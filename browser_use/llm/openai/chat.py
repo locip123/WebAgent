@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
@@ -6,14 +7,16 @@ import httpx
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionContentPartTextParam
 from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.responses import Response
 from openai.types.shared.chat_model import ChatModel
 from openai.types.shared_params.reasoning_effort import ReasoningEffort
 from openai.types.shared_params.response_format_json_schema import JSONSchema, ResponseFormatJSONSchema
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
+from browser_use.llm.openai.responses_serializer import ResponsesAPIMessageSerializer
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
@@ -48,6 +51,10 @@ class ChatOpenAI(BaseChatModel):
 	remove_defaults_from_schema: bool = (
 		False  # If True, remove default values from JSON schema (for compatibility with some providers)
 	)
+	use_responses_api: bool = False
+	"""Use the OpenAI Responses API instead of Chat Completions."""
+	stream_responses_api: bool = False
+	"""Consume Responses API calls as SSE and stop as soon as a terminal event arrives."""
 
 	# Client initialization parameters
 	api_key: str | None = None
@@ -141,6 +148,257 @@ class ChatOpenAI(BaseChatModel):
 
 		return usage
 
+	def _get_responses_usage(self, response: Response | str) -> ChatInvokeUsage | None:
+		"""Extract usage from a Responses API response, including proxy text responses."""
+		if isinstance(response, str) or response.usage is None:
+			return None
+
+		cached_tokens = None
+		if response.usage.input_tokens_details is not None:
+			cached_tokens = response.usage.input_tokens_details.cached_tokens
+
+		return ChatInvokeUsage(
+			prompt_tokens=response.usage.input_tokens,
+			prompt_cached_tokens=cached_tokens,
+			prompt_cache_creation_tokens=None,
+			prompt_image_tokens=None,
+			completion_tokens=response.usage.output_tokens,
+			total_tokens=response.usage.total_tokens,
+		)
+
+	@staticmethod
+	def _get_responses_text(response: Response | str) -> str:
+		"""Return generated text from the official response schema or a proxy text response."""
+		if isinstance(response, str):
+			return ChatOpenAI._extract_responses_sse_text(response)
+		return response.output_text or ''
+
+	@staticmethod
+	def _extract_responses_sse_text(response_text: str) -> str:
+		"""Extract output text when a proxy returns Responses API SSE events as a string."""
+		if not response_text.lstrip().startswith('data:'):
+			return response_text
+
+		deltas: list[str] = []
+		completed_text: str | None = None
+
+		for line in response_text.splitlines():
+			if not line.startswith('data:'):
+				continue
+
+			payload = line.removeprefix('data:').strip()
+			if not payload or payload == '[DONE]':
+				continue
+
+			try:
+				event = json.loads(payload)
+			except json.JSONDecodeError:
+				continue
+
+			if event.get('type') == 'response.output_text.delta' and isinstance(event.get('delta'), str):
+				deltas.append(event['delta'])
+			elif event.get('type') == 'response.output_text.done' and isinstance(event.get('text'), str):
+				completed_text = event['text']
+			elif event.get('type') == 'response.completed':
+				completed_text = ChatOpenAI._extract_completed_response_text(event) or completed_text
+
+		return completed_text or ''.join(deltas) or response_text
+
+	@staticmethod
+	def _extract_completed_response_text(event: dict[str, Any]) -> str:
+		"""Extract output text from a response.completed event payload."""
+		response = event.get('response')
+		if not isinstance(response, dict):
+			return ''
+
+		output = response.get('output')
+		if not isinstance(output, list):
+			return ''
+
+		text_parts: list[str] = []
+		for item in output:
+			if not isinstance(item, dict) or item.get('type') != 'message':
+				continue
+			content = item.get('content')
+			if not isinstance(content, list):
+				continue
+			for part in content:
+				if isinstance(part, dict) and part.get('type') == 'output_text' and isinstance(part.get('text'), str):
+					text_parts.append(part['text'])
+
+		return ''.join(text_parts)
+
+	@staticmethod
+	def _get_responses_stop_reason(response: Response | str) -> str | None:
+		"""Return the Responses API status when the provider returned a standard response object."""
+		if isinstance(response, str):
+			return None
+		return response.status
+
+	@staticmethod
+	def _parse_responses_structured_text(response_text: str, output_format: type[T]) -> T:
+		"""Validate structured text, tolerating proxy-appended duplicate fragments.
+
+		Some OpenAI-compatible gateways append a repeated parameter object after
+		the complete schema-constrained object, sometimes truncating that repeated
+		fragment. Prefer strict validation, then accept only the first complete JSON
+		value and validate it against the requested schema. The ignored suffix can
+		never become a second browser action.
+		"""
+		try:
+			return output_format.model_validate_json(response_text)
+		except ValidationError as validation_error:
+			decoder = json.JSONDecoder()
+			try:
+				first_value, end_position = decoder.raw_decode(response_text.lstrip())
+			except json.JSONDecodeError:
+				raise validation_error
+
+			if not response_text.lstrip()[end_position:].strip():
+				raise validation_error
+			return output_format.model_validate(first_value)
+
+	async def _create_streaming_response(self, model_params: dict[str, Any]) -> Response | str:
+		"""Consume a Responses SSE stream without waiting for the server to close it.
+
+		LiteLLM's ChatGPT-subscription adapter always talks SSE to its upstream,
+		even when its caller requests a non-streaming response.  Asking the proxy
+		for SSE as well avoids its non-streaming EOF aggregation path.  Explicitly
+		break on the terminal event because a proxy/upstream may keep the HTTP
+		connection open after ``response.completed``.
+		"""
+		client = self.get_client()
+		stream = None
+		text_deltas: list[str] = []
+		completed_text: str | None = None
+		try:
+			stream = await client.responses.create(**model_params, stream=True)
+			async for event in stream:
+				event_type = getattr(event, 'type', '')
+				if event_type == 'response.output_text.delta':
+					delta = getattr(event, 'delta', None)
+					if isinstance(delta, str):
+						text_deltas.append(delta)
+					continue
+				if event_type == 'response.output_text.done':
+					text = getattr(event, 'text', None)
+					if isinstance(text, str):
+						completed_text = text
+					continue
+				if event_type == 'response.completed':
+					response = event.response
+					return response if response.output_text else completed_text or ''.join(text_deltas)
+				if event_type == 'response.incomplete':
+					response = event.response
+					return response if response.output_text else completed_text or ''.join(text_deltas)
+				if event_type == 'response.failed':
+					error = getattr(event.response, 'error', None)
+					message = getattr(error, 'message', None) or str(error or 'Responses API request failed')
+					raise ModelProviderError(message=message, model=self.name)
+				if event_type == 'error':
+					raise ModelProviderError(
+						message=getattr(event, 'message', None) or 'Responses API stream failed',
+						model=self.name,
+					)
+
+			raise ModelProviderError(
+				message='Responses API stream ended without a terminal response event',
+				model=self.name,
+			)
+		finally:
+			if stream is not None:
+				await stream.close()
+			await client.close()
+
+	async def _ainvoke_responses_api(
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
+		"""Invoke the model through the OpenAI Responses API."""
+		input_messages = ResponsesAPIMessageSerializer.serialize_messages(messages)
+
+		try:
+			model_params: dict[str, Any] = {
+				'model': self.model,
+				'input': input_messages,
+			}
+
+			if self.temperature is not None:
+				model_params['temperature'] = self.temperature
+
+			if self.max_completion_tokens is not None:
+				model_params['max_output_tokens'] = self.max_completion_tokens
+
+			if self.top_p is not None:
+				model_params['top_p'] = self.top_p
+
+			if self.service_tier is not None:
+				model_params['service_tier'] = self.service_tier
+
+			if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
+				model_params['reasoning'] = {'effort': self.reasoning_effort}
+				model_params.pop('temperature', None)
+
+			if output_format is not None:
+				json_schema = SchemaOptimizer.create_optimized_json_schema(
+					output_format,
+					remove_min_items=self.remove_min_items_from_schema,
+					remove_defaults=self.remove_defaults_from_schema,
+				)
+				model_params['text'] = {
+					'format': {
+						'type': 'json_schema',
+						'name': 'agent_output',
+						'strict': True,
+						'schema': json_schema,
+					}
+				}
+
+				if self.add_schema_to_system_prompt and input_messages and input_messages[0]['role'] == 'system':
+					schema_text = f'\n<json_schema>\n{json_schema}\n</json_schema>'
+					content = input_messages[0]['content']
+					if isinstance(content, str):
+						input_messages[0]['content'] = content + schema_text
+					else:
+						input_messages[0]['content'] = list(content) + [{'type': 'input_text', 'text': schema_text}]
+
+				if self.dont_force_structured_output:
+					model_params.pop('text', None)
+
+			if self.stream_responses_api:
+				response = await self._create_streaming_response(model_params)
+			else:
+				response = await self.get_client().responses.create(**model_params)
+			response_text = self._get_responses_text(response)
+			usage = self._get_responses_usage(response)
+			stop_reason = self._get_responses_stop_reason(response)
+
+			if output_format is None:
+				return ChatInvokeCompletion(completion=response_text, usage=usage, stop_reason=stop_reason)
+
+			if not response_text:
+				raise ModelProviderError(
+					message='Failed to parse structured output from Responses API response',
+					status_code=500,
+					model=self.name,
+				)
+
+			return ChatInvokeCompletion(
+				completion=self._parse_responses_structured_text(response_text, output_format),
+				usage=usage,
+				stop_reason=stop_reason,
+			)
+
+		except ModelProviderError:
+			raise
+		except RateLimitError as e:
+			raise ModelRateLimitError(message=e.message, model=self.name) from e
+		except APIConnectionError as e:
+			raise ModelProviderError(message=str(e), model=self.name) from e
+		except APIStatusError as e:
+			raise ModelProviderError(message=e.message, status_code=e.status_code, model=self.name) from e
+		except Exception as e:
+			raise ModelProviderError(message=str(e), model=self.name) from e
+
 	@overload
 	async def ainvoke(
 		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
@@ -162,6 +420,8 @@ class ChatOpenAI(BaseChatModel):
 		Returns:
 			Either a string response or an instance of output_format
 		"""
+		if self.use_responses_api:
+			return await self._ainvoke_responses_api(messages, output_format, **kwargs)
 
 		openai_messages = OpenAIMessageSerializer.serialize_messages(messages)
 
