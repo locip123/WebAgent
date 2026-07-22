@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +11,16 @@ import pytest
 from browser_use.webretriever import cli
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.models import CompetitionTask
-from browser_use.webretriever.runner import RunnerConfig, _result_payload, _task_timeout_outcome, build_llm, validate_model_policy
+from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
+from browser_use.webretriever.runner import (
+	RunnerConfig,
+	_consume_tasks,
+	_result_payload,
+	_run_task,
+	_task_timeout_outcome,
+	build_llm,
+	validate_model_policy,
+)
 
 
 def _config(tmp_path: Path, **overrides: object) -> RunnerConfig:
@@ -80,6 +90,7 @@ def test_cli_parser_accepts_task_and_output_aliases(tmp_path: Path, input_flag: 
 
 	assert args.input_path == tmp_path / 'tasks.json'
 	assert args.output_dir == tmp_path / 'output'
+	assert args.max_concurrency == 3
 
 
 def test_cli_config_uses_environment_and_cdp_alias(monkeypatch, tmp_path: Path):
@@ -110,7 +121,7 @@ def test_cli_config_uses_environment_and_cdp_alias(monkeypatch, tmp_path: Path):
 		'ws://browser.example.test/one',
 		'ws://browser.example.test/two',
 	]
-	assert config.thought_language == '中文'
+	assert config.thought_language == DEFAULT_THOUGHT_LANGUAGE
 
 
 def test_cli_config_allows_thought_language_override(monkeypatch, tmp_path: Path):
@@ -159,6 +170,27 @@ def test_cli_config_reads_cdp_urls_from_environment(monkeypatch, tmp_path: Path)
 		'ws://browser.example.test/one',
 		'ws://browser.example.test/two',
 	]
+
+
+def test_cli_config_reads_declared_sec_user_agent_from_environment(monkeypatch, tmp_path: Path):
+	monkeypatch.setenv('WEBRETRIEVER_MODEL', 'gpt-5.4')
+	monkeypatch.setenv('WEBRETRIEVER_API_KEY', 'web-key')
+	monkeypatch.setenv('WEBRETRIEVER_SEC_USER_AGENT', 'Example Organization sec-admin@example.org')
+	parser = cli.build_parser()
+	args = parser.parse_args(
+		[
+			'--input',
+			str(tmp_path / 'tasks.json'),
+			'--output',
+			str(tmp_path / 'output'),
+			'--cdp-url',
+			'ws://browser.example.test/one',
+		]
+	)
+
+	config = cli.config_from_args(args, parser)
+
+	assert config.sec_user_agent == 'Example Organization sec-admin@example.org'
 
 
 def test_cli_vlm_ports_compatibility_ignores_gateway_environment(monkeypatch, tmp_path: Path):
@@ -231,6 +263,191 @@ def test_runner_config_accepts_exact_competition_limits(tmp_path: Path):
 	config.validate()
 
 
+def test_runner_config_defaults_to_three_concurrent_tasks(tmp_path: Path):
+	config = _config(tmp_path)
+
+	assert config.max_concurrency == 3
+	config.validate()
+
+
+@pytest.mark.parametrize(
+	('value', 'error'),
+	[
+		('contact@example.org', 'organization name'),
+		('Example Organization no-contact', 'contact email'),
+		('Example Organization contact@example.org\r\nX-Injected: true', 'single printable line'),
+		('组织 contact@example.org', 'ASCII'),
+	],
+)
+def test_runner_config_rejects_invalid_declared_sec_user_agent(tmp_path: Path, value: str, error: str):
+	config = _config(tmp_path, sec_user_agent=value)
+
+	with pytest.raises(ValueError, match=error):
+		config.validate()
+
+
+@pytest.mark.asyncio
+async def test_sec_task_without_declared_user_agent_logs_warning(monkeypatch, tmp_path: Path, caplog):
+	class FakeRuntime:
+		declared_user_agents: list[str | None] = []
+
+		def __init__(self, _context: Any, _task_dir: Path, _logger: Any, *, declared_user_agent: str | None = None) -> None:
+			self.declared_user_agents.append(declared_user_agent)
+			self.visited_urls = ['https://www.sec.gov/']
+
+		async def start(self, _website: str) -> None:
+			return None
+
+		async def close(self) -> None:
+			return None
+
+		def capture_payload(self) -> dict[str, Any]:
+			return {'capture_time': '2026-07-21 00:00:00', 'total_requests': 0, 'all_requests': []}
+
+	class FakeAgent:
+		partial_outcome = None
+
+		def __init__(self, **_kwargs: Any) -> None:
+			return None
+
+		async def run(self) -> AgentRunOutcome:
+			return AgentRunOutcome(status='SUCCESS', agent_answer='done', evidence=['SEC page'])
+
+	monkeypatch.setattr('browser_use.webretriever.runner.BrowserRuntime', FakeRuntime)
+	monkeypatch.setattr('browser_use.webretriever.runner.ProtocolIIIAgent', FakeAgent)
+	task = CompetitionTask.model_validate(
+		{
+			'task_idx': 6,
+			'task_id': '6d2ecefa7ec049919234b2e2492a87a1',
+			'website': 'https://www.sec.gov/',
+			'task': 'Read the filing.',
+		}
+	)
+	logger = __import__('logging').getLogger('test-webretriever-sec-warning')
+
+	with caplog.at_level('WARNING'):
+		status = await _run_task(
+			context=cast(Any, object()),
+			task=task,
+			config=_config(tmp_path),
+			llm=cast(Any, object()),
+			logger=logger,
+		)
+
+	assert status == 'SUCCESS'
+	assert FakeRuntime.declared_user_agents == [None]
+	assert 'running without a declared User-Agent' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_three_workers_process_six_tasks_concurrently(monkeypatch, tmp_path: Path):
+	tasks = [
+		CompetitionTask.model_validate(
+			{
+				'task_idx': index,
+				'task_id': f'{index:032x}',
+				'website': 'https://example.com',
+				'task': f'Read result {index}.',
+			}
+		)
+		for index in range(6)
+	]
+	queue: asyncio.Queue[CompetitionTask] = asyncio.Queue()
+	for task in tasks:
+		queue.put_nowait(task)
+
+	active = 0
+	peak_active = 0
+
+	async def fake_run_task(**kwargs: Any) -> str:
+		nonlocal active, peak_active
+		active += 1
+		peak_active = max(peak_active, active)
+		await asyncio.sleep(0.01)
+		active -= 1
+		return 'SUCCESS'
+
+	monkeypatch.setattr('browser_use.webretriever.runner._run_task', fake_run_task)
+	statuses: dict[str, str] = {}
+	config = _config(tmp_path)
+	await asyncio.gather(
+		*(
+			_consume_tasks(
+				worker_id=worker_id,
+				context=cast(Any, object()),
+				queue=queue,
+				config=config,
+				llm=cast(Any, object()),
+				statuses=statuses,
+				sec_task_semaphore=asyncio.Semaphore(1),
+			)
+			for worker_id in range(config.max_concurrency)
+		)
+	)
+
+	assert peak_active == 3
+	assert len(statuses) == 6
+	assert set(statuses.values()) == {'SUCCESS'}
+
+
+@pytest.mark.asyncio
+async def test_sec_tasks_are_serialized_while_other_tasks_remain_concurrent(monkeypatch, tmp_path: Path):
+	tasks = [
+		CompetitionTask.model_validate(
+			{
+				'task_idx': index,
+				'task_id': f'{index:032x}',
+				'website': website,
+				'task': f'Read result {index}.',
+			}
+		)
+		for index, website in enumerate(('https://www.sec.gov/', 'https://data.sec.gov/', 'https://example.com/'))
+	]
+	queue: asyncio.Queue[CompetitionTask] = asyncio.Queue()
+	for task in tasks:
+		queue.put_nowait(task)
+
+	active_sec = 0
+	peak_sec = 0
+	non_sec_ran_with_sec = False
+
+	async def fake_run_task(**kwargs: Any) -> str:
+		nonlocal active_sec, peak_sec, non_sec_ran_with_sec
+		is_sec = 'sec.gov' in kwargs['task'].website
+		if is_sec:
+			active_sec += 1
+			peak_sec = max(peak_sec, active_sec)
+		else:
+			non_sec_ran_with_sec = active_sec > 0
+		await asyncio.sleep(0.02)
+		if is_sec:
+			active_sec -= 1
+		return 'SUCCESS'
+
+	monkeypatch.setattr('browser_use.webretriever.runner._run_task', fake_run_task)
+	statuses: dict[str, str] = {}
+	config = _config(tmp_path)
+	sec_task_semaphore = asyncio.Semaphore(1)
+	await asyncio.gather(
+		*(
+			_consume_tasks(
+				worker_id=worker_id,
+				context=cast(Any, object()),
+				queue=queue,
+				config=config,
+				llm=cast(Any, object()),
+				statuses=statuses,
+				sec_task_semaphore=sec_task_semaphore,
+			)
+			for worker_id in range(3)
+		)
+	)
+
+	assert peak_sec == 1
+	assert non_sec_ran_with_sec
+	assert set(statuses.values()) == {'SUCCESS'}
+
+
 def test_runner_config_defaults_to_five_minute_task_timeout(tmp_path: Path):
 	config = _config(tmp_path)
 
@@ -261,7 +478,7 @@ def test_result_payload_records_end_to_end_task_timing():
 	assert payload['task_started_at'] == '2026-07-20T00:00:00+00:00'
 	assert payload['task_elapsed_seconds'] == 12.346
 	assert payload['task_timeout_seconds'] == 300
-	assert payload['thought_language'] == '中文'
+	assert payload['thought_language'] == DEFAULT_THOUGHT_LANGUAGE
 	assert isinstance(payload['task_completed_at'], str)
 
 
@@ -302,6 +519,7 @@ def test_task_timeout_outcome_preserves_partial_agent_history(tmp_path: Path):
 		({'max_steps': 101}, '100'),
 		({'model_timeout_seconds': 181}, '180'),
 		({'task_timeout_seconds': 0}, 'greater than 0'),
+		({'task_timeout_seconds': 301}, '300'),
 		({'max_concurrency': 9}, '8'),
 		({'cdp_urls': [f'ws://browser.example.test/{index}' for index in range(9)]}, '8 concurrent CDP'),
 	],

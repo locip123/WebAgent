@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-DEFAULT_THOUGHT_LANGUAGE = '中文'
+DEFAULT_THOUGHT_LANGUAGE = '简体中文'
 
 
 def normalize_thought_language(value: str) -> str:
@@ -39,7 +39,7 @@ BROWSER AND SOURCE POLICY
 - External search engines are prohibited. Never use Google Search, Bing, Baidu Search, DuckDuckGo, Yahoo Search, Yandex, Sogou, Brave Search, Perplexity, or another general web-search service or search API.
 - A target website's own navigation, search box, advanced search, filters, and result pages are allowed.
 - Follow relevant visible links, redirects, and publisher-linked document/CDN URLs so the provenance remains auditable from the starting site. Do not invent an unrelated URL or guessed API endpoint.
-- inspect_network may read only XHR/Fetch traffic already produced by this browser trajectory. It is not permission to construct or call a new API.
+- inspect_network and find_chart_data_requests may read only traffic already produced by this browser trajectory. They are not permission to construct or call a new API. call_data_analysis_assistant may read only the validated task-local artifact directory returned by find_chart_data_requests; it may not browse or fetch more data.
 - Keep the task read-only. Search and calculator forms are allowed; do not purchase, publish, message, delete, alter an account, or perform another irreversible action.
 
 WORKING METHOD
@@ -78,7 +78,11 @@ CHARTS AND DYNAMIC DATA
 - Verify chart title, legend/series, x-axis period, y-axis unit/scale, and selected geography/category.
 - Prefer hover on a semantic chart point. For canvas charts, use hover_xy and adjust methodically using the current viewport.
 - Read the exact tooltip value. Never estimate a value from line height, bar length, or nearby axis ticks.
-- If a matching first-party XHR/Fetch response is available, inspect it and confirm that its request parameters correspond to the current UI filters. A requested value appearing only in request parameters is not result evidence; verify the response field.
+- When chart data is not reliably exposed in the DOM or tooltip, use find_chart_data_requests after the chart has loaded and all requested filters are visibly verified. It selects current-page and iframe chart traffic, saves bounded redacted packets, and locally normalizes supported responses into tables in a task-scoped data_dir.
+- When find_chart_data_requests returns status=ready, first verify that every task-critical value in datasets[].active_filters agrees with the requested state. A conflicting filter is stale; a missing task-critical filter is unconfirmed and must be checked against the visible UI/request provenance. Correct stale UI state and run a new scan. Once filters agree, immediately call call_data_analysis_assistant with the exact returned data_dir and the complete analytical question from the authoritative task. Use its answer, evidence_rows, and provenance to finish; call it again only when a genuine analytical ambiguity remains.
+- For find statuses saved_raw_only, no_match, or capture_pending, inspect at most the necessary saved cursor fragment and then use the page table, official export, or exact tooltips. For stale_state, start a new scan after verifying the page; for too_large, narrow the visible chart/filter before rescanning; for timeout, use a cheaper browser-grounded fallback. Do not send raw protocol payloads to call_data_analysis_assistant and do not repeat an unchanged failed scan.
+- For analysis statuses invalid_data_dir or invalid_manifest, return to the latest ready find result; for no_tabular_data, use the structured-data fallback above; for analysis_failed or unsafe_code, simplify the analytical question once; for timeout, finish from already returned decisive evidence or use a deterministic browser fallback. Never repeat the identical failed analysis call.
+- If a matching first-party response is available, inspect it and confirm that its request parameters correspond to the current UI filters. A requested value appearing only in request parameters is not result evidence; verify the response field.
 - For a task-specific geography or category, never use a default aggregate response (for example World/1W) merely because its cache or body also contains other entity codes. Apply the requested filter and verify the selected code in the request and the exact keyed response record before extracting values.
 - Avoid stale responses created before the final filter was applied.
 
@@ -119,6 +123,8 @@ Populate only fields accepted by the selected action; leave unrelated optional f
 - switch_tab, close_tab: tab_index from the current observation.
 - find_text: text; this searches the current page or supported browser-retrieved document, not the web.
 - inspect_network: no parameter or optional text used only to filter captured traffic.
+- find_chart_data_requests: normally omit cursor. It scans the current page, saves selected redacted packets and normalized tables, and returns status, artifact_id, data_dir, dataset/request summaries, a bounded untrusted packet preview, and optional next_cursor. Use cursor only to inspect additional raw-packet fragments after a structured-data failure; pass the returned next_cursor unchanged.
+- call_data_analysis_assistant: analysis_query and data_dir. Copy data_dir exactly from a successful find_chart_data_requests result into the dedicated field; never embed or infer a path inside analysis_query. analysis_query must state the complete task-specific calculation in the user's language, including all dates, filters, entities, metrics, denominator semantics, and requested output. The assistant reads only manifest-listed normalized tables and returns a bounded answer with evidence and provenance.
 - calculate: operation and text. text must be JSON encoding either `{label: number, ...}` or `[{"label": ..., "value": number}, ...]` copied only from browser-observed data. Supported operations are argmax, argmin, argmax_difference, argmin_difference, argmax_growth, and argmin_growth. Difference/growth operations sort numeric labels chronologically and report the winning current label plus top candidates.
 - finish: success; when success=true also provide answer and evidence.
 
@@ -213,6 +219,7 @@ def build_step_prompt(
 	history: list[dict[str, Any]],
 	memory: str,
 	last_outcome: str,
+	last_outcome_limit: int = 4_000,
 ) -> str:
 	"""Build a bounded step prompt without accepting a reference answer."""
 	return _STEP_OBSERVATION_PROMPT.format(
@@ -220,7 +227,7 @@ def build_step_prompt(
 		task=task,
 		step=step + 1,
 		max_steps=max_steps,
-		last_outcome=_bounded_text(last_outcome, 4_000),
+		last_outcome=_bounded_text(last_outcome, last_outcome_limit),
 		memory=_bounded_text(memory, 6_000) or '(none yet)',
 		history=_render_history(history),
 		# Preserve both the beginning (URL/elements/page) and tail

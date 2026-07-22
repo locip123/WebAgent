@@ -17,12 +17,17 @@ from playwright.async_api import Browser, BrowserContext, Playwright, async_play
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json
-from browser_use.webretriever.browser import BrowserRuntime, cdp_headers_for_url, redact_cdp_url
+from browser_use.webretriever.browser import BrowserRuntime, cdp_headers_for_url, is_sec_url, redact_cdp_url
 from browser_use.webretriever.models import CompetitionTask, load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, normalize_thought_language
 
 ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
+DEFAULT_MAX_CONCURRENCY = 3
+MAX_CONCURRENCY = 8
+MAX_TASK_TIMEOUT_SECONDS = 300.0
+_SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
+_MAX_SEC_USER_AGENT_LENGTH = 512
 
 
 @dataclass(slots=True)
@@ -33,12 +38,13 @@ class RunnerConfig:
 	api_key: str
 	api_base: str | None
 	cdp_urls: list[str]
+	sec_user_agent: str | None = None
 	vlm_ports: list[int] = field(default_factory=list)
 	api_mode: ApiMode = 'auto'
 	max_steps: int = 100
 	model_timeout_seconds: float = 180.0
 	task_timeout_seconds: float = 300.0
-	max_concurrency: int = 8
+	max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 	reasoning_effort: ReasoningEffort = 'medium'
 	thought_language: str = DEFAULT_THOUGHT_LANGUAGE
 	local_browser: bool = False
@@ -64,8 +70,10 @@ class RunnerConfig:
 			raise ValueError('model_timeout_seconds must be in (0, 180]')
 		if self.task_timeout_seconds <= 0:
 			raise ValueError('task_timeout_seconds must be greater than 0')
-		if not 1 <= self.max_concurrency <= 8:
-			raise ValueError('max_concurrency must be between 1 and the competition limit of 8')
+		if self.task_timeout_seconds > MAX_TASK_TIMEOUT_SECONDS:
+			raise ValueError(f'task_timeout_seconds must be at most {MAX_TASK_TIMEOUT_SECONDS:g}')
+		if not 1 <= self.max_concurrency <= MAX_CONCURRENCY:
+			raise ValueError(f'max_concurrency must be between 1 and the competition limit of {MAX_CONCURRENCY}')
 		if self.local_browser and self.cdp_urls:
 			raise ValueError('local_browser and cdp_urls are mutually exclusive')
 		if not self.local_browser and not self.cdp_urls:
@@ -76,12 +84,37 @@ class RunnerConfig:
 			raise ValueError('the competition permits at most 8 concurrent CDP browsers')
 		if self.limit is not None and self.limit < 1:
 			raise ValueError('limit must be at least 1')
+		self.sec_user_agent = normalize_sec_user_agent(self.sec_user_agent)
 		self.thought_language = normalize_thought_language(self.thought_language)
 		validate_model_policy(self.model)
 
 
 def _version_tuple(match: re.Match[str]) -> tuple[int, int]:
 	return int(match.group(1)), int(match.group(2) or 0)
+
+
+def normalize_sec_user_agent(value: str | None) -> str | None:
+	"""Validate the declared identity required by SEC automated-access policy."""
+
+	if value is None:
+		return None
+	if any(character in value for character in '\r\n\x00') or not value.isprintable():
+		raise ValueError('WEBRETRIEVER_SEC_USER_AGENT must be a single printable line')
+	normalized = value.strip()
+	if not normalized:
+		return None
+	if len(normalized) > _MAX_SEC_USER_AGENT_LENGTH:
+		raise ValueError(f'WEBRETRIEVER_SEC_USER_AGENT must be at most {_MAX_SEC_USER_AGENT_LENGTH} characters')
+	try:
+		normalized.encode('ascii')
+	except UnicodeEncodeError as exc:
+		raise ValueError('WEBRETRIEVER_SEC_USER_AGENT must use ASCII characters') from exc
+	email_match = _SEC_USER_AGENT_EMAIL_RE.search(normalized)
+	if email_match is None:
+		raise ValueError('WEBRETRIEVER_SEC_USER_AGENT must include a contact email address')
+	if not (normalized[: email_match.start()] + normalized[email_match.end() :]).strip():
+		raise ValueError('WEBRETRIEVER_SEC_USER_AGENT must include an organization name and contact email address')
+	return normalized
 
 
 def validate_model_policy(model: str) -> None:
@@ -317,8 +350,21 @@ async def _run_task(
 				_clear_previous_trajectory(writer)
 			writer.write_result(status='PENDING', actions=[], thoughts=[], urls=[], agent_answer='')
 			logger.info('Starting task %s/%s at %s', task.task_idx, task.task_id, task.website)
+			is_sec_task = is_sec_url(task.website)
+			if is_sec_task and config.sec_user_agent is None:
+				logger.warning(
+					'SEC task %s/%s is running without a declared User-Agent; '
+					'set WEBRETRIEVER_SEC_USER_AGENT to an organization name and contact email to avoid SEC blocking',
+					task.task_idx,
+					task.task_id,
+				)
 
-			runtime = BrowserRuntime(context, writer.task_dir, logger)
+			runtime = BrowserRuntime(
+				context,
+				writer.task_dir,
+				logger,
+				declared_user_agent=config.sec_user_agent if is_sec_task else None,
+			)
 			await _await_with_hard_timeout(
 				runtime.start(task.website),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
@@ -331,6 +377,7 @@ async def _run_task(
 				max_steps=config.max_steps,
 				model_timeout_seconds=config.model_timeout_seconds,
 				thought_language=config.thought_language,
+				task_deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
 			)
 			outcome = await _await_with_hard_timeout(
 				agent.run(),
@@ -380,6 +427,7 @@ async def _consume_tasks(
 	config: RunnerConfig,
 	llm: ChatOpenAI,
 	statuses: dict[str, str],
+	sec_task_semaphore: asyncio.Semaphore,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
@@ -388,7 +436,12 @@ async def _consume_tasks(
 		except asyncio.QueueEmpty:
 			return
 		try:
+			is_sec_task = is_sec_url(task.website)
+			acquired_sec_slot = False
 			try:
+				if is_sec_task:
+					await sec_task_semaphore.acquire()
+					acquired_sec_slot = True
 				statuses[task.task_id] = await _run_task(
 					context=context,
 					task=task,
@@ -408,6 +461,9 @@ async def _consume_tasks(
 					writer.write_capture()
 				except Exception:
 					logger.exception('Could not persist runner failure for task %s/%s', task.task_idx, task.task_id)
+			finally:
+				if acquired_sec_slot:
+					sec_task_semaphore.release()
 		finally:
 			queue.task_done()
 
@@ -420,6 +476,7 @@ async def _cdp_worker(
 	queue: asyncio.Queue[CompetitionTask],
 	config: RunnerConfig,
 	statuses: dict[str, str],
+	sec_task_semaphore: asyncio.Semaphore,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	llm = build_llm(config, worker_id)
@@ -439,6 +496,7 @@ async def _cdp_worker(
 			config=config,
 			llm=llm,
 			statuses=statuses,
+			sec_task_semaphore=sec_task_semaphore,
 		)
 	except Exception as exc:
 		# Playwright connection errors may repeat the endpoint verbatim.  Avoid
@@ -450,6 +508,41 @@ async def _cdp_worker(
 				await browser.close()
 			except Exception as exc:
 				logger.warning('Could not close CDP connection: %s', redact_cdp_url(str(exc)))
+
+
+async def _local_worker(
+	*,
+	worker_id: int,
+	browser: Browser,
+	queue: asyncio.Queue[CompetitionTask],
+	config: RunnerConfig,
+	statuses: dict[str, str],
+	sec_task_semaphore: asyncio.Semaphore,
+) -> None:
+	"""Run one isolated local browser context for each concurrent worker."""
+
+	logger = _worker_logger(config.output_dir, worker_id)
+	llm = build_llm(config, worker_id)
+	context: BrowserContext | None = None
+	try:
+		context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
+		await _consume_tasks(
+			worker_id=worker_id,
+			context=context,
+			queue=queue,
+			config=config,
+			llm=llm,
+			statuses=statuses,
+			sec_task_semaphore=sec_task_semaphore,
+		)
+	except Exception:
+		logger.exception('Local browser worker failed')
+	finally:
+		if context is not None:
+			try:
+				await context.close()
+			except Exception as exc:
+				logger.warning('Could not close local browser context: %s', exc)
 
 
 def _select_tasks(tasks: list[CompetitionTask], config: RunnerConfig) -> list[CompetitionTask]:
@@ -472,24 +565,30 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	for task in tasks:
 		queue.put_nowait(task)
 	statuses: dict[str, str] = {}
+	sec_task_semaphore = asyncio.Semaphore(1)
+	worker_count = min(config.max_concurrency, len(tasks))
 	async with async_playwright() as playwright:
 		if config.local_browser:
-			llm = build_llm(config)
 			browser = await playwright.chromium.launch(headless=config.headless)
 			try:
-				context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
-				await _consume_tasks(
-					worker_id=0,
-					context=context,
-					queue=queue,
-					config=config,
-					llm=llm,
-					statuses=statuses,
+				await asyncio.gather(
+					*(
+						_local_worker(
+							worker_id=worker_id,
+							browser=browser,
+							queue=queue,
+							config=config,
+							statuses=statuses,
+							sec_task_semaphore=sec_task_semaphore,
+						)
+						for worker_id in range(worker_count)
+					)
 				)
 			finally:
 				await browser.close()
 		else:
-			worker_urls = config.cdp_urls[: config.max_concurrency]
+			worker_urls = config.cdp_urls[:worker_count]
+			worker_count = len(worker_urls)
 			await asyncio.gather(
 				*(
 					_cdp_worker(
@@ -499,6 +598,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 						queue=queue,
 						config=config,
 						statuses=statuses,
+						sec_task_semaphore=sec_task_semaphore,
 					)
 					for worker_id, cdp_url in enumerate(worker_urls)
 				)
@@ -522,6 +622,8 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		'created_at': datetime.now(timezone.utc).isoformat(),
 		'input': str(config.input_path),
 		'total_selected': len(tasks),
+		'max_concurrency': config.max_concurrency,
+		'workers_started': worker_count,
 		'counts': counts,
 		'statuses': statuses,
 	}
@@ -530,8 +632,11 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 
 
 __all__ = [
+	'DEFAULT_MAX_CONCURRENCY',
+	'MAX_CONCURRENCY',
 	'RunnerConfig',
 	'build_llm',
+	'normalize_sec_user_agent',
 	'resolve_responses_api',
 	'run',
 	'validate_model_policy',

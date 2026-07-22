@@ -14,7 +14,14 @@ from typing import Sequence
 from dotenv import load_dotenv
 
 from browser_use.webretriever.models import load_tasks
-from browser_use.webretriever.runner import RunnerConfig, run
+from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
+from browser_use.webretriever.runner import (
+	DEFAULT_MAX_CONCURRENCY,
+	MAX_CONCURRENCY,
+	MAX_TASK_TIMEOUT_SECONDS,
+	RunnerConfig,
+	run,
+)
 
 
 def _first_env(*names: str) -> str | None:
@@ -23,6 +30,13 @@ def _first_env(*names: str) -> str | None:
 		if value is not None and value.strip():
 			return value.strip()
 	return None
+
+
+def _sec_user_agent_from_env() -> str | None:
+	"""Read the SEC identity without normalizing potentially unsafe header input."""
+
+	value = os.getenv('WEBRETRIEVER_SEC_USER_AGENT')
+	return value if value is not None and value.strip() else None
 
 
 def _split_cdp_urls(values: Sequence[str] | None) -> list[str]:
@@ -115,10 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		'--task-timeout',
 		type=float,
-		default=300.0,
-		help='seconds allowed for one complete task; exceeding it writes FAIL_TASK_TIMEOUT',
+		default=MAX_TASK_TIMEOUT_SECONDS,
+		help=f'seconds allowed for one complete task; hard-capped at {MAX_TASK_TIMEOUT_SECONDS:g}',
 	)
-	parser.add_argument('--max-concurrency', type=int, default=8, help='hard-capped by the rules at 8')
+	parser.add_argument(
+		'--max-concurrency',
+		type=int,
+		default=DEFAULT_MAX_CONCURRENCY,
+		help=f'number of tasks to run concurrently; hard-capped by the rules at {MAX_CONCURRENCY}',
+	)
 
 	parser.add_argument(
 		'--task-index',
@@ -181,6 +200,7 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 		api_key=api_key or '',
 		api_base=api_base,
 		cdp_urls=_split_cdp_urls(args.cdp_urls),
+		sec_user_agent=_sec_user_agent_from_env(),
 		vlm_ports=args.vlm_ports,
 		api_mode=args.api_mode,
 		max_steps=args.max_steps,
@@ -188,7 +208,7 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 		task_timeout_seconds=args.task_timeout,
 		max_concurrency=args.max_concurrency,
 		reasoning_effort=args.reasoning_effort,
-		thought_language=args.thought_language or _first_env('WEBRETRIEVER_THOUGHT_LANGUAGE') or '中文',
+		thought_language=args.thought_language or _first_env('WEBRETRIEVER_THOUGHT_LANGUAGE') or DEFAULT_THOUGHT_LANGUAGE,
 		local_browser=args.local_browser,
 		headless=not args.headed,
 		rerun_failed=args.rerun_failed,

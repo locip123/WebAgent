@@ -150,6 +150,13 @@ def test_load_tasks_rejects_duplicate_indices_and_ids(tmp_path: Path, field: str
 		{'action': 'read_element', 'element_id': 1},
 		{'action': 'find_text', 'text': 'needle'},
 		{'action': 'inspect_network', 'text': '/api/data'},
+		{'action': 'find_chart_data_requests'},
+		{'action': 'find_chart_data_requests', 'cursor': 'scan-id:1'},
+		{
+			'action': 'call_data_analysis_assistant',
+			'analysis_query': 'Which month has the highest ratio?',
+			'data_dir': '/tmp/task/chart_data/scan-id',
+		},
 		{'action': 'calculate', 'operation': 'argmax_growth', 'text': '{"2023":10,"2024":12}'},
 		{'action': 'finish', 'success': True, 'answer': '42', 'evidence': ['The page displays 42.']},
 	],
@@ -207,6 +214,16 @@ def test_agent_decision_rejects_conflicting_nested_gateway_action() -> None:
 		{'action': 'finish', 'success': True, 'answer': '42'},
 		{'action': 'finish', 'success': True, 'evidence': ['fact']},
 		{'action': 'finish', 'success': True, 'answer': '42', 'evidence': 'not-a-list'},
+		{'action': 'call_data_analysis_assistant', 'analysis_query': 'Analyze this.'},
+		{'action': 'call_data_analysis_assistant', 'data_dir': '/tmp/task/chart_data/scan-id'},
+		{
+			'action': 'call_data_analysis_assistant',
+			'analysis_query': 'Analyze this.',
+			'data_dir': '/tmp/task/chart_data/scan-id',
+			'cursor': 'not-accepted',
+		},
+		{'action': 'call_data_analysis_assistant', 'analysis_query': '   ', 'data_dir': '/tmp/data'},
+		{'action': 'find_chart_data_requests', 'analysis_query': 'Analyze this.'},
 	],
 )
 def test_agent_decision_rejects_missing_or_irrelevant_parameters(payload: dict[str, object]) -> None:

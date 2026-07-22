@@ -2,3 +2,5 @@
 - Challenge: https://mininglamp-ai.github.io/WebRetriever_Challenge/
 - Challenge guide: https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/
 - Challenge data: data/data/protocol3.json
+- The execution entry point of the program is 'python run_webretriever.py'
+- webretriever is the agent that we need to jointly build

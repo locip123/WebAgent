@@ -1,0 +1,84 @@
+---
+title: "Migration Troubleshooting"
+description: "Common issues and solutions when migrating from v2 to v3"
+---
+
+<Note>
+  This guide covers common issues encountered during migration. For breaking
+  changes and migration steps, see the [Migration Guide](/v3/migration-guide).
+</Note>
+
+## Common Issues and Solutions
+
+### Issue: LLM Not Found
+
+**Problem**: `ModuleNotFoundError: No module named 'pandasai.llm'`
+
+**Solution**: Install the appropriate LLM extension
+
+```bash
+pip install pandasai-litellm
+```
+
+### Issue: Skills Not Working
+
+**Problem**: Skills not being recognized
+
+**Solution**: Use the new `@pai.skill()` decorator
+
+```python
+# v2
+from pandasai.skills import skill
+@skill
+def my_skill():
+    pass
+
+# v3
+import pandasai as pai
+@pai.skill()
+def my_skill():
+    "doc string"
+    pass
+```
+
+### Issue: Configuration Not Applied
+
+**Problem**: Configuration settings not taking effect
+
+**Solution**: Use global configuration
+
+```python
+# v2
+df = SmartDataframe(data, config=config)
+
+# v3
+pai.config.set(config)
+df = pai.DataFrame(data)
+```
+
+### Issue: Agent Methods Not Found
+
+**Problem**: `AttributeError: 'Agent' object has no attribute 'clarification_questions'` (or `rephrase_query`, `explain`)
+
+**Solution**: These methods have been removed in v3. Use alternatives:
+
+```python
+# v2 - These methods are removed
+agent.clarification_questions('What is the GDP?')
+agent.rephrase_query('What is the GDP?')
+agent.explain()
+
+# v3 - Use these instead
+response = agent.chat('What is the GDP?')
+follow_up = agent.follow_up('What about last year?')  # Maintains context
+```
+
+## Get Support
+
+### Community Support
+
+If you need help with migration or have questions, join our **[Discord community](https://discord.gg/KYKj9F2FRH)** where you can get support from other PandasAI users and contributors.
+
+### Enterprise Support
+
+Enterprise customers should contact their dedicated account manager via Slack or through the dedicated support channel selected at purchase. Enterprise support includes priority assistance with migration, custom implementation guidance, and direct access to the engineering team.

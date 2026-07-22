@@ -49,6 +49,17 @@ dependencies = [
     "browser-harness==0.1.6",
     "playwright==1.61.0",
     "xlrd==2.0.2",
+    # Task-local, MIT-core PandasAI runtime used by WebRetriever's
+    # call_data_analysis_assistant action.
+    # browser-use-core 0.13.2 requires pandas>=2.3.3; the extracted PandasAI
+    # generation core is verified through pandas 3.0.x.
+    "pandas>=2.3.3,<3.1",
+    "numpy==1.26.4",
+    "duckdb>=1.0,<2",
+    "sqlglot>=25.0.3,<26",
+    "astor>=0.8.1,<1",
+    "jinja2>=3.1.3,<4",
+    "pyyaml>=6,<7",
 ]
 # google-api-core: only used for Google LLM APIs
 # pyperclip: only used for examples that use copy/paste
@@ -70,7 +81,7 @@ core = [
 ]
 aws = ["boto3==1.42.37"]
 oci = ["oci==2.166.0"]
-video = ["imageio[ffmpeg]==2.37.2", "numpy==2.4.1"]
+video = ["imageio[ffmpeg]==2.37.2", "numpy==1.26.4"]
 examples = [
     "agentmail==0.0.59",
     # botocore: only needed for Bedrock Claude boto3 examples/models/bedrock_claude.py
@@ -179,15 +190,60 @@ reportMissingTypeStubs = false
 [tool.hatch.build]
 include = [
     "browser_use/**/*.py",
+    "browser_use/pandas-ai/LICENSE",
+    "browser_use/pandas-ai/WEBRETRIEVER_CORE.md",
+    "browser_use/pandas-ai/pandasai/core/prompts/templates/generate_python_code_with_sql.tmpl",
+    "browser_use/pandas-ai/pandasai/core/prompts/templates/generate_system_message.tmpl",
+    "browser_use/pandas-ai/pandasai/core/prompts/templates/shared/dataframe.tmpl",
+    "browser_use/pandas-ai/pandasai/core/prompts/templates/shared/sql_functions.tmpl",
+    "!browser_use/pandas-ai/pandasai/ee/**",
+    "!browser_use/pandas-ai/extensions/**",
+    "!browser_use/pandas-ai/tests/**",
     "!browser_use/**/tests/*.py",
     "!browser_use/**/tests.py",
-	"browser_use/agent/system_prompts/*.md",
+    "browser_use/agent/system_prompts/*.md",
     "browser_use/cli_templates/*.py",
     "browser_use/skills/**/*.md",
     "browser_use/py.typed",
     "browser_use/dom/**/*.js",
     "!tests/**/*.py",
     "!debug/*",
+]
+
+[tool.hatch.build.targets.wheel]
+exclude = [
+    "browser_use/pandas-ai/pandasai/cli/**",
+    "browser_use/pandas-ai/pandasai/ee/**",
+    "browser_use/pandas-ai/pandasai/core/code_execution/**",
+    "browser_use/pandas-ai/pandasai/core/response/**",
+    "browser_use/pandas-ai/pandasai/core/user_query.py",
+    "browser_use/pandas-ai/pandasai/core/prompts/correct_execute_sql_query_usage_error_prompt.py",
+    "browser_use/pandas-ai/pandasai/core/prompts/correct_output_type_error_prompt.py",
+    "browser_use/pandas-ai/pandasai/dataframe/virtual_dataframe.py",
+    "browser_use/pandas-ai/pandasai/data_loader/duck_db_connection_manager.py",
+    "browser_use/pandas-ai/pandasai/data_loader/loader.py",
+    "browser_use/pandas-ai/pandasai/data_loader/local_loader.py",
+    "browser_use/pandas-ai/pandasai/data_loader/sql_loader.py",
+    "browser_use/pandas-ai/pandasai/data_loader/view_loader.py",
+    "browser_use/pandas-ai/pandasai/helpers/env.py",
+    "browser_use/pandas-ai/pandasai/helpers/filemanager.py",
+    "browser_use/pandas-ai/pandasai/helpers/folder.py",
+    "browser_use/pandas-ai/pandasai/helpers/json_encoder.py",
+    "browser_use/pandas-ai/pandasai/helpers/logger.py",
+    "browser_use/pandas-ai/pandasai/helpers/session.py",
+    "browser_use/pandas-ai/pandasai/helpers/sql_sanitizer.py",
+    "browser_use/pandas-ai/pandasai/helpers/telemetry.py",
+    "browser_use/pandas-ai/pandasai/llm/fake.py",
+    "browser_use/pandas-ai/pandasai/query_builders/base_query_builder.py",
+    "browser_use/pandas-ai/pandasai/query_builders/local_query_builder.py",
+    "browser_use/pandas-ai/pandasai/query_builders/paginator.py",
+    "browser_use/pandas-ai/pandasai/query_builders/sql_query_builder.py",
+    "browser_use/pandas-ai/pandasai/query_builders/sql_transformation_manager.py",
+    "browser_use/pandas-ai/pandasai/query_builders/view_query_builder.py",
+    "browser_use/pandas-ai/pandasai/sandbox/**",
+    "browser_use/pandas-ai/pandasai/smart_dataframe/**",
+    "browser_use/pandas-ai/pandasai/smart_datalake/**",
+    "browser_use/pandas-ai/pandasai/vectorstores/**",
 ]
 
 [tool.pytest.ini_options]

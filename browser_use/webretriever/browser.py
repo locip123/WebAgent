@@ -37,6 +37,7 @@ __all__ = [
 	'BrowserRuntime',
 	'ElementRef',
 	'cdp_headers_for_url',
+	'is_sec_url',
 	'is_forbidden_search_url',
 	'redact_cdp_url',
 ]
@@ -87,6 +88,21 @@ def redact_cdp_url(cdp_url: str) -> str:
 
 def _host_matches(host: str, domain: str) -> bool:
 	return host == domain or host.endswith(f'.{domain}')
+
+
+def is_sec_url(url: str) -> bool:
+	"""Whether *url* belongs to SEC.gov or one of its subdomains."""
+
+	if not isinstance(url, str) or not url.strip():
+		return False
+	candidate = url.strip()
+	if '://' not in candidate and not candidate.startswith('//'):
+		candidate = f'//{candidate}'
+	try:
+		host = (urlsplit(candidate).hostname or '').rstrip('.').lower()
+	except ValueError:
+		return False
+	return _host_matches(host, 'sec.gov')
 
 
 def is_forbidden_search_url(url: str) -> bool:
@@ -355,6 +371,7 @@ class BrowserRuntime:
 		navigation_timeout_ms: int = 60_000,
 		action_timeout_ms: int = 20_000,
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
+		declared_user_agent: str | None = None,
 	) -> None:
 		self.context = context
 		self.task_dir = Path(task_dir)
@@ -362,17 +379,28 @@ class BrowserRuntime:
 		self.navigation_timeout_ms = navigation_timeout_ms
 		self.action_timeout_ms = action_timeout_ms
 		self.max_response_body_bytes = max(0, max_response_body_bytes)
+		self.declared_user_agent = declared_user_agent
 
 		self.page: Page | None = None
 		self.website = ''
 		self.visited_urls: list[str] = []
 		self.all_requests: list[dict[str, Any]] = []
+		# ``all_requests`` is the competition-compatible XHR/Fetch capture.  Keep a
+		# separate all-resource cache for chart-request discovery so broad capture
+		# does not change the evaluator-facing capture.json contract.
+		self.network_requests: list[dict[str, Any]] = []
 		self.downloads: list[dict[str, Any]] = []
 
 		self._owned_pages: list[Page] = []
 		self._page_handlers: dict[int, list[tuple[str, Callable[..., Any]]]] = {}
 		self._context_handlers: list[tuple[str, Callable[..., Any]]] = []
 		self._request_entries: dict[int, dict[str, Any]] = {}
+		self._network_request_entries: dict[int, dict[str, Any]] = {}
+		self._network_entries_by_id: dict[int, dict[str, Any]] = {}
+		self._network_responses: dict[int, Response] = {}
+		self._next_network_request_id = 0
+		self._page_ids: dict[int, int] = {}
+		self._page_document_generations: dict[int, int] = {}
 		self._element_bindings: dict[int, _ElementBinding] = {}
 		self._last_safe_urls: dict[int, str] = {}
 		self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -414,6 +442,7 @@ class BrowserRuntime:
 		self._install_context_listeners()
 		page = await self.context.new_page()
 		self._register_page(page, make_active=True)
+		await self._configure_owned_page(page)
 		self._started = True
 		self.logger.info('Opening exact task start URL: %s', redact_cdp_url(website))
 		download_started = await self._goto_exact(page, website)
@@ -531,6 +560,11 @@ class BrowserRuntime:
 		self._owned_pages.clear()
 		self._element_bindings.clear()
 		self._request_entries.clear()
+		self._network_request_entries.clear()
+		self._network_entries_by_id.clear()
+		self._network_responses.clear()
+		self._page_ids.clear()
+		self._page_document_generations.clear()
 		self._reserved_download_paths.clear()
 		self.page = None
 
@@ -548,6 +582,8 @@ class BrowserRuntime:
 	def _register_page(self, page: Page, *, make_active: bool) -> None:
 		if all(id(existing) != id(page) for existing in self._owned_pages):
 			self._owned_pages.append(page)
+			self._page_ids[id(page)] = len(self._page_ids)
+			self._page_document_generations[id(page)] = 0
 		page.set_default_timeout(self.action_timeout_ms)
 		page.set_default_navigation_timeout(self.navigation_timeout_ms)
 		if id(page) not in self._page_handlers:
@@ -566,10 +602,32 @@ class BrowserRuntime:
 			self.page = page
 		self._record_url(page.url, unless_last=True)
 
+	async def _configure_owned_page(self, page: Page) -> None:
+		"""Apply the declared SEC identity before an owned page navigates."""
+
+		if self.declared_user_agent and is_sec_url(self.website):
+			await page.set_extra_http_headers({'User-Agent': self.declared_user_agent})
+
+	def _capture_request_headers(self, headers: Mapping[str, str]) -> dict[str, str]:
+		"""Copy request headers while keeping configured contact details private."""
+
+		captured = dict(headers)
+		if not self.declared_user_agent:
+			return captured
+		for name, value in tuple(captured.items()):
+			if name.lower() == 'user-agent' and value == self.declared_user_agent:
+				captured[name] = _REDACTED
+		return captured
+
 	def _on_context_page(self, page: Page) -> None:
 		if self._closed:
 			return
 		self._register_page(page, make_active=True)
+		# A target=_blank link or script-created popup is registered by the
+		# browser, not by one of our explicit new-page actions. Schedule the same
+		# page-scoped declaration for its follow-up requests.
+		if self.declared_user_agent and is_sec_url(self.website):
+			self._spawn_background(self._configure_owned_page(page))
 
 	def _on_page_closed(self, page: Page) -> None:
 		if self.page is page:
@@ -579,6 +637,7 @@ class BrowserRuntime:
 	def _on_frame_navigated(self, page: Page, frame: Frame) -> None:
 		if frame is not page.main_frame:
 			return
+		self._page_document_generations[id(page)] = self._page_document_generations.get(id(page), 0) + 1
 		url = frame.url
 		if is_forbidden_search_url(url):
 			if id(page) not in self._rollback_pages and not self._closed:
@@ -588,9 +647,30 @@ class BrowserRuntime:
 			self._record_url(url)
 			self._last_safe_urls[id(page)] = url
 
+	def _network_request_owner(self, request: Request) -> tuple[int | None, int | None, str, str]:
+		"""Resolve a request to its owning top-level page and document generation."""
+
+		try:
+			frame = request.frame
+			page = frame.page
+		except Exception:
+			return None, None, '', ''
+		page_key = id(page)
+		document_generation = self._page_document_generations.get(page_key)
+		# The main-document request fires before ``framenavigated`` advances the
+		# generation. Attribute the entire redirect chain to the document it is
+		# creating so the current-page snapshot includes its own HTML request.
+		with contextlib.suppress(Exception):
+			if request.is_navigation_request() and frame is page.main_frame and document_generation is not None:
+				document_generation += 1
+		return (
+			self._page_ids.get(page_key),
+			document_generation,
+			str(page.url),
+			str(frame.url),
+		)
+
 	def _on_request(self, request: Request) -> None:
-		if request.resource_type not in {'xhr', 'fetch'}:
-			return
 		post_data: str | None = None
 		raw_post_data: str | None = None
 		json_data: Any = None
@@ -605,22 +685,56 @@ class BrowserRuntime:
 		if post_data:
 			with contextlib.suppress(json.JSONDecodeError):
 				json_data = json.loads(post_data)
-		entry: dict[str, Any] = {
+		page_id, document_generation, page_url, frame_url = self._network_request_owner(request)
+		request_id = self._next_network_request_id
+		self._next_network_request_id += 1
+		network_entry: dict[str, Any] = {
+			'request_id': request_id,
 			'timestamp': time.time(),
 			'url': request.url,
 			'method': request.method,
-			'headers': dict(request.headers),
+			'headers': self._capture_request_headers(request.headers),
 			'resource_type': request.resource_type,
 			'post_data': post_data,
 			'post_text': post_data,
 			'json_data': json_data,
+			'page_id': page_id,
+			'document_generation': document_generation,
+			'page_url': page_url,
+			'frame_url': frame_url,
+			'response_body_state': 'pending',
 		}
 		if raw_post_data is not None:
-			entry['raw_post_data'] = raw_post_data
-		self.all_requests.append(entry)
-		self._request_entries[id(request)] = entry
+			network_entry['raw_post_data'] = raw_post_data
+		self.network_requests.append(network_entry)
+		self._network_request_entries[id(request)] = network_entry
+		self._network_entries_by_id[request_id] = network_entry
+
+		if request.resource_type in {'xhr', 'fetch'}:
+			# Preserve the historical capture schema exactly; page provenance and
+			# request IDs belong only to the action-specific all-resource cache.
+			entry = {
+				'timestamp': network_entry['timestamp'],
+				'url': network_entry['url'],
+				'method': network_entry['method'],
+				'headers': copy.deepcopy(network_entry['headers']),
+				'resource_type': network_entry['resource_type'],
+				'post_data': post_data,
+				'post_text': post_data,
+				'json_data': copy.deepcopy(json_data),
+			}
+			if raw_post_data is not None:
+				entry['raw_post_data'] = raw_post_data
+			self.all_requests.append(entry)
+			self._request_entries[id(request)] = entry
 
 	def _on_response(self, response: Response) -> None:
+		network_entry = self._network_request_entries.get(id(response.request))
+		if network_entry is not None:
+			network_entry['status'] = response.status
+			network_entry['response_headers'] = dict(response.headers)
+			network_entry['response_body_state'] = 'available'
+			self._network_responses[int(network_entry['request_id'])] = response
 		entry = self._request_entries.get(id(response.request))
 		if entry is not None:
 			self._spawn_background(self._capture_response(response, entry))
@@ -632,6 +746,11 @@ class BrowserRuntime:
 				self._spawn_download(self._save_document_response(response, extension))
 
 	def _on_request_failed(self, request: Request) -> None:
+		network_entry = self._network_request_entries.get(id(request))
+		if network_entry is not None:
+			with contextlib.suppress(Exception):
+				network_entry['failure'] = request.failure
+			network_entry['response_body_state'] = 'failed'
 		entry = self._request_entries.get(id(request))
 		if entry is None:
 			return
@@ -668,6 +787,88 @@ class BrowserRuntime:
 			raise
 		except Exception as exc:
 			entry['response_error'] = f'{type(exc).__name__}: {exc}'[:500]
+
+	async def settle_network_capture(self) -> None:
+		"""Finish response collectors that were already scheduled by the browser."""
+
+		await self._drain_background_tasks()
+
+	def current_page_network_requests(self) -> list[dict[str, Any]]:
+		"""Return all HTTP requests belonging to the active page's current document.
+
+		Requests initiated by child frames retain the top-level page identifier, so
+		Tableau and similar cross-origin embeds are included. Requests from previous
+		documents and other tabs are excluded.
+		"""
+
+		page = self._active_page()
+		page_key = id(page)
+		page_id = self._page_ids.get(page_key)
+		document_generation = self._page_document_generations.get(page_key)
+		if page_id is None or document_generation is None:
+			return []
+		return [
+			copy.deepcopy(entry)
+			for entry in self.network_requests
+			if entry.get('page_id') == page_id and entry.get('document_generation') == document_generation
+		]
+
+	async def materialize_network_request(
+		self,
+		request_id: int,
+		*,
+		max_body_bytes: int = _MAX_DOWNLOAD_BYTES,
+	) -> dict[str, Any]:
+		"""Return one all-resource request with its complete bounded response body."""
+
+		entry = self._network_entries_by_id.get(int(request_id))
+		if entry is None:
+			raise ValueError(f'Unknown network request_id {request_id}')
+		state = str(entry.get('response_body_state', 'pending'))
+		if state in {'complete', 'body_too_large', 'failed', 'unavailable', 'error'}:
+			return copy.deepcopy(entry)
+
+		response = self._network_responses.get(int(request_id))
+		if response is None:
+			entry['response_body_state'] = 'unavailable' if entry.get('status') is not None else 'pending'
+			return copy.deepcopy(entry)
+
+		headers = entry.get('response_headers')
+		if not isinstance(headers, Mapping):
+			headers = dict(response.headers)
+			entry['response_headers'] = dict(headers)
+		content_length = self._content_length(headers)
+		if content_length is not None and content_length > max_body_bytes:
+			entry['response_body_state'] = 'body_too_large'
+			entry['response_body_bytes'] = content_length
+			entry['response_error'] = f'content-length {content_length} exceeds {max_body_bytes} byte limit'
+			return copy.deepcopy(entry)
+
+		try:
+			body = await asyncio.wait_for(response.body(), timeout=max(1, self.action_timeout_ms / 1000))
+			entry['response_body_bytes'] = len(body)
+			if len(body) > max_body_bytes:
+				entry['response_body_state'] = 'body_too_large'
+				entry['response_error'] = f'response body {len(body)} exceeds {max_body_bytes} byte limit'
+				return copy.deepcopy(entry)
+
+			content_type = str(headers.get('content-type', '')).lower()
+			if self._is_textual_content(content_type, body):
+				text = body.decode(self._charset(content_type), errors='replace')
+				entry['response_body'] = text
+				if 'json' in content_type:
+					with contextlib.suppress(json.JSONDecodeError):
+						entry['response_json'] = json.loads(text)
+			else:
+				entry['response_body_base64'] = base64.b64encode(body).decode('ascii')
+				entry['response_body_encoding'] = 'base64'
+			entry['response_body_state'] = 'complete'
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			entry['response_body_state'] = 'error'
+			entry['response_error'] = f'{type(exc).__name__}: {exc}'[:500]
+		return copy.deepcopy(entry)
 
 	def _on_download(self, download: Download) -> None:
 		self._download_urls_seen.add(download.url)
@@ -816,6 +1017,7 @@ class BrowserRuntime:
 			if new_tab:
 				page = await self.context.new_page()
 				self._register_page(page, make_active=True)
+				await self._configure_owned_page(page)
 			download_started = await self._goto_exact(page, url)
 			self._record_url(url if download_started else page.url, unless_last=True)
 			return f'downloaded document from {url}' if download_started else f'navigated to {page.url}'
@@ -854,7 +1056,7 @@ class BrowserRuntime:
 				delta_x = -amount if direction == 'left' else amount
 		if self._has_target(params):
 			result = await self._target_locator(params).evaluate(
-				'''(element, delta) => {
+				"""(element, delta) => {
 					const permitsScroll = (node, axis) => {
 						const style = getComputedStyle(node);
 						const overflow = axis === 'x' ? style.overflowX : style.overflowY;
@@ -880,7 +1082,7 @@ class BrowserRuntime:
 						afterX: target.scrollLeft,
 						afterY: target.scrollTop,
 					};
-				}''',
+				}""",
 				{'x': delta_x, 'y': delta_y},
 			)
 			target_name = str(result.get('tag', 'element'))
@@ -921,6 +1123,7 @@ class BrowserRuntime:
 		if operation in {'new', 'open', 'create'}:
 			page = await self.context.new_page()
 			self._register_page(page, make_active=True)
+			await self._configure_owned_page(page)
 			url = self._first(params, 'url')
 			if url is not None:
 				url = str(url)
@@ -970,7 +1173,7 @@ class BrowserRuntime:
 					if await item.is_visible():
 						text = re.sub(r'\s+', ' ', await item.inner_text(timeout=self.action_timeout_ms)).strip()
 						metadata = await item.evaluate(
-							'''(element, options) => {
+							"""(element, options) => {
 								const interactiveSelector = [
 									'a[href]', 'button', 'input:not([type="hidden"])', 'textarea', 'select',
 									'[contenteditable="true"]', '[role="button"]', '[role="link"]',
@@ -998,12 +1201,15 @@ class BrowserRuntime:
 										&& rect.top < window.innerHeight && rect.left < window.innerWidth,
 									revealed,
 								};
-							}''',
+							}""",
 							{'reveal': not revealed_control},
 						)
 						if metadata.get('revealed'):
 							revealed_control = True
-						details = [f'tag={metadata.get("tag", "")}', f'in_viewport={str(bool(metadata.get("inViewport"))).lower()}']
+						details = [
+							f'tag={metadata.get("tag", "")}',
+							f'in_viewport={str(bool(metadata.get("inViewport"))).lower()}',
+						]
 						if metadata.get('revealed'):
 							details.append('revealed_for_next_observation=true')
 						if metadata.get('id'):

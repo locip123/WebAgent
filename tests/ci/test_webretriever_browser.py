@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import zipfile
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.async_api import async_playwright
 
 from browser_use.webretriever.browser import (
 	BrowserObservation,
@@ -16,6 +18,7 @@ from browser_use.webretriever.browser import (
 	_ElementBinding,
 	cdp_headers_for_url,
 	is_forbidden_search_url,
+	is_sec_url,
 	redact_cdp_url,
 )
 from browser_use.webretriever.models import AgentDecision
@@ -160,6 +163,7 @@ class FakePage:
 		self.keyboard = FakeKeyboard()
 		self.handlers: dict[str, list[Any]] = {}
 		self.goto_urls: list[str] = []
+		self.extra_http_headers: list[dict[str, str]] = []
 		self.screenshot_paths: list[str] = []
 		self.closed = False
 		self.back_url = 'https://start.example/path'
@@ -183,6 +187,9 @@ class FakePage:
 		self.goto_urls.append(url)
 		self.url = url
 		self.main_frame.url = url
+
+	async def set_extra_http_headers(self, headers: dict[str, str]) -> None:
+		self.extra_http_headers.append(headers)
 
 	async def go_back(self, **kwargs: Any) -> None:
 		self.url = self.back_url
@@ -270,6 +277,16 @@ def test_search_detection_does_not_use_unsafe_substrings() -> None:
 	assert not is_forbidden_search_url('https://notgoogle.com/search?q=x')
 
 
+@pytest.mark.parametrize('url', ['https://sec.gov', 'https://www.sec.gov/', 'https://data.sec.gov/submissions/CIK.json'])
+def test_sec_detection_matches_only_sec_hosts(url: str) -> None:
+	assert is_sec_url(url)
+
+
+@pytest.mark.parametrize('url', ['https://notsec.gov', 'https://sec.gov.example.test', 'https://example.test/?next=sec.gov'])
+def test_sec_detection_rejects_lookalike_hosts(url: str) -> None:
+	assert not is_sec_url(url)
+
+
 async def test_start_uses_exact_url_and_close_cleans_listeners_and_page(tmp_path: Path) -> None:
 	page = FakePage()
 	context = FakeContext([page])
@@ -285,6 +302,137 @@ async def test_start_uses_exact_url_and_close_cleans_listeners_and_page(tmp_path
 	assert page.closed
 	assert len(context.removed) == 4
 	assert all(not handlers for handlers in context.handlers.values())
+
+
+async def test_sec_start_declares_user_agent_before_first_navigation(tmp_path: Path) -> None:
+	page = FakePage()
+	context = FakeContext([page])
+	declared = 'Example Organization sec-admin@example.org'
+	runtime = BrowserRuntime(
+		context,
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		declared_user_agent=declared,
+	)  # type: ignore[arg-type]
+
+	await runtime.start('https://www.sec.gov/Archives/edgar/data/1/')
+
+	assert page.extra_http_headers == [{'User-Agent': declared}]
+	assert page.goto_urls == ['https://www.sec.gov/Archives/edgar/data/1/']
+
+
+async def test_declared_sec_user_agent_is_sent_on_first_navigation(monkeypatch, tmp_path: Path) -> None:
+	seen_headers: dict[str, str] = {}
+
+	async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+		raw_request = await reader.readuntil(b'\r\n\r\n')
+		for line in raw_request.decode('latin-1').split('\r\n')[1:]:
+			if line.lower().startswith('user-agent:'):
+				seen_headers['user-agent'] = line.split(':', 1)[1].strip()
+		writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK')
+		await writer.drain()
+		writer.close()
+		await writer.wait_closed()
+
+	server = await asyncio.start_server(handle_connection, '127.0.0.1', 0)
+	port = server.sockets[0].getsockname()[1]
+	declared = 'Example Organization sec-admin@example.org'
+	monkeypatch.setattr('browser_use.webretriever.browser.is_sec_url', lambda _url: True)
+	try:
+		async with async_playwright() as playwright:
+			browser = await playwright.chromium.launch(headless=True)
+			context = await browser.new_context()
+			runtime = BrowserRuntime(
+				context,
+				tmp_path,
+				logging.getLogger('test-webretriever'),
+				declared_user_agent=declared,
+			)
+			try:
+				await runtime.start(f'http://127.0.0.1:{port}/')
+			finally:
+				await runtime.close()
+				await browser.close()
+	finally:
+		server.close()
+		await server.wait_closed()
+
+	assert seen_headers['user-agent'] == declared
+
+
+async def test_non_sec_start_does_not_declare_sec_user_agent(tmp_path: Path) -> None:
+	page = FakePage()
+	context = FakeContext([page])
+	runtime = BrowserRuntime(
+		context,
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		declared_user_agent='Example Organization sec-admin@example.org',
+	)  # type: ignore[arg-type]
+
+	await runtime.start('https://example.test/')
+
+	assert page.extra_http_headers == []
+
+
+async def test_sec_user_agent_does_not_contaminate_a_later_non_sec_task(tmp_path: Path) -> None:
+	sec_page = FakePage()
+	non_sec_page = FakePage()
+	context = FakeContext([sec_page, non_sec_page])
+	declared = 'Example Organization sec-admin@example.org'
+	sec_runtime = BrowserRuntime(
+		context,
+		tmp_path / 'sec',
+		logging.getLogger('test-webretriever'),
+		declared_user_agent=declared,
+	)  # type: ignore[arg-type]
+	await sec_runtime.start('https://www.sec.gov/')
+	await sec_runtime.close()
+
+	non_sec_runtime = BrowserRuntime(context, tmp_path / 'non-sec', logging.getLogger('test-webretriever'))  # type: ignore[arg-type]
+	await non_sec_runtime.start('https://example.test/')
+
+	assert sec_page.extra_http_headers == [{'User-Agent': declared}]
+	assert non_sec_page.extra_http_headers == []
+
+
+async def test_sec_new_tab_declares_user_agent(tmp_path: Path) -> None:
+	first_page = FakePage()
+	second_page = FakePage()
+	context = FakeContext([first_page, second_page])
+	declared = 'Example Organization sec-admin@example.org'
+	runtime = BrowserRuntime(
+		context,
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		declared_user_agent=declared,
+	)  # type: ignore[arg-type]
+	await runtime.start('https://www.sec.gov/')
+
+	await runtime.execute({'action': 'new_tab', 'url': 'https://www.sec.gov/Archives/edgar/data/1/'})
+
+	assert first_page.extra_http_headers == [{'User-Agent': declared}]
+	assert second_page.extra_http_headers == [{'User-Agent': declared}]
+	assert second_page.goto_urls == ['https://www.sec.gov/Archives/edgar/data/1/']
+
+
+async def test_sec_popup_declares_user_agent_for_follow_up_requests(tmp_path: Path) -> None:
+	first_page = FakePage()
+	popup_page = FakePage()
+	context = FakeContext([first_page])
+	declared = 'Example Organization sec-admin@example.org'
+	runtime = BrowserRuntime(
+		context,
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		declared_user_agent=declared,
+	)  # type: ignore[arg-type]
+	await runtime.start('https://www.sec.gov/')
+
+	runtime._on_context_page(popup_page)  # type: ignore[arg-type]
+	await runtime._drain_background_tasks()
+
+	assert popup_page.extra_http_headers == [{'User-Agent': declared}]
 
 
 async def test_observe_enumerates_cross_frame_elements_and_saves_both_screenshots(tmp_path: Path) -> None:
@@ -491,6 +639,22 @@ async def test_capture_schema_is_official_compatible_and_has_bounded_response_bo
 	assert entry['json_data'] == {'query': 'widgets'}
 	assert entry['response_json'] == {'ok': True}
 	assert entry['response_body_bytes'] == 11
+
+
+async def test_capture_redacts_declared_sec_user_agent(tmp_path: Path) -> None:
+	declared = 'Example Organization sec-admin@example.org'
+	runtime = BrowserRuntime(
+		FakeContext([]),
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		declared_user_agent=declared,
+	)  # type: ignore[arg-type]
+	request = FakeRequest()
+	request.headers = {'content-type': 'application/json', 'user-agent': declared}
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+
+	assert runtime.capture_payload()['all_requests'][0]['headers']['user-agent'] == '<redacted>'
 
 
 async def test_inline_pdf_document_response_is_saved_extracted_and_deduplicated(tmp_path: Path) -> None:

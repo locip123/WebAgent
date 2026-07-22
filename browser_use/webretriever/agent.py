@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
+from browser_use.webretriever.network import ChartNetworkInspector
 from browser_use.webretriever.prompts import (
 	DEFAULT_THOUGHT_LANGUAGE,
 	build_step_prompt,
@@ -24,6 +26,9 @@ from browser_use.webretriever.prompts import (
 )
 
 T = TypeVar('T')
+_FIND_CHART_MAX_SECONDS = 60.0
+_ANALYSIS_MAX_SECONDS = 90.0
+_FINISH_RESERVE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -168,6 +173,9 @@ class ProtocolIIIAgent:
 		max_consecutive_model_output_errors: int = 3,
 		max_consecutive_model_timeouts: int = 2,
 		thought_language: str = DEFAULT_THOUGHT_LANGUAGE,
+		chart_network_inspector: Any | None = None,
+		data_analysis_assistant: Any | None = None,
+		task_deadline_monotonic: float | None = None,
 	):
 		if not 1 <= max_steps <= 100:
 			raise ValueError('max_steps must be between 1 and the competition limit of 100')
@@ -190,6 +198,20 @@ class ProtocolIIIAgent:
 		self.max_consecutive_model_timeouts = max_consecutive_model_timeouts
 		self.thought_language = normalize_thought_language(thought_language)
 		self.system_prompt = build_system_prompt(self.thought_language)
+		self.task_deadline_monotonic = task_deadline_monotonic
+		self._trusted_chart_manifests: dict[str, str] = {}
+		self._ready_chart_data_dirs: set[str] = set()
+		self._chart_artifact_filters: dict[str, dict[str, Any]] = {}
+		self.chart_network_inspector = chart_network_inspector or ChartNetworkInspector(
+			llm,
+			# Leave room inside the 300-second task watchdog for normalization,
+			# the 90-second analysis action, and the final grounded answer.
+			model_timeout_seconds=min(_FIND_CHART_MAX_SECONDS, model_timeout_seconds),
+		)
+		# Import the optional PandasAI runtime only if the model actually selects
+		# its action.  Ordinary browser tasks and unit tests therefore do not pay
+		# its import/dependency cost.
+		self.data_analysis_assistant = data_analysis_assistant
 		# The runner can enforce a task-wide deadline while this coroutine is in
 		# flight.  Retain the mutable outcome so it can persist all completed work
 		# if that outer deadline cancels ``run`` before it returns.
@@ -200,6 +222,96 @@ class ProtocolIIIAgent:
 		"""Actions, thoughts, and steps completed before an external cancellation."""
 
 		return self._partial_outcome
+
+	def _get_data_analysis_assistant(self) -> Any:
+		if self.data_analysis_assistant is None:
+			from browser_use.webretriever.data_analysis import DataAnalysisAssistant
+
+			self.data_analysis_assistant = DataAnalysisAssistant(
+				self.llm,
+				task_dir=self.task_dir,
+				task_identity=self.task.prompt_payload(),
+				model_timeout_seconds=min(90.0, self.model_timeout_seconds),
+				max_output_chars=32_000,
+				trusted_manifest_hashes=self._trusted_chart_manifests,
+			)
+		return self.data_analysis_assistant
+
+	def _remaining_task_seconds(self) -> float:
+		if self.task_deadline_monotonic is None:
+			return float('inf')
+		return max(0.0, self.task_deadline_monotonic - time.monotonic())
+
+	def _chart_action_budget(self, action: str, *, cursor: bool = False) -> float:
+		remaining = self._remaining_task_seconds()
+		if action == 'find_chart_data_requests':
+			if cursor:
+				return max(0.0, min(5.0, remaining - _FINISH_RESERVE_SECONDS))
+			# A find call must leave a full analysis window and one final model turn.
+			return max(0.0, min(_FIND_CHART_MAX_SECONDS, remaining - _ANALYSIS_MAX_SECONDS - _FINISH_RESERVE_SECONDS))
+		return max(0.0, min(_ANALYSIS_MAX_SECONDS, remaining - _FINISH_RESERVE_SECONDS))
+
+	def _register_chart_artifact(self, output: str) -> dict[str, Any] | None:
+		try:
+			payload = json.loads(output)
+		except (TypeError, json.JSONDecodeError):
+			return None
+		if not isinstance(payload, dict) or payload.get('status') != 'ready':
+			return payload if isinstance(payload, dict) else None
+		data_dir = payload.get('data_dir')
+		manifest_sha256 = payload.get('manifest_sha256')
+		if not isinstance(data_dir, str) or not isinstance(manifest_sha256, str):
+			return payload
+		try:
+			resolved = Path(data_dir).resolve(strict=True)
+			chart_root = (self.task_dir.resolve(strict=True) / 'chart_data').resolve(strict=True)
+		except (FileNotFoundError, OSError):
+			return payload
+		if resolved == chart_root or not resolved.is_relative_to(chart_root):
+			return payload
+		key = str(resolved)
+		self._trusted_chart_manifests[key] = manifest_sha256
+		self._ready_chart_data_dirs.add(key)
+		active_filters = payload.get('active_filters')
+		if not isinstance(active_filters, dict):
+			datasets = payload.get('datasets')
+			if isinstance(datasets, list):
+				candidates = [item.get('active_filters') for item in datasets if isinstance(item, dict)]
+				if candidates and isinstance(candidates[0], dict) and all(item == candidates[0] for item in candidates):
+					active_filters = candidates[0]
+		self._chart_artifact_filters[key] = dict(active_filters) if isinstance(active_filters, dict) else {}
+		return payload
+
+	def _is_ready_chart_data_dir(self, data_dir: str | None) -> bool:
+		if not isinstance(data_dir, str):
+			return False
+		try:
+			return str(Path(data_dir).resolve(strict=True)) in self._ready_chart_data_dirs
+		except (FileNotFoundError, OSError):
+			return False
+
+	def _chart_filter_mismatch(self, data_dir: str | None, analysis_query: str | None) -> str | None:
+		if not isinstance(data_dir, str):
+			return None
+		try:
+			filters = self._chart_artifact_filters.get(str(Path(data_dir).resolve(strict=True)), {})
+		except (FileNotFoundError, OSError):
+			return None
+		requested_years = set(re.findall(r'(?<!\d)(?:19|20)\d{2}(?!\d)', f'{self.task.task}\n{analysis_query or ""}'))
+		if len(requested_years) != 1:
+			return None
+		active_years: set[str] = set()
+		for name, value in filters.items():
+			folded = str(name).casefold()
+			if 'year' not in folded and not any(marker in str(name) for marker in ('年份', '年度', '年')):
+				continue
+			active_years.update(re.findall(r'(?<!\d)(?:19|20)\d{2}(?!\d)', json.dumps(value, ensure_ascii=False)))
+		if active_years and active_years != requested_years:
+			return (
+				f'active Year filter {sorted(active_years)} conflicts with requested year {sorted(requested_years)}; '
+				'correct the visible UI and run find_chart_data_requests again'
+			)
+		return None
 
 	async def run(self) -> AgentRunOutcome:
 		started_at = time.monotonic()
@@ -252,15 +364,20 @@ class ProtocolIIIAgent:
 				),
 			]
 
+			model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
+			if model_call_timeout <= 0:
+				outcome.status = 'FAIL_TASK_TIMEOUT'
+				outcome.error = 'Task deadline elapsed before the next model decision'
+				break
 			try:
 				response = await _await_with_hard_timeout(
 					self.llm.ainvoke(messages, output_format=AgentDecision),
-					self.model_timeout_seconds,
+					model_call_timeout,
 				)
 				decision = response.completion
 				_merge_usage(outcome.usage, _usage_dict(response.usage))
 			except TimeoutError:
-				model_error = f'Model request exceeded {self.model_timeout_seconds:g} seconds'
+				model_error = f'Model request exceeded {model_call_timeout:g} seconds'
 				_save_visual_screenshot(
 					screenshot,
 					self.task_dir / 'trajectory_visual' / f'{step}.png',
@@ -270,7 +387,7 @@ class ProtocolIIIAgent:
 				consecutive_model_timeouts += 1
 				consecutive_model_output_errors = 0
 				last_outcome = (
-					f'ERROR: The prior model request exceeded {self.model_timeout_seconds:g} seconds; '
+					f'ERROR: The prior model request exceeded {model_call_timeout:g} seconds; '
 					'no browser action was executed. Reassess the unchanged page and return one concise action.'
 				)
 				outcome.steps.append(
@@ -366,7 +483,99 @@ class ProtocolIIIAgent:
 			outcome.steps.append(step_record)
 			action_failed = False
 			try:
-				last_outcome = await self.runtime.execute(decision)
+				if decision.action == 'find_chart_data_requests':
+					budget = self._chart_action_budget(decision.action, cursor=decision.cursor is not None)
+					if budget <= 0:
+						last_outcome = json.dumps(
+							{
+								'action': decision.action,
+								'status': 'timeout',
+								'error': (
+									'insufficient task time remains for cursor inspection and finish'
+									if decision.cursor is not None
+									else 'insufficient task time remains for find plus analysis and finish'
+								),
+							},
+							separators=(',', ':'),
+						)
+						action_failed = True
+					else:
+						execution = await _await_with_hard_timeout(
+							self.chart_network_inspector.execute(
+								runtime=self.runtime,
+								task=self.task.task,
+								page_url=observation.url,
+								page_title=getattr(observation, 'title', ''),
+								cursor=decision.cursor,
+								task_dir=self.task_dir,
+								task_identity=self.task.prompt_payload(),
+							),
+							budget,
+						)
+						last_outcome = execution.output
+						_merge_usage(outcome.usage, execution.usage)
+						payload = self._register_chart_artifact(last_outcome)
+						if decision.cursor is not None:
+							action_failed = not isinstance(payload, dict) or payload.get('status') in {'stale_state', 'timeout'}
+						else:
+							action_failed = not isinstance(payload, dict) or payload.get('status') != 'ready'
+				elif decision.action == 'call_data_analysis_assistant':
+					budget = self._chart_action_budget(decision.action)
+					filter_mismatch = self._chart_filter_mismatch(decision.data_dir, decision.analysis_query)
+					if not self._is_ready_chart_data_dir(decision.data_dir):
+						last_outcome = json.dumps(
+							{
+								'action': decision.action,
+								'status': 'invalid_data_dir',
+								'error': 'data_dir must be the exact ready directory returned by find_chart_data_requests in this task run',
+							},
+							separators=(',', ':'),
+						)
+						action_failed = True
+					elif filter_mismatch is not None:
+						last_outcome = json.dumps(
+							{
+								'action': decision.action,
+								'status': 'invalid_manifest',
+								'error': filter_mismatch,
+							},
+							ensure_ascii=False,
+							separators=(',', ':'),
+						)
+						action_failed = True
+					elif budget <= 0:
+						last_outcome = json.dumps(
+							{
+								'action': decision.action,
+								'status': 'timeout',
+								'error': 'insufficient task time remains for analysis and finish',
+							},
+							separators=(',', ':'),
+						)
+						action_failed = True
+					else:
+						execution = await _await_with_hard_timeout(
+							self._get_data_analysis_assistant().execute(
+								analysis_query=decision.analysis_query,
+								data_dir=decision.data_dir,
+							),
+							budget,
+						)
+						last_outcome = execution.output
+						_merge_usage(outcome.usage, execution.usage)
+						try:
+							payload = json.loads(last_outcome)
+						except (TypeError, json.JSONDecodeError):
+							payload = None
+						action_failed = not isinstance(payload, dict) or payload.get('status') != 'ok'
+				else:
+					last_outcome = await self.runtime.execute(decision)
+			except TimeoutError:
+				last_outcome = json.dumps(
+					{'action': decision.action, 'status': 'timeout', 'error': 'action exceeded its shared task budget'},
+					separators=(',', ':'),
+				)
+				action_failed = True
 			except Exception as exc:
 				last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
 				action_failed = True

@@ -1,0 +1,52 @@
+---
+title: "Train PandasAI"
+---
+
+You can train PandasAI to understand your data better and to improve its performance.
+
+## Training with local Vector stores
+
+If you want to train the model with a local vector store, you can use the local `ChromaDB`, `Qdrant` or `Pinecone` vector stores. Here's how to do it:
+An enterprise license is required for using the vector stores locally, ([check it out](https://github.com/Sinaptik-AI/pandas-ai/blob/master/pandasai/ee/LICENSE)).
+If you plan to use it in production, [contact us](https://pandas-ai.com).
+
+```python
+from pandasai import Agent
+from pandasai.ee.vectorstores import ChromaDB
+from pandasai.ee.vectorstores import Qdrant
+from pandasai.ee.vectorstores import Pinecone
+from pandasai.ee.vector_stores import LanceDB
+
+# Instantiate the vector store
+vector_store = ChromaDB()
+# or with Qdrant
+# vector_store = Qdrant()
+# or with LanceDB
+vector_store = LanceDB()
+# or with Pinecone
+# vector_store = Pinecone(
+#     api_key="*****",
+#     embedding_function=embedding_function,
+#     dimensions=384, # dimension of your embedding model
+# )
+
+# Instantiate the agent with the custom vector store
+agent = Agent("data.csv", vectorstore=vector_store)
+
+# Train the model
+query = "What is the total sales for the current fiscal year?"
+response = """
+import pandas as pd
+
+df = dfs[0]
+
+# Calculate the total sales for the current fiscal year
+total_sales = df[df['date'] >= pd.to_datetime('today').replace(month=4, day=1)]['sales'].sum()
+result = { "type": "number", "value": total_sales }
+"""
+agent.train(queries=[query], codes=[response])
+
+response = agent.chat("What is the total sales for the last fiscal year?")
+print(response)
+# The model will use the information provided in the training to generate a response
+```

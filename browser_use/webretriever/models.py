@@ -36,6 +36,8 @@ ActionName: TypeAlias = Literal[
 	'read_element',
 	'find_text',
 	'inspect_network',
+	'find_chart_data_requests',
+	'call_data_analysis_assistant',
 	'calculate',
 	'finish',
 ]
@@ -193,6 +195,9 @@ class AgentDecision(BaseModel):
 	evidence: Evidence | None = None
 	success: bool | None = None
 	operation: CalculationOperation | None = None
+	cursor: str | None = None
+	analysis_query: str | None = None
+	data_dir: str | None = None
 
 	@model_validator(mode='before')
 	@classmethod
@@ -229,7 +234,7 @@ class AgentDecision(BaseModel):
 			data[field_name] = field_value
 		return data
 
-	@field_validator('text', 'url', 'key', 'answer')
+	@field_validator('text', 'url', 'key', 'answer', 'cursor', 'analysis_query', 'data_dir')
 	@classmethod
 	def _non_empty_optional_string(cls, value: str | None) -> str | None:
 		if value is not None and not value:
@@ -266,6 +271,8 @@ class AgentDecision(BaseModel):
 			'read_element': frozenset({'element_id'}),
 			'find_text': frozenset({'text'}),
 			'inspect_network': frozenset(),
+			'find_chart_data_requests': frozenset(),
+			'call_data_analysis_assistant': frozenset({'analysis_query', 'data_dir'}),
 			'calculate': frozenset({'operation', 'text'}),
 			'finish': frozenset({'success'}),
 		}
@@ -273,6 +280,7 @@ class AgentDecision(BaseModel):
 			'press': frozenset({'element_id'}),
 			'scroll': frozenset({'element_id'}),
 			'inspect_network': frozenset({'text'}),
+			'find_chart_data_requests': frozenset({'cursor'}),
 			'finish': frozenset({'answer', 'evidence'}),
 		}
 		parameter_names = {
@@ -292,6 +300,9 @@ class AgentDecision(BaseModel):
 			'evidence',
 			'success',
 			'operation',
+			'cursor',
+			'analysis_query',
+			'data_dir',
 		}
 		required = required_by_action[self.action]
 		missing = sorted(name for name in required if getattr(self, name) is None)
