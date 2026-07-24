@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import logging
 import zipfile
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from browser_use.webretriever.browser import (
@@ -22,6 +25,10 @@ from browser_use.webretriever.browser import (
 	redact_cdp_url,
 )
 from browser_use.webretriever.models import AgentDecision
+
+_VALID_PNG = base64.b64decode(
+	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+)
 
 
 class FakeLocator:
@@ -451,6 +458,252 @@ async def test_observe_enumerates_cross_frame_elements_and_saves_both_screenshot
 	assert '[Frame 1: https://frame.example/]' in observation.page_text
 	assert (tmp_path / 'trajectory' / '3.png').read_bytes() == b'image-1'
 	assert (tmp_path / 'trajectory_visual' / '3.png').read_bytes() == b'image-2'
+
+
+async def test_observe_recovers_raw_screenshot_timeout_with_current_cdp_png(tmp_path: Path) -> None:
+	class RawScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			if len(self.screenshot_paths) == 1:
+				raise PlaywrightTimeoutError('raw screenshot timed out')
+			Path(path).write_bytes(b'annotated-image')
+			return b'annotated-image'
+
+	class FakeCDPSession:
+		detached = False
+
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			assert method == 'Page.captureScreenshot'
+			return {'data': base64.b64encode(_VALID_PNG).decode('ascii')}
+
+		async def detach(self) -> None:
+			self.detached = True
+
+	class ScreenshotContext(FakeContext):
+		def __init__(self) -> None:
+			super().__init__([])
+			self.session = FakeCDPSession()
+
+		async def new_cdp_session(self, page: FakePage) -> FakeCDPSession:
+			return self.session
+
+	page = RawScreenshotTimeoutPage('https://example.test/')
+	context = ScreenshotContext()
+	runtime = BrowserRuntime(
+		context,  # type: ignore[arg-type]
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		action_timeout_ms=30_000,
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+	runtime._started = True
+	runtime.website = page.url
+	runtime.page = page  # type: ignore[assignment]
+	runtime._owned_pages = [page]  # type: ignore[list-item]
+	runtime._last_safe_urls[id(page)] = page.url
+
+	observation = await runtime.observe(0)
+
+	assert observation.screenshot == b'annotated-image'
+	assert (tmp_path / 'trajectory' / '0.png').read_bytes() == _VALID_PNG
+	assert context.session.detached
+
+
+async def test_observe_reports_both_failures_when_raw_cdp_recovery_fails(tmp_path: Path) -> None:
+	class RawScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			raise PlaywrightTimeoutError('font readiness exhausted the screenshot deadline')
+
+	class FailingCDPSession:
+		detached = False
+
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			raise RuntimeError('renderer did not answer CDP capture')
+
+		async def detach(self) -> None:
+			self.detached = True
+
+	class ScreenshotContext(FakeContext):
+		def __init__(self) -> None:
+			super().__init__([])
+			self.session = FailingCDPSession()
+
+		async def new_cdp_session(self, page: FakePage) -> FailingCDPSession:
+			return self.session
+
+	page = RawScreenshotTimeoutPage('https://example.test/')
+	context = ScreenshotContext()
+	runtime = BrowserRuntime(
+		context,  # type: ignore[arg-type]
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+	runtime._started = True
+	runtime.website = page.url
+	runtime.page = page  # type: ignore[assignment]
+	runtime._owned_pages = [page]  # type: ignore[list-item]
+	runtime._last_safe_urls[id(page)] = page.url
+
+	with pytest.raises(RuntimeError) as error:
+		await runtime.observe(0)
+
+	message = str(error.value)
+	assert 'font readiness exhausted the screenshot deadline' in message
+	assert 'renderer did not answer CDP capture' in message
+	assert context.session.detached
+
+
+async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(tmp_path: Path) -> None:
+	html = (
+		b'<!doctype html><style>'
+		b"@font-face{font-family:Stall;src:url('/stall.woff2')}body{font-family:Stall,sans-serif}"
+		b'</style><button>ready</button>'
+	)
+	release_font = asyncio.Event()
+	handler_tasks: set[asyncio.Task[Any]] = set()
+
+	async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+		task = asyncio.current_task()
+		if task is not None:
+			handler_tasks.add(task)
+		try:
+			request = await reader.readuntil(b'\r\n\r\n')
+			path = request.split(b' ', 2)[1]
+			if path == b'/stall.woff2':
+				writer.write(
+					b'HTTP/1.1 200 OK\r\n'
+					b'Content-Type: font/woff2\r\n'
+					b'Content-Length: 999999\r\n'
+					b'Connection: close\r\n\r\n'
+				)
+				await writer.drain()
+				await release_font.wait()
+			else:
+				writer.write(
+					b'HTTP/1.1 200 OK\r\n'
+					b'Content-Type: text/html\r\n'
+					+ f'Content-Length: {len(html)}\r\n'.encode()
+					+ b'Connection: close\r\n\r\n'
+					+ html
+				)
+				await writer.drain()
+		except (asyncio.IncompleteReadError, ConnectionError):
+			pass
+		finally:
+			if task is not None:
+				handler_tasks.discard(task)
+			writer.close()
+			with contextlib.suppress(Exception):
+				await writer.wait_closed()
+
+	server = await asyncio.start_server(handle_connection, '127.0.0.1', 0)
+	port = server.sockets[0].getsockname()[1]
+	runtime: BrowserRuntime | None = None
+	try:
+		async with async_playwright() as playwright:
+			browser = await playwright.chromium.launch(headless=True)
+			context = await browser.new_context()
+			runtime = BrowserRuntime(
+				context,
+				tmp_path,
+				logging.getLogger('test-webretriever'),
+				screenshot_timeout_ms=250,
+				cdp_screenshot_timeout_ms=1_000,
+			)
+			try:
+				await runtime.start(f'http://127.0.0.1:{port}/')
+				assert await runtime.page.evaluate('document.fonts.status') == 'loading'
+				observation = await runtime.observe(0)
+			finally:
+				release_font.set()
+				await runtime.close()
+				await browser.close()
+	finally:
+		release_font.set()
+		server.close()
+		await server.wait_closed()
+		if handler_tasks:
+			await asyncio.gather(*tuple(handler_tasks), return_exceptions=True)
+
+	raw = (tmp_path / 'trajectory' / '0.png').read_bytes()
+	visual = (tmp_path / 'trajectory_visual' / '0.png').read_bytes()
+	assert raw.startswith(_VALID_PNG[:8])
+	assert visual.startswith(_VALID_PNG[:8])
+	assert observation.screenshot == visual
+
+
+async def test_observe_keeps_raw_screenshot_when_annotated_capture_has_non_timeout_error(tmp_path: Path) -> None:
+	class AnnotatedScreenshotErrorPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			if len(self.screenshot_paths) == 2:
+				raise RuntimeError('annotated renderer failed')
+			Path(path).write_bytes(_VALID_PNG)
+			return _VALID_PNG
+
+	class NoFallbackContext(FakeContext):
+		async def new_cdp_session(self, page: FakePage) -> None:
+			raise AssertionError('non-timeout screenshot errors must not use CDP')
+
+	page = AnnotatedScreenshotErrorPage('https://example.test/')
+	context = NoFallbackContext([])
+	runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))  # type: ignore[arg-type]
+	runtime._started = True
+	runtime.website = page.url
+	runtime.page = page  # type: ignore[assignment]
+	runtime._owned_pages = [page]  # type: ignore[list-item]
+	runtime._last_safe_urls[id(page)] = page.url
+
+	observation = await runtime.observe(0)
+
+	assert observation.screenshot == _VALID_PNG
+	assert (tmp_path / 'trajectory' / '0.png').read_bytes() == _VALID_PNG
+	assert not (tmp_path / 'trajectory_visual' / '0.png').exists()
+
+
+async def test_observe_propagates_annotated_cdp_recovery_failure(tmp_path: Path) -> None:
+	class AnnotatedScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			if len(self.screenshot_paths) == 2:
+				raise PlaywrightTimeoutError('annotated screenshot deadline expired')
+			Path(path).write_bytes(_VALID_PNG)
+			return _VALID_PNG
+
+	class FailingCDPSession:
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			raise RuntimeError('annotated CDP capture failed')
+
+		async def detach(self) -> None:
+			return None
+
+	class ScreenshotContext(FakeContext):
+		async def new_cdp_session(self, page: FakePage) -> FailingCDPSession:
+			return FailingCDPSession()
+
+	page = AnnotatedScreenshotTimeoutPage('https://example.test/')
+	context = ScreenshotContext([])
+	runtime = BrowserRuntime(
+		context,  # type: ignore[arg-type]
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+	runtime._started = True
+	runtime.website = page.url
+	runtime.page = page  # type: ignore[assignment]
+	runtime._owned_pages = [page]  # type: ignore[list-item]
+	runtime._last_safe_urls[id(page)] = page.url
+
+	with pytest.raises(RuntimeError) as error:
+		await runtime.observe(0)
+
+	assert 'annotated screenshot deadline expired' in str(error.value)
+	assert 'annotated CDP capture failed' in str(error.value)
 
 
 async def test_model_actions_double_click_hover_xy_drag_and_page_scroll(tmp_path: Path) -> None:

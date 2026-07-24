@@ -27,6 +27,7 @@ from xml.etree import ElementTree
 
 from playwright.async_api import BrowserContext, Download, Frame, Locator, Page, Request, Response
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 if TYPE_CHECKING:
 	from browser_use.webretriever.models import AgentDecision
@@ -53,6 +54,7 @@ _MAX_RENDERED_TEXT = 100_000
 _MAX_RESPONSE_BODY_BYTES = 128 * 1024
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _MAX_DOWNLOAD_TEXT = 250_000
+_PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 _DOCUMENT_MIME_EXTENSIONS = {
 	'application/pdf': '.pdf',
 	'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
@@ -62,6 +64,10 @@ _DOCUMENT_MIME_EXTENSIONS = {
 	'application/csv': '.csv',
 }
 _DOCUMENT_EXTENSIONS = frozenset(_DOCUMENT_MIME_EXTENSIONS.values())
+
+
+class _ScreenshotFallbackError(RuntimeError):
+	"""Raised when Playwright screenshot timeout recovery through CDP also fails."""
 
 
 def cdp_headers_for_url(cdp_url: str) -> dict[str, str]:
@@ -370,6 +376,8 @@ class BrowserRuntime:
 		*,
 		navigation_timeout_ms: int = 60_000,
 		action_timeout_ms: int = 20_000,
+		screenshot_timeout_ms: int = 20_000,
+		cdp_screenshot_timeout_ms: int = 20_000,
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
 		declared_user_agent: str | None = None,
 	) -> None:
@@ -378,6 +386,8 @@ class BrowserRuntime:
 		self.logger = logger
 		self.navigation_timeout_ms = navigation_timeout_ms
 		self.action_timeout_ms = action_timeout_ms
+		self.screenshot_timeout_ms = screenshot_timeout_ms
+		self.cdp_screenshot_timeout_ms = cdp_screenshot_timeout_ms
 		self.max_response_body_bytes = max(0, max_response_body_bytes)
 		self.declared_user_agent = declared_user_agent
 
@@ -464,12 +474,14 @@ class BrowserRuntime:
 		step_name = self._safe_step_name(step)
 		raw_path = self.trajectory_dir / f'{step_name}.png'
 		visual_path = self.trajectory_visual_dir / f'{step_name}.png'
-		raw_screenshot = await page.screenshot(path=str(raw_path), type='png', animations='disabled')
+		raw_screenshot = await self._capture_screenshot(page, raw_path)
 
 		page_text = await self._collect_page_text(page)
 		elements = await self._collect_elements(page)
 		try:
-			screenshot = await page.screenshot(path=str(visual_path), type='png', animations='disabled')
+			screenshot = await self._capture_screenshot(page, visual_path)
+		except _ScreenshotFallbackError:
+			raise
 		except Exception:
 			self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
 			screenshot = raw_screenshot
@@ -492,6 +504,53 @@ class BrowserRuntime:
 			screenshot_path=str(raw_path),
 			visual_screenshot_path=str(visual_path),
 		)
+
+	async def _capture_screenshot(self, page: Page, path: Path) -> bytes:
+		try:
+			return await page.screenshot(
+				path=str(path),
+				type='png',
+				animations='disabled',
+				timeout=self.screenshot_timeout_ms,
+			)
+		except PlaywrightTimeoutError as screenshot_timeout:
+			self.logger.warning('Playwright screenshot timed out for %s; falling back to CDP capture', path.name)
+			try:
+				screenshot = await asyncio.wait_for(
+					self._capture_cdp_screenshot(page, path),
+					timeout=self.cdp_screenshot_timeout_ms / 1000,
+				)
+			except Exception as fallback_error:
+				raise _ScreenshotFallbackError(
+					f'Playwright screenshot timed out after {self.screenshot_timeout_ms}ms '
+					f'({screenshot_timeout}) and CDP fallback failed: '
+					f'{type(fallback_error).__name__}: {fallback_error}'
+				) from fallback_error
+			self.logger.info('Recovered screenshot %s through CDP capture', path.name)
+			return screenshot
+
+	async def _capture_cdp_screenshot(self, page: Page, path: Path) -> bytes:
+		cdp_session = None
+		try:
+			cdp_session = await self.context.new_cdp_session(page)
+			result = await cdp_session.send(
+				'Page.captureScreenshot',
+				{'format': 'png', 'captureBeyondViewport': False},
+			)
+			encoded = result.get('data')
+			if not isinstance(encoded, str) or not encoded:
+				raise ValueError('CDP screenshot response did not include image data')
+			try:
+				screenshot = base64.b64decode(encoded, validate=True)
+			except (ValueError, TypeError) as exc:
+				raise ValueError('CDP screenshot response was not valid base64') from exc
+			if not screenshot.startswith(_PNG_SIGNATURE):
+				raise ValueError('CDP screenshot response was not a PNG image')
+			path.write_bytes(screenshot)
+			return screenshot
+		finally:
+			if cdp_session is not None:
+				await cdp_session.detach()
 
 	async def execute(self, decision: AgentDecision | Mapping[str, Any]) -> str:
 		"""Execute one model decision and return a compact action result."""
