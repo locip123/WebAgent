@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import logging
+import stat
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -1044,6 +1045,348 @@ async def test_inline_pdf_document_response_is_saved_extracted_and_deduplicated(
 	assert item['filename'] == 'result.pdf'
 	assert 'Protocol PDF answer 42' in item['text']
 	assert Path(item['path']).read_bytes() == pdf
+
+
+async def _download_observation(
+	httpserver: Any,
+	tmp_path: Path,
+	*,
+	route: str,
+	filename: str,
+	payload: bytes,
+	find_query: str | None = None,
+) -> tuple[BrowserObservation, str]:
+	httpserver.expect_request(route).respond_with_data(
+		payload,
+		content_type='application/zip',
+		headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+	)
+	async with async_playwright() as playwright:
+		browser = await playwright.chromium.launch(headless=True)
+		context = await browser.new_context(accept_downloads=True)
+		runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
+		try:
+			await runtime.start(httpserver.url_for(route))
+			observation = await runtime.observe(0)
+			search_result = await runtime.execute({'action': 'find', 'query': find_query}) if find_query else ''
+		finally:
+			await runtime.close()
+			await browser.close()
+	return observation, search_result
+
+
+async def test_downloaded_zip_exposes_searchable_archive_members(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		archive.writestr('reports/Data.csv', 'country,2005,2006\nChina,6.465,8.5\n')
+	observation, search_result = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/official-data.ZIP',
+		filename='official-data.ZIP',
+		payload=stream.getvalue(),
+		find_query='China,6.465',
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'official-data.ZIP')
+	member_item = next(item for item in observation.downloads if item['filename'] == 'reports/Data.csv')
+	assert (tmp_path / 'downloads' / 'official-data.ZIP').is_file()
+	assert (tmp_path / 'downloads' / 'reports' / 'Data.csv').read_text() == 'country,2005,2006\nChina,6.465,8.5\n'
+	assert archive_item['extraction_status'] == 'success'
+	assert archive_item['extracted_count'] == 1
+	assert 'China,6.465' not in archive_item['text']
+	assert member_item['source'] == 'archive_member'
+	assert member_item['source_archive'] == 'official-data.ZIP'
+	assert 'download reports/Data.csv:' in search_result
+
+
+async def test_downloaded_zip_preserves_safe_members_without_overwriting_files(httpserver, tmp_path: Path) -> None:
+	download_dir = tmp_path / 'downloads'
+	(download_dir / 'shared').mkdir(parents=True)
+	(download_dir / 'shared' / 'Data.csv').write_text('existing evidence\n', encoding='utf-8')
+	(download_dir / 'blocked').write_text('directory name is already a file\n', encoding='utf-8')
+	(download_dir / 'broken.csv').symlink_to(download_dir / 'missing-target.csv')
+
+	nested_stream = BytesIO()
+	with zipfile.ZipFile(nested_stream, 'w') as nested_archive:
+		nested_archive.writestr('secret/inner.csv', 'must not be recursively extracted\n')
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		archive.writestr('shared/Data.csv', 'new evidence\n')
+		archive.writestr('blocked/report.csv', 'directory conflict resolved\n')
+		archive.writestr('broken.csv', 'broken symlink conflict resolved\n')
+		archive.writestr('nested.zip', nested_stream.getvalue())
+		archive.writestr('../escape.txt', 'unsafe\n')
+		archive.writestr('/absolute.txt', 'unsafe\n')
+		archive.writestr('C:/drive.txt', 'unsafe\n')
+		archive.writestr('D:drive-relative.txt', 'unsafe\n')
+		symlink = zipfile.ZipInfo('link.txt')
+		symlink.create_system = 3
+		symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+		archive.writestr(symlink, 'shared/Data.csv')
+		fifo = zipfile.ZipInfo('pipe')
+		fifo.create_system = 3
+		fifo.external_attr = (stat.S_IFIFO | 0o644) << 16
+		archive.writestr(fifo, b'')
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/mixed.zip',
+		filename='mixed.zip',
+		payload=stream.getvalue(),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'mixed.zip')
+	member_names = {item['filename'] for item in observation.downloads if item.get('source') == 'archive_member'}
+	assert (download_dir / 'shared' / 'Data.csv').read_text() == 'existing evidence\n'
+	assert (download_dir / 'shared' / 'Data_1.csv').read_text() == 'new evidence\n'
+	assert (download_dir / 'blocked').read_text() == 'directory name is already a file\n'
+	assert (download_dir / 'blocked_1' / 'report.csv').read_text() == 'directory conflict resolved\n'
+	assert (download_dir / 'broken.csv').is_symlink()
+	assert (download_dir / 'broken_1.csv').read_text() == 'broken symlink conflict resolved\n'
+	assert (download_dir / 'nested.zip').is_file()
+	assert not (download_dir / 'secret').exists()
+	assert not (tmp_path / 'escape.txt').exists()
+	assert not (download_dir / 'absolute.txt').exists()
+	assert not (download_dir / 'C:').exists()
+	assert not (download_dir / 'link.txt').exists()
+	assert not (download_dir / 'pipe').exists()
+	assert member_names == {'shared/Data_1.csv', 'blocked_1/report.csv', 'broken_1.csv', 'nested.zip'}
+	assert archive_item['extraction_status'] == 'partial'
+	assert archive_item['extracted_count'] == 4
+	assert archive_item['skipped_count'] == 6
+	assert len(archive_item['extraction_warnings']) == 6
+
+
+async def test_downloaded_zip_skips_member_larger_than_100_mib(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	megabyte = b'\0' * (1024 * 1024)
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		with archive.open('too-large.bin', 'w') as member:
+			for _ in range(101):
+				member.write(megabyte)
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/large-member.zip',
+		filename='large-member.zip',
+		payload=stream.getvalue(),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'large-member.zip')
+	assert (tmp_path / 'downloads' / 'large-member.zip').is_file()
+	assert not (tmp_path / 'downloads' / 'too-large.bin').exists()
+	assert 'failure' not in archive_item
+	assert archive_item['extraction_status'] == 'failed'
+	assert archive_item['extracted_count'] == 0
+	assert archive_item['skipped_count'] == 1
+	assert any('100 MiB' in warning for warning in archive_item['extraction_warnings'])
+	assert not list((tmp_path / 'downloads').glob('.*.part'))
+
+
+async def test_downloaded_zip_stops_before_250_mib_total_output(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	megabyte = b'\0' * (1024 * 1024)
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		for name, size_mib in (
+			('too-large.bin', 101),
+			('retained.bin', 90),
+			('budget-exhausted.bin', 90),
+		):
+			with archive.open(name, 'w') as member:
+				for _ in range(size_mib):
+					member.write(megabyte)
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/large-total.zip',
+		filename='large-total.zip',
+		payload=stream.getvalue(),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'large-total.zip')
+	assert not (tmp_path / 'downloads' / 'too-large.bin').exists()
+	assert (tmp_path / 'downloads' / 'retained.bin').stat().st_size == 90 * 1024 * 1024
+	assert not (tmp_path / 'downloads' / 'budget-exhausted.bin').exists()
+	assert archive_item['extraction_status'] == 'partial'
+	assert archive_item['extracted_count'] == 1
+	assert archive_item['skipped_count'] == 2
+	assert any('100 MiB' in warning for warning in archive_item['extraction_warnings'])
+	assert any('250 MiB' in warning for warning in archive_item['extraction_warnings'])
+	assert not list((tmp_path / 'downloads').glob('.*.part'))
+
+
+async def test_downloaded_zip_uses_written_bytes_instead_of_declared_size(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		archive.writestr('declared-huge.txt', 'small actual output\n')
+	payload = bytearray(stream.getvalue())
+	with zipfile.ZipFile(BytesIO(payload)) as archive:
+		info = archive.getinfo('declared-huge.txt')
+	declared_size = (2**32 - 2).to_bytes(4, 'little')
+	payload[info.header_offset + 22 : info.header_offset + 26] = declared_size
+	central_offset = payload.find(b'PK\x01\x02')
+	assert central_offset >= 0
+	payload[central_offset + 24 : central_offset + 28] = declared_size
+
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/misreported-size.zip',
+		filename='misreported-size.zip',
+		payload=bytes(payload),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'misreported-size.zip')
+	member_item = next(item for item in observation.downloads if item.get('source') == 'archive_member')
+	assert (tmp_path / 'downloads' / 'declared-huge.txt').read_text() == 'small actual output\n'
+	assert member_item['size_bytes'] == len(b'small actual output\n')
+	assert archive_item['extraction_status'] == 'success'
+
+
+async def test_downloaded_zip_exposes_at_most_1000_members(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		for index in range(1001):
+			archive.writestr(f'rows/file-{index:04}.txt', '')
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/many-members.zip',
+		filename='many-members.zip',
+		payload=stream.getvalue(),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'many-members.zip')
+	member_items = [item for item in observation.downloads if item.get('source') == 'archive_member']
+	assert (tmp_path / 'downloads' / 'rows' / 'file-0999.txt').is_file()
+	assert not (tmp_path / 'downloads' / 'rows' / 'file-1000.txt').exists()
+	assert len(member_items) == 1000
+	assert archive_item['extraction_status'] == 'partial'
+	assert archive_item['extracted_count'] == 1000
+	assert archive_item['skipped_count'] == 1
+	assert any('1,000' in warning for warning in archive_item['extraction_warnings'])
+	assert 'ZIP extraction partial: 1000 file(s) extracted, 1 member(s) skipped.' in observation.render_text()
+
+
+async def test_downloaded_zip_bounds_member_warnings_without_hiding_skip_count(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+		for index in range(150):
+			archive.writestr(f'../escape-{index}.txt', 'unsafe\n')
+		archive.writestr('safe.txt', 'usable evidence\n')
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/many-warnings.zip',
+		filename='many-warnings.zip',
+		payload=stream.getvalue(),
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'many-warnings.zip')
+	assert (tmp_path / 'downloads' / 'safe.txt').read_text() == 'usable evidence\n'
+	assert archive_item['extraction_status'] == 'partial'
+	assert archive_item['extracted_count'] == 1
+	assert archive_item['skipped_count'] == 150
+	assert len(archive_item['extraction_warnings']) == 100
+	assert archive_item['extraction_warnings'][-1] == '51 additional warning(s) omitted'
+	assert '51 additional warning(s) omitted' in archive_item['text']
+
+
+async def test_downloaded_zip_isolates_crc_and_encrypted_member_failures(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED) as archive:
+		archive.writestr('before.txt', 'before remains usable\n')
+		archive.writestr('bad-crc.txt', 'corrupt this member\n')
+		archive.writestr('encrypted.txt', 'password required\n')
+		archive.writestr(f'{"x" * 300}/too-long.txt', 'filesystem path failure\n')
+		archive.writestr('after.txt', 'after remains usable\n')
+	payload = bytearray(stream.getvalue())
+	with zipfile.ZipFile(BytesIO(payload)) as archive:
+		bad_crc = archive.getinfo('bad-crc.txt')
+		name_length = int.from_bytes(payload[bad_crc.header_offset + 26 : bad_crc.header_offset + 28], 'little')
+		extra_length = int.from_bytes(payload[bad_crc.header_offset + 28 : bad_crc.header_offset + 30], 'little')
+		data_offset = bad_crc.header_offset + 30 + name_length + extra_length
+		payload[data_offset] ^= 0xFF
+
+	central_offset = payload.find(b'PK\x01\x02')
+	while central_offset >= 0 and payload[central_offset : central_offset + 4] == b'PK\x01\x02':
+		name_length = int.from_bytes(payload[central_offset + 28 : central_offset + 30], 'little')
+		extra_length = int.from_bytes(payload[central_offset + 30 : central_offset + 32], 'little')
+		comment_length = int.from_bytes(payload[central_offset + 32 : central_offset + 34], 'little')
+		name_start = central_offset + 46
+		name = bytes(payload[name_start : name_start + name_length]).decode()
+		if name == 'encrypted.txt':
+			flags = int.from_bytes(payload[central_offset + 8 : central_offset + 10], 'little') | 1
+			payload[central_offset + 8 : central_offset + 10] = flags.to_bytes(2, 'little')
+			local_offset = int.from_bytes(payload[central_offset + 42 : central_offset + 46], 'little')
+			local_flags = int.from_bytes(payload[local_offset + 6 : local_offset + 8], 'little') | 1
+			payload[local_offset + 6 : local_offset + 8] = local_flags.to_bytes(2, 'little')
+			break
+		central_offset = name_start + name_length + extra_length + comment_length
+
+	observation, search_result = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/member-failures.zip',
+		filename='member-failures.zip',
+		payload=bytes(payload),
+		find_query='after remains usable',
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'member-failures.zip')
+	member_names = {item['filename'] for item in observation.downloads if item.get('source') == 'archive_member'}
+	assert (tmp_path / 'downloads' / 'before.txt').read_text() == 'before remains usable\n'
+	assert (tmp_path / 'downloads' / 'after.txt').read_text() == 'after remains usable\n'
+	assert not (tmp_path / 'downloads' / 'bad-crc.txt').exists()
+	assert not (tmp_path / 'downloads' / 'encrypted.txt').exists()
+	assert member_names == {'before.txt', 'after.txt'}
+	assert archive_item['extraction_status'] == 'partial'
+	assert archive_item['extracted_count'] == 2
+	assert archive_item['skipped_count'] == 3
+	assert any('bad-crc.txt' in warning for warning in archive_item['extraction_warnings'])
+	assert any('encrypted.txt' in warning for warning in archive_item['extraction_warnings'])
+	assert any('too-long.txt' in warning for warning in archive_item['extraction_warnings'])
+	assert 'download after.txt:' in search_result
+	assert not list((tmp_path / 'downloads').glob('.*.part'))
+
+
+async def test_invalid_downloaded_zip_keeps_download_success_separate_from_extraction(httpserver, tmp_path: Path) -> None:
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/invalid.zip',
+		filename='invalid.zip',
+		payload=b'not a ZIP archive',
+	)
+
+	archive_item = next(item for item in observation.downloads if item['filename'] == 'invalid.zip')
+	assert (tmp_path / 'downloads' / 'invalid.zip').read_bytes() == b'not a ZIP archive'
+	assert 'failure' not in archive_item
+	assert archive_item['extraction_status'] == 'failed'
+	assert archive_item['extracted_count'] == 0
+	assert archive_item['skipped_count'] == 0
+	assert archive_item['extraction_warnings'] == ['Downloaded file has a .zip suffix but is not a valid ZIP archive']
+	assert not [item for item in observation.downloads if item.get('source') == 'archive_member']
+
+
+async def test_valid_zip_without_zip_filename_is_not_automatically_extracted(httpserver, tmp_path: Path) -> None:
+	stream = BytesIO()
+	with zipfile.ZipFile(stream, 'w') as archive:
+		archive.writestr('hidden.txt', 'must remain inside the unrecognised archive\n')
+	observation, _ = await _download_observation(
+		httpserver,
+		tmp_path,
+		route='/export.bin',
+		filename='export.bin',
+		payload=stream.getvalue(),
+	)
+
+	download_item = next(item for item in observation.downloads if item['filename'] == 'export.bin')
+	assert (tmp_path / 'downloads' / 'export.bin').is_file()
+	assert not (tmp_path / 'downloads' / 'hidden.txt').exists()
+	assert 'extraction_status' not in download_item
+	assert not [item for item in observation.downloads if item.get('source') == 'archive_member']
 
 
 def test_document_response_uses_observed_spreadsheet_extension() -> None:

@@ -14,7 +14,10 @@ import copy
 import json
 import logging
 import math
+import os
 import re
+import stat
+import tempfile
 import time
 import zipfile
 from dataclasses import asdict, dataclass
@@ -28,6 +31,7 @@ from xml.etree import ElementTree
 from playwright.async_api import BrowserContext, Download, Frame, Locator, Page, Request, Response
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
 	from browser_use.webretriever.models import AgentDecision
@@ -54,6 +58,10 @@ _MAX_RENDERED_TEXT = 100_000
 _MAX_RESPONSE_BODY_BYTES = 128 * 1024
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _MAX_DOWNLOAD_TEXT = 250_000
+_MAX_ARCHIVE_FILES = 1_000
+_MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
+_MAX_ARCHIVE_TOTAL_BYTES = 250 * 1024 * 1024
+_MAX_ARCHIVE_WARNINGS = 100
 _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 _DOCUMENT_MIME_EXTENSIONS = {
 	'application/pdf': '.pdf',
@@ -68,6 +76,44 @@ _DOCUMENT_EXTENSIONS = frozenset(_DOCUMENT_MIME_EXTENSIONS.values())
 
 class _ScreenshotFallbackError(RuntimeError):
 	"""Raised when Playwright screenshot timeout recovery through CDP also fails."""
+
+
+class _ArchiveResourceLimitError(RuntimeError):
+	"""Raised when a ZIP member exceeds an extraction resource budget."""
+
+
+class _ExtractedArchiveMember(BaseModel):
+	model_config = ConfigDict(extra='forbid', frozen=True)
+
+	archive_name: str
+	relative_name: str
+	path: Path
+	size_bytes: int
+
+
+class _ArchiveExtractionResult(BaseModel):
+	model_config = ConfigDict(extra='forbid', frozen=True)
+
+	status: Literal['success', 'partial', 'failed']
+	members: list[_ExtractedArchiveMember]
+	skipped_count: int
+	warnings: list[str]
+
+
+class _ArchiveMemberDownload(BaseModel):
+	model_config = ConfigDict(extra='forbid', frozen=True)
+
+	timestamp: float
+	url: str
+	suggested_filename: str
+	filename: str
+	path: str
+	size_bytes: int
+	source: Literal['archive_member']
+	source_archive: str
+	text: str
+	text_truncated: bool
+	text_extraction_error: str | None = None
 
 
 def _consume_detached_task_result(task: asyncio.Future[Any]) -> None:
@@ -263,9 +309,14 @@ class BrowserObservation:
 		for item in self.recent_network[-12:]:
 			status = item.get('status', 'pending')
 			network_lines.append(f'  {clip(item.get("method", ""), 20)} {clip(item.get("url", ""), 1_500)} [{status}]')
+		archive_summaries = [item for item in self.downloads if 'extraction_status' in item][-4:]
+		summary_paths = {str(item.get('path', '')) for item in archive_summaries}
+		other_downloads = [item for item in self.downloads if str(item.get('path', '')) not in summary_paths]
+		download_items = [*archive_summaries, *other_downloads[-(8 - len(archive_summaries)) :]]
+		download_items.sort(key=lambda item: float(item.get('timestamp', 0)))
 		download_lines = [
 			f'  {clip(item.get("filename", item.get("suggested_filename", "download")), 300)}: {clip(item.get("text", ""), 800)}'
-			for item in self.downloads[-8:]
+			for item in download_items
 		]
 		# Put compact, high-value evidence before potentially very long page text,
 		# then budget the page section independently so downloads/network cannot be
@@ -435,6 +486,7 @@ class BrowserRuntime:
 		self._started = False
 		self._closed = False
 		self._execute_lock = asyncio.Lock()
+		self._archive_extraction_lock = asyncio.Lock()
 
 		self.trajectory_dir = self.task_dir / 'trajectory'
 		self.trajectory_visual_dir = self.task_dir / 'trajectory_visual'
@@ -1003,9 +1055,43 @@ class BrowserRuntime:
 				item['failure'] = failure
 				return
 			item['size_bytes'] = destination.stat().st_size
-			text, truncated = await asyncio.to_thread(self._extract_download_text, destination)
-			item['text'] = text
-			item['text_truncated'] = truncated
+			if destination.suffix.lower() == '.zip':
+				async with self._archive_extraction_lock:
+					extraction = await asyncio.to_thread(self._extract_download_archive, destination)
+				item['extraction_status'] = extraction.status
+				item['extracted_count'] = len(extraction.members)
+				item['skipped_count'] = extraction.skipped_count
+				item['extraction_warnings'] = extraction.warnings
+				item['text'] = self._archive_extraction_summary(extraction)
+				item['text_truncated'] = False
+				for member in extraction.members:
+					text = ''
+					truncated = False
+					text_extraction_error: str | None = None
+					if member.path.suffix.lower() != '.zip':
+						try:
+							text, truncated = await asyncio.to_thread(self._extract_download_text, member.path)
+						except Exception as exc:
+							text_extraction_error = f'{type(exc).__name__}: {exc}'[:500]
+							text = f'[text extraction failed: {text_extraction_error}]'
+					member_item = _ArchiveMemberDownload(
+						timestamp=time.time(),
+						url=download.url,
+						suggested_filename=member.archive_name,
+						filename=member.relative_name,
+						path=str(member.path),
+						size_bytes=member.size_bytes,
+						source='archive_member',
+						source_archive=destination.name,
+						text=text,
+						text_truncated=truncated,
+						text_extraction_error=text_extraction_error,
+					)
+					self.downloads.append(member_item.model_dump(exclude_none=True))
+			else:
+				text, truncated = await asyncio.to_thread(self._extract_download_text, destination)
+				item['text'] = text
+				item['text_truncated'] = truncated
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
@@ -1877,6 +1963,188 @@ class BrowserRuntime:
 			counter += 1
 		self._reserved_download_paths.add(candidate)
 		return candidate
+
+	@staticmethod
+	def _archive_member_parts(filename: str) -> tuple[str, ...] | None:
+		assert isinstance(filename, str)
+		normalised = filename.replace('\\', '/')
+		if normalised.startswith('/') or re.match(r'^[A-Za-z]:', normalised):
+			return None
+		parts = tuple(part for part in normalised.split('/') if part not in {'', '.'})
+		if not parts or any(part == '..' for part in parts):
+			return None
+		assert all(part not in {'', '.', '..'} for part in parts)
+		return parts
+
+	def _extract_download_archive(self, archive_path: Path) -> _ArchiveExtractionResult:
+		assert archive_path.is_file()
+		assert archive_path.parent.resolve(strict=True) == self.download_dir.resolve(strict=True)
+		members: list[_ExtractedArchiveMember] = []
+		warnings: list[str] = []
+		warning_count = 0
+		skipped_count = 0
+
+		def add_warning(message: str) -> None:
+			nonlocal warning_count
+			warning_count += 1
+			if len(warnings) < _MAX_ARCHIVE_WARNINGS:
+				warnings.append(message[:500])
+
+		if not zipfile.is_zipfile(archive_path):
+			result = _ArchiveExtractionResult(
+				status='failed',
+				members=[],
+				skipped_count=0,
+				warnings=['Downloaded file has a .zip suffix but is not a valid ZIP archive'],
+			)
+			assert result.status == 'failed' and not result.members
+			return result
+
+		try:
+			with zipfile.ZipFile(archive_path) as archive:
+				directory_aliases: dict[tuple[str, ...], Path] = {}
+				total_bytes = 0
+				for info in archive.infolist():
+					mode = info.external_attr >> 16
+					file_type = stat.S_IFMT(mode)
+					if info.create_system == 3 and file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+						skipped_count += 1
+						add_warning(f'{info.filename}: non-regular archive member skipped')
+						continue
+					parts = self._archive_member_parts(info.filename)
+					if parts is None:
+						skipped_count += 1
+						add_warning(f'{info.filename}: unsafe archive path skipped')
+						continue
+					target: Path | None = None
+					temporary_path: Path | None = None
+					try:
+						is_directory = info.is_dir() or (
+							info.create_system == 3 and file_type == stat.S_IFDIR
+						)
+						if is_directory:
+							self._archive_member_directory(parts, directory_aliases)
+							continue
+						if len(members) >= _MAX_ARCHIVE_FILES:
+							skipped_count += 1
+							add_warning(f'{info.filename}: archive exceeds 1,000 file extraction limit')
+							continue
+						parent = self._archive_member_directory(parts[:-1], directory_aliases)
+						if not parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True)):
+							raise ValueError('archive member parent escaped the downloads directory')
+						target = self._reserve_unique_archive_path(parent / parts[-1], kind='file')
+						with tempfile.NamedTemporaryFile(dir=parent, prefix=f'.{target.name}.', suffix='.part', delete=False) as output:
+							temporary_path = Path(output.name)
+							with archive.open(info) as source:
+								member_bytes = 0
+								while chunk := source.read(1024 * 1024):
+									projected_member_bytes = member_bytes + len(chunk)
+									if projected_member_bytes > _MAX_ARCHIVE_MEMBER_BYTES:
+										raise _ArchiveResourceLimitError('member exceeds 100 MiB extraction limit')
+									projected_total_bytes = total_bytes + len(chunk)
+									if projected_total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
+										raise _ArchiveResourceLimitError('archive exceeds 250 MiB total extraction limit')
+									written_bytes = output.write(chunk)
+									member_bytes += written_bytes
+									total_bytes += written_bytes
+									if written_bytes != len(chunk):
+										raise OSError(f'partial archive member write: {written_bytes} of {len(chunk)} bytes')
+						os.link(temporary_path, target)
+						temporary_path.unlink()
+						temporary_path = None
+						members.append(
+							_ExtractedArchiveMember(
+								archive_name=info.filename,
+								relative_name=target.relative_to(self.download_dir).as_posix(),
+								path=target,
+								size_bytes=target.stat().st_size,
+							)
+						)
+					except Exception as exc:
+						if target is not None:
+							self._reserved_download_paths.discard(target)
+						skipped_count += 1
+						add_warning(f'{info.filename}: extraction failed: {type(exc).__name__}: {exc}')
+					finally:
+						if temporary_path is not None:
+							temporary_path.unlink(missing_ok=True)
+		except Exception as exc:
+			add_warning(f'ZIP extraction failed: {type(exc).__name__}: {exc}')
+
+		if warning_count > _MAX_ARCHIVE_WARNINGS:
+			omitted_count = warning_count - (_MAX_ARCHIVE_WARNINGS - 1)
+			warnings[-1] = f'{omitted_count} additional warning(s) omitted'
+		status: Literal['success', 'partial', 'failed']
+		if warnings and not members:
+			status = 'failed'
+		elif warnings:
+			status = 'partial'
+		else:
+			status = 'success'
+		result = _ArchiveExtractionResult(status=status, members=members, skipped_count=skipped_count, warnings=warnings)
+		assert len(result.members) <= _MAX_ARCHIVE_FILES
+		assert all(
+			member.path.parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True))
+			for member in result.members
+		)
+		return result
+
+	def _archive_member_directory(
+		self,
+		parts: tuple[str, ...],
+		aliases: dict[tuple[str, ...], Path],
+	) -> Path:
+		assert all(part not in {'', '.', '..'} for part in parts)
+		assert self.download_dir.is_dir()
+		parent = self.download_dir
+		prefix: tuple[str, ...] = ()
+		for part in parts:
+			prefix += (part,)
+			if prefix in aliases:
+				parent = aliases[prefix]
+				continue
+			candidate = parent / part
+			if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+				candidate = self._reserve_unique_archive_path(candidate, kind='directory')
+				candidate.mkdir()
+			else:
+				candidate.mkdir(exist_ok=True)
+			aliases[prefix] = candidate
+			parent = candidate
+		assert parent.is_dir()
+		assert parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True))
+		return parent
+
+	def _reserve_unique_archive_path(self, candidate: Path, *, kind: Literal['directory', 'file']) -> Path:
+		assert candidate.parent.is_dir()
+		assert candidate.parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True))
+		counter = 1
+		original = candidate
+		while candidate.exists() or candidate.is_symlink() or candidate in self._reserved_download_paths:
+			name = (
+				f'{original.name}_{counter}'
+				if kind == 'directory'
+				else f'{original.stem}_{counter}{original.suffix}'
+			)
+			candidate = original.with_name(name)
+			counter += 1
+		self._reserved_download_paths.add(candidate)
+		assert candidate in self._reserved_download_paths
+		assert candidate.parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True))
+		assert not candidate.exists() and not candidate.is_symlink()
+		return candidate
+
+	@staticmethod
+	def _archive_extraction_summary(result: _ArchiveExtractionResult) -> str:
+		assert result.skipped_count >= 0
+		summary = (
+			f'ZIP extraction {result.status}: {len(result.members)} file(s) extracted, '
+			f'{result.skipped_count} member(s) skipped.'
+		)
+		if result.warnings:
+			summary += '\nWarnings:\n' + '\n'.join(f'- {warning}' for warning in result.warnings)
+		assert summary
+		return summary
 
 	@staticmethod
 	def _document_response_extension(response: Response) -> str | None:
