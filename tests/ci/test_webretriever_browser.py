@@ -244,8 +244,19 @@ class FakeContext:
 		return self.pages_to_create.pop(0)
 
 
-def make_started_runtime(tmp_path: Path, page: FakePage) -> BrowserRuntime:
-	runtime = BrowserRuntime(FakeContext([]), tmp_path, logging.getLogger('test-webretriever'))  # type: ignore[arg-type]
+def make_started_runtime(
+	tmp_path: Path,
+	page: FakePage,
+	*,
+	context: FakeContext | None = None,
+	**runtime_kwargs: Any,
+) -> BrowserRuntime:
+	runtime = BrowserRuntime(
+		context or FakeContext([]),  # type: ignore[arg-type]
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		**runtime_kwargs,
+	)
 	runtime._started = True
 	runtime.website = page.url
 	runtime.page = page  # type: ignore[assignment]
@@ -489,19 +500,14 @@ async def test_observe_recovers_raw_screenshot_timeout_with_current_cdp_png(tmp_
 
 	page = RawScreenshotTimeoutPage('https://example.test/')
 	context = ScreenshotContext()
-	runtime = BrowserRuntime(
-		context,  # type: ignore[arg-type]
+	runtime = make_started_runtime(
 		tmp_path,
-		logging.getLogger('test-webretriever'),
+		page,
+		context=context,
 		action_timeout_ms=30_000,
 		screenshot_timeout_ms=25,
 		cdp_screenshot_timeout_ms=25,
 	)
-	runtime._started = True
-	runtime.website = page.url
-	runtime.page = page  # type: ignore[assignment]
-	runtime._owned_pages = [page]  # type: ignore[list-item]
-	runtime._last_safe_urls[id(page)] = page.url
 
 	observation = await runtime.observe(0)
 
@@ -534,18 +540,13 @@ async def test_observe_reports_both_failures_when_raw_cdp_recovery_fails(tmp_pat
 
 	page = RawScreenshotTimeoutPage('https://example.test/')
 	context = ScreenshotContext()
-	runtime = BrowserRuntime(
-		context,  # type: ignore[arg-type]
+	runtime = make_started_runtime(
 		tmp_path,
-		logging.getLogger('test-webretriever'),
+		page,
+		context=context,
 		screenshot_timeout_ms=25,
 		cdp_screenshot_timeout_ms=25,
 	)
-	runtime._started = True
-	runtime.website = page.url
-	runtime.page = page  # type: ignore[assignment]
-	runtime._owned_pages = [page]  # type: ignore[list-item]
-	runtime._last_safe_urls[id(page)] = page.url
 
 	with pytest.raises(RuntimeError) as error:
 		await runtime.observe(0)
@@ -556,9 +557,67 @@ async def test_observe_reports_both_failures_when_raw_cdp_recovery_fails(tmp_pat
 	assert context.session.detached
 
 
+async def test_observe_does_not_use_cdp_for_raw_non_timeout_error(tmp_path: Path) -> None:
+	class RawScreenshotErrorPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			raise RuntimeError('raw renderer failed without a timeout')
+
+	class NoFallbackContext(FakeContext):
+		async def new_cdp_session(self, page: FakePage) -> None:
+			raise AssertionError('non-timeout screenshot errors must not use CDP')
+
+	page = RawScreenshotErrorPage('https://example.test/')
+	context = NoFallbackContext([])
+	runtime = make_started_runtime(tmp_path, page, context=context)
+
+	with pytest.raises(RuntimeError, match='raw renderer failed without a timeout'):
+		await runtime.observe(0)
+
+
+async def test_observe_does_not_wait_past_cdp_deadline_when_session_release_hangs(tmp_path: Path) -> None:
+	class RawScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			raise PlaywrightTimeoutError('raw screenshot deadline expired')
+
+	release_detach = asyncio.Event()
+
+	class HangingCDPSession:
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			await asyncio.Event().wait()
+			raise AssertionError('unreachable')
+
+		async def detach(self) -> None:
+			await release_detach.wait()
+
+	class ScreenshotContext(FakeContext):
+		async def new_cdp_session(self, page: FakePage) -> HangingCDPSession:
+			return HangingCDPSession()
+
+	page = RawScreenshotTimeoutPage('https://example.test/')
+	context = ScreenshotContext([])
+	runtime = make_started_runtime(
+		tmp_path,
+		page,
+		context=context,
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+
+	observation_task = asyncio.create_task(runtime.observe(0))
+	done, _ = await asyncio.wait({observation_task}, timeout=0.2)
+	try:
+		assert observation_task in done, 'CDP recovery exceeded its hard deadline while releasing the session'
+		with pytest.raises(RuntimeError, match='CDP fallback failed'):
+			await observation_task
+	finally:
+		release_detach.set()
+		if not observation_task.done():
+			await asyncio.gather(observation_task, return_exceptions=True)
+
+
 async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(tmp_path: Path) -> None:
 	html = (
-		b'<!doctype html><style>'
+		b'<!doctype html><title>Pending font page</title><style>'
 		b"@font-face{font-family:Stall;src:url('/stall.woff2')}body{font-family:Stall,sans-serif}"
 		b'</style><button>ready</button>'
 	)
@@ -601,6 +660,7 @@ async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(t
 
 	server = await asyncio.start_server(handle_connection, '127.0.0.1', 0)
 	port = server.sockets[0].getsockname()[1]
+	start_url = f'http://127.0.0.1:{port}/'
 	runtime: BrowserRuntime | None = None
 	try:
 		async with async_playwright() as playwright:
@@ -614,7 +674,7 @@ async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(t
 				cdp_screenshot_timeout_ms=1_000,
 			)
 			try:
-				await runtime.start(f'http://127.0.0.1:{port}/')
+				await runtime.start(start_url)
 				assert await runtime.page.evaluate('document.fonts.status') == 'loading'
 				observation = await runtime.observe(0)
 			finally:
@@ -633,6 +693,10 @@ async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(t
 	assert raw.startswith(_VALID_PNG[:8])
 	assert visual.startswith(_VALID_PNG[:8])
 	assert observation.screenshot == visual
+	assert observation.url == start_url
+	assert observation.title == 'Pending font page'
+	assert (observation.viewport_width, observation.viewport_height) == (1280, 720)
+	assert any(element.text == 'ready' for element in observation.elements)
 
 
 async def test_observe_keeps_raw_screenshot_when_annotated_capture_has_non_timeout_error(tmp_path: Path) -> None:
@@ -650,12 +714,7 @@ async def test_observe_keeps_raw_screenshot_when_annotated_capture_has_non_timeo
 
 	page = AnnotatedScreenshotErrorPage('https://example.test/')
 	context = NoFallbackContext([])
-	runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))  # type: ignore[arg-type]
-	runtime._started = True
-	runtime.website = page.url
-	runtime.page = page  # type: ignore[assignment]
-	runtime._owned_pages = [page]  # type: ignore[list-item]
-	runtime._last_safe_urls[id(page)] = page.url
+	runtime = make_started_runtime(tmp_path, page, context=context)
 
 	observation = await runtime.observe(0)
 
@@ -686,18 +745,13 @@ async def test_observe_propagates_annotated_cdp_recovery_failure(tmp_path: Path)
 
 	page = AnnotatedScreenshotTimeoutPage('https://example.test/')
 	context = ScreenshotContext([])
-	runtime = BrowserRuntime(
-		context,  # type: ignore[arg-type]
+	runtime = make_started_runtime(
 		tmp_path,
-		logging.getLogger('test-webretriever'),
+		page,
+		context=context,
 		screenshot_timeout_ms=25,
 		cdp_screenshot_timeout_ms=25,
 	)
-	runtime._started = True
-	runtime.website = page.url
-	runtime.page = page  # type: ignore[assignment]
-	runtime._owned_pages = [page]  # type: ignore[list-item]
-	runtime._last_safe_urls[id(page)] = page.url
 
 	with pytest.raises(RuntimeError) as error:
 		await runtime.observe(0)

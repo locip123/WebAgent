@@ -70,6 +70,35 @@ class _ScreenshotFallbackError(RuntimeError):
 	"""Raised when Playwright screenshot timeout recovery through CDP also fails."""
 
 
+def _consume_detached_task_result(task: asyncio.Future[Any]) -> None:
+	"""Retrieve a late cancellation-resistant result without warning."""
+
+	if task.cancelled():
+		return
+	try:
+		task.exception()
+	except BaseException:
+		pass
+
+
+async def _await_with_hard_timeout(awaitable: Any, timeout_seconds: float) -> Any:
+	"""Enforce a deadline without waiting for cancellation acknowledgement."""
+
+	task = asyncio.ensure_future(awaitable)
+	try:
+		done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+	except BaseException:
+		if not task.done():
+			task.add_done_callback(_consume_detached_task_result)
+			task.cancel()
+		raise
+	if task in done or task.done():
+		return task.result()
+	task.add_done_callback(_consume_detached_task_result)
+	task.cancel()
+	raise TimeoutError(f'operation exceeded the {timeout_seconds:g}-second hard deadline')
+
+
 def cdp_headers_for_url(cdp_url: str) -> dict[str, str]:
 	"""Return the cloud-sandbox authentication header encoded in a CDP URL."""
 
@@ -516,9 +545,9 @@ class BrowserRuntime:
 		except PlaywrightTimeoutError as screenshot_timeout:
 			self.logger.warning('Playwright screenshot timed out for %s; falling back to CDP capture', path.name)
 			try:
-				screenshot = await asyncio.wait_for(
+				screenshot = await _await_with_hard_timeout(
 					self._capture_cdp_screenshot(page, path),
-					timeout=self.cdp_screenshot_timeout_ms / 1000,
+					self.cdp_screenshot_timeout_ms / 1000,
 				)
 			except Exception as fallback_error:
 				raise _ScreenshotFallbackError(
