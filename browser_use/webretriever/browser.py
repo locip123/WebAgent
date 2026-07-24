@@ -81,24 +81,6 @@ def _consume_detached_task_result(task: asyncio.Future[Any]) -> None:
 		pass
 
 
-async def _await_with_hard_timeout(awaitable: Any, timeout_seconds: float) -> Any:
-	"""Enforce a deadline without waiting for cancellation acknowledgement."""
-
-	task = asyncio.ensure_future(awaitable)
-	try:
-		done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
-	except BaseException:
-		if not task.done():
-			task.add_done_callback(_consume_detached_task_result)
-			task.cancel()
-		raise
-	if task in done or task.done():
-		return task.result()
-	task.add_done_callback(_consume_detached_task_result)
-	task.cancel()
-	raise TimeoutError(f'operation exceeded the {timeout_seconds:g}-second hard deadline')
-
-
 def cdp_headers_for_url(cdp_url: str) -> dict[str, str]:
 	"""Return the cloud-sandbox authentication header encoded in a CDP URL."""
 
@@ -445,6 +427,7 @@ class BrowserRuntime:
 		self._background_tasks: set[asyncio.Task[Any]] = set()
 		self._download_tasks: set[asyncio.Task[Any]] = set()
 		self._policy_tasks: set[asyncio.Task[Any]] = set()
+		self._screenshot_recovery_tasks: set[asyncio.Task[Any]] = set()
 		self._rollback_pages: set[int] = set()
 		self._captured_document_responses: set[tuple[str, int]] = set()
 		self._download_urls_seen: set[str] = set()
@@ -545,11 +528,9 @@ class BrowserRuntime:
 		except PlaywrightTimeoutError as screenshot_timeout:
 			self.logger.warning('Playwright screenshot timed out for %s; falling back to CDP capture', path.name)
 			try:
-				screenshot = await _await_with_hard_timeout(
-					self._capture_cdp_screenshot(page, path),
-					self.cdp_screenshot_timeout_ms / 1000,
-				)
+				screenshot = await self._capture_cdp_screenshot_before_deadline(page, path)
 			except Exception as fallback_error:
+				path.unlink(missing_ok=True)
 				raise _ScreenshotFallbackError(
 					f'Playwright screenshot timed out after {self.screenshot_timeout_ms}ms '
 					f'({screenshot_timeout}) and CDP fallback failed: '
@@ -558,7 +539,35 @@ class BrowserRuntime:
 			self.logger.info('Recovered screenshot %s through CDP capture', path.name)
 			return screenshot
 
-	async def _capture_cdp_screenshot(self, page: Page, path: Path) -> bytes:
+	async def _capture_cdp_screenshot_before_deadline(self, page: Page, path: Path) -> bytes:
+		expired = asyncio.Event()
+		task = asyncio.create_task(self._capture_cdp_screenshot(page, path, expired))
+		timeout_seconds = self.cdp_screenshot_timeout_ms / 1000
+		try:
+			done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+		except BaseException:
+			expired.set()
+			if not task.done():
+				self._track_screenshot_recovery_task(task)
+				task.cancel()
+			raise
+		if task in done or task.done():
+			return task.result()
+		expired.set()
+		self._track_screenshot_recovery_task(task)
+		task.cancel()
+		raise TimeoutError(f'CDP screenshot recovery exceeded the {timeout_seconds:g}-second hard deadline')
+
+	def _track_screenshot_recovery_task(self, task: asyncio.Task[Any]) -> None:
+		self._screenshot_recovery_tasks.add(task)
+
+		def consume_and_discard(finished: asyncio.Task[Any]) -> None:
+			self._screenshot_recovery_tasks.discard(finished)
+			_consume_detached_task_result(finished)
+
+		task.add_done_callback(consume_and_discard)
+
+	async def _capture_cdp_screenshot(self, page: Page, path: Path, expired: asyncio.Event) -> bytes:
 		cdp_session = None
 		try:
 			cdp_session = await self.context.new_cdp_session(page)
@@ -575,6 +584,8 @@ class BrowserRuntime:
 				raise ValueError('CDP screenshot response was not valid base64') from exc
 			if not screenshot.startswith(_PNG_SIGNATURE):
 				raise ValueError('CDP screenshot response was not a PNG image')
+			if expired.is_set():
+				raise TimeoutError('CDP screenshot recovery expired before the image could be persisted')
 			path.write_bytes(screenshot)
 			return screenshot
 		finally:
@@ -636,6 +647,7 @@ class BrowserRuntime:
 			for event, handler in self._page_handlers.pop(id(page), []):
 				with contextlib.suppress(Exception):
 					page.remove_listener(event, handler)
+		await self._cancel_screenshot_recovery_tasks()
 		await self._drain_background_tasks()
 		await self._drain_download_tasks()
 		await self._drain_policy_tasks()
@@ -655,6 +667,17 @@ class BrowserRuntime:
 		self._page_document_generations.clear()
 		self._reserved_download_paths.clear()
 		self.page = None
+
+	async def _cancel_screenshot_recovery_tasks(self) -> None:
+		tasks = tuple(self._screenshot_recovery_tasks)
+		if not tasks:
+			return
+		for task in tasks:
+			task.cancel()
+		cleanup_timeout = min(1.0, max(0.0, self.cdp_screenshot_timeout_ms / 1000))
+		_, pending = await asyncio.wait(tasks, timeout=cleanup_timeout)
+		if pending:
+			self.logger.warning('%d timed-out CDP screenshot recovery task(s) resisted bounded cleanup', len(pending))
 
 	def _install_context_listeners(self) -> None:
 		handlers: list[tuple[str, Callable[..., Any]]] = [

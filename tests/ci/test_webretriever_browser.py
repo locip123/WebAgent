@@ -615,6 +615,49 @@ async def test_observe_does_not_wait_past_cdp_deadline_when_session_release_hang
 			await asyncio.gather(observation_task, return_exceptions=True)
 
 
+async def test_timed_out_cdp_recovery_cannot_write_a_late_screenshot(tmp_path: Path) -> None:
+	class RawScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			raise PlaywrightTimeoutError('raw screenshot deadline expired')
+
+	release_capture = asyncio.Event()
+	capture_finished = asyncio.Event()
+
+	class CancellationResistantCDPSession:
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			try:
+				await release_capture.wait()
+			except asyncio.CancelledError:
+				await release_capture.wait()
+			return {'data': base64.b64encode(_VALID_PNG).decode('ascii')}
+
+		async def detach(self) -> None:
+			capture_finished.set()
+
+	class ScreenshotContext(FakeContext):
+		async def new_cdp_session(self, page: FakePage) -> CancellationResistantCDPSession:
+			return CancellationResistantCDPSession()
+
+	page = RawScreenshotTimeoutPage('https://example.test/')
+	context = ScreenshotContext([])
+	runtime = make_started_runtime(
+		tmp_path,
+		page,
+		context=context,
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+
+	with pytest.raises(RuntimeError, match='CDP fallback failed'):
+		await runtime.observe(0)
+
+	raw_path = tmp_path / 'trajectory' / '0.png'
+	assert not raw_path.exists()
+	release_capture.set()
+	await asyncio.wait_for(capture_finished.wait(), timeout=0.2)
+	assert not raw_path.exists()
+
+
 async def test_observe_recovers_both_screenshots_when_page_font_never_finishes(tmp_path: Path) -> None:
 	html = (
 		b'<!doctype html><title>Pending font page</title><style>'
