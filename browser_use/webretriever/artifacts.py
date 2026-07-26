@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from browser_use.webretriever.models import CompetitionTask
 
+MODEL_PROMPT_LOG_FILENAME = 'model_prompts.json'
+
 try:
 	import fcntl
 except ImportError:  # pragma: no cover - the official runner is Linux
@@ -173,6 +175,7 @@ class TaskArtifactWriter:
 		self.trajectory_visual_dir = self.task_dir / 'trajectory_visual'
 		self.result_path = self.task_dir / 'result.json'
 		self.capture_path = self.task_dir / 'capture.json'
+		self.model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self.logs_dir = self.output_dir / 'logs'
 		self.lock_path = self.output_dir / 'locks' / f'{task.directory_name}.lock'
 		self.lock = TaskLock(self.lock_path)
@@ -195,6 +198,16 @@ class TaskArtifactWriter:
 			'all_requests': [],
 		}
 
+	@staticmethod
+	def _empty_model_prompt_log() -> dict[str, Any]:
+		"""Return the initial model-prompt log for a task with no model calls."""
+
+		return {
+			'format': 'webretriever-model-prompts/v1',
+			'system_prompt': '',
+			'steps': [],
+		}
+
 	def prepare(self) -> Path:
 		"""Idempotently create the task tree and initial JSON documents."""
 
@@ -212,6 +225,8 @@ class TaskArtifactWriter:
 				atomic_write_json(self.result_path, self._pending_result())
 			if not self.capture_path.exists():
 				atomic_write_json(self.capture_path, self._empty_capture())
+			if not self.model_prompt_log_path.exists():
+				atomic_write_json(self.model_prompt_log_path, self._empty_model_prompt_log())
 		finally:
 			if not already_acquired:
 				self.lock.release()

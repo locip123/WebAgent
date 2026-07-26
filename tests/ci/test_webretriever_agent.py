@@ -203,6 +203,39 @@ async def test_agent_success_is_grounded_and_ground_truth_never_enters_prompt(tm
 
 
 @pytest.mark.asyncio
+async def test_agent_writes_each_model_prompt_before_request(tmp_path: Path):
+	llm = FakeLLM(
+		[
+			AgentDecision(action='wait', seconds=0.1, thought='Wait for the page to settle.'),
+			AgentDecision(
+				action='finish',
+				answer='42',
+				evidence=['The current page states 42.'],
+				success=True,
+			),
+		]
+	)
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=FakeRuntime(),
+		task_dir=tmp_path,
+		max_steps=2,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	prompt_log = json.loads((tmp_path / 'model_prompts.json').read_text(encoding='utf-8'))
+	assert prompt_log['system_prompt'] == llm.calls[0][0][0].text
+	assert [entry['step'] for entry in prompt_log['steps']] == [1, 2]
+	assert [entry['prompt'] for entry in prompt_log['steps']] == [call[0][1].text for call in llm.calls]
+	assert [entry['image'] for entry in prompt_log['steps']] == [
+		{'media_type': 'image/png', 'detail': 'high', 'path': 'trajectory/0.png'},
+		{'media_type': 'image/png', 'detail': 'high', 'path': 'trajectory/1.png'},
+	]
+
+
+@pytest.mark.asyncio
 async def test_agent_uses_configured_language_for_thoughts(tmp_path: Path):
 	llm = FakeLLM(
 		[

@@ -229,6 +229,15 @@ class FakePage:
 		return None
 
 
+class FakeDownloadPlaceholderPage(FakePage):
+	def __init__(self, opener: FakePage | None) -> None:
+		super().__init__(':')
+		self._opener = opener
+
+	async def opener(self) -> FakePage | None:
+		return self._opener
+
+
 class FakeContext:
 	def __init__(self, pages: list[FakePage]) -> None:
 		self.pages_to_create = pages
@@ -508,6 +517,36 @@ async def test_observe_enumerates_cross_frame_elements_and_saves_both_screenshot
 	assert '[Frame 1: https://frame.example/]' in observation.page_text
 	assert (tmp_path / 'trajectory' / '3.png').read_bytes() == b'image-1'
 	assert (tmp_path / 'trajectory_visual' / '3.png').read_bytes() == b'image-2'
+
+
+async def test_observe_download_placeholder_falls_back_when_opener_is_closed(tmp_path: Path) -> None:
+	closed_opener = FakePage('https://closed.example/')
+	closed_opener.closed = True
+	older_page = FakePage('https://older.example/')
+	recent_page = FakePage('https://recent.example/')
+	placeholder = FakeDownloadPlaceholderPage(closed_opener)
+	runtime = make_started_runtime(tmp_path, placeholder)
+	runtime._owned_pages = [older_page, closed_opener, recent_page, placeholder]  # type: ignore[list-item]
+	runtime._record_url(':')
+
+	observation = await runtime.observe(0)
+
+	assert observation.url == recent_page.url
+	assert runtime.page is recent_page
+	assert placeholder.closed
+	assert ':' not in runtime.visited_urls
+
+
+async def test_observe_download_placeholder_fails_fast_without_safe_page(tmp_path: Path) -> None:
+	placeholder = FakeDownloadPlaceholderPage(None)
+	runtime = make_started_runtime(tmp_path, placeholder)
+
+	with pytest.raises(RuntimeError, match='has no live safe opener or fallback page'):
+		await runtime.observe(0)
+
+	assert placeholder.closed
+	assert runtime.page is None
+	assert placeholder.screenshot_paths == []
 
 
 async def test_observe_recovers_raw_screenshot_timeout_with_current_cdp_png(tmp_path: Path) -> None:
@@ -1248,6 +1287,87 @@ async def test_inline_pdf_document_response_is_saved_extracted_and_deduplicated(
 	assert item['filename'] == 'result.pdf'
 	assert 'Protocol PDF answer 42' in item['text']
 	assert Path(item['path']).read_bytes() == pdf
+
+
+async def test_observe_closes_target_blank_download_placeholder_and_restores_opener(
+	httpserver,
+	tmp_path: Path,
+) -> None:
+	from reportlab.pdfgen.canvas import Canvas
+
+	stream = BytesIO()
+	canvas = Canvas(stream)
+	canvas.drawString(72, 720, 'Downloaded report')
+	canvas.save()
+	pdf = stream.getvalue()
+	httpserver.expect_request('/download-placeholder-source').respond_with_data(
+		'<html><body><a href="/download-placeholder.pdf" target="_blank">Download report</a></body></html>',
+		content_type='text/html',
+	)
+	httpserver.expect_request('/download-placeholder.pdf').respond_with_data(
+		pdf,
+		content_type='application/pdf',
+		headers={'Content-Disposition': 'attachment; filename="download-placeholder.pdf"'},
+	)
+
+	async with async_playwright() as playwright:
+		browser = await playwright.chromium.launch(headless=True)
+		context = await browser.new_context(accept_downloads=True)
+		runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
+		source_url = httpserver.url_for('/download-placeholder-source')
+		try:
+			await runtime.start(source_url)
+			initial = await runtime.observe(0)
+			link = next(element for element in initial.elements if element.text == 'Download report')
+			runtime.screenshot_timeout_ms = 250
+			runtime.cdp_screenshot_timeout_ms = 250
+
+			await runtime.execute({'action': 'click', 'element_id': link.index})
+
+			assert runtime.page is not None
+			assert runtime.page.url == ':'
+			recovered = await runtime.observe(1)
+
+			assert recovered.url == source_url
+			assert runtime.page.url == source_url
+			assert ':' not in runtime.visited_urls
+			assert all(page.url != ':' for page in context.pages)
+			assert any(download['filename'] == 'download-placeholder.pdf' for download in recovered.downloads)
+		finally:
+			await runtime.close()
+			await browser.close()
+
+
+async def test_observe_keeps_normal_target_blank_page_active(httpserver, tmp_path: Path) -> None:
+	httpserver.expect_request('/normal-popup-source').respond_with_data(
+		'<html><body><a href="/normal-popup-target" target="_blank">Open report</a></body></html>',
+		content_type='text/html',
+	)
+	httpserver.expect_request('/normal-popup-target').respond_with_data(
+		'<html><body><h1>Report page</h1></body></html>',
+		content_type='text/html',
+	)
+
+	async with async_playwright() as playwright:
+		browser = await playwright.chromium.launch(headless=True)
+		context = await browser.new_context(accept_downloads=True)
+		runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
+		target_url = httpserver.url_for('/normal-popup-target')
+		try:
+			await runtime.start(httpserver.url_for('/normal-popup-source'))
+			initial = await runtime.observe(0)
+			link = next(element for element in initial.elements if element.text == 'Open report')
+
+			await runtime.execute({'action': 'click', 'element_id': link.index})
+			opened = await runtime.observe(1)
+
+			assert opened.url == target_url
+			assert runtime.page is not None
+			assert runtime.page.url == target_url
+			assert len(context.pages) == 2
+		finally:
+			await runtime.close()
+			await browser.close()
 
 
 async def _download_observation(

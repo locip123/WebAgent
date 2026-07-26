@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
+from browser_use.webretriever.artifacts import MODEL_PROMPT_LOG_FILENAME, atomic_write_json
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
 from browser_use.webretriever.network import ChartNetworkInspector
 from browser_use.webretriever.prompts import (
@@ -198,6 +199,8 @@ class ProtocolIIIAgent:
 		self.max_consecutive_model_timeouts = max_consecutive_model_timeouts
 		self.thought_language = normalize_thought_language(thought_language)
 		self.system_prompt = build_system_prompt(self.thought_language)
+		self._model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
+		self._model_prompt_log: dict[str, Any] = {}
 		self.task_deadline_monotonic = task_deadline_monotonic
 		self._trusted_chart_manifests: dict[str, str] = {}
 		self._ready_chart_data_dirs: set[str] = set()
@@ -313,10 +316,47 @@ class ProtocolIIIAgent:
 			)
 		return None
 
+	def _reset_model_prompt_log(self) -> None:
+		"""Start a fresh, durable log of the text and image sent to the model."""
+
+		self._model_prompt_log = {
+			'format': 'webretriever-model-prompts/v1',
+			# The system message is identical for every step, so storing it once
+			# avoids duplicating a large prompt while retaining the complete input.
+			'system_prompt': self.system_prompt,
+			'steps': [],
+		}
+		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	def _record_model_prompt(self, *, step: int, prompt: str, screenshot_path: Path) -> None:
+		"""Atomically persist one model request before it is submitted.
+
+		The screenshot is already retained in ``trajectory``.  Referencing that
+		file keeps the JSON readable while preserving the exact image bytes that
+		were encoded into the multimodal request.
+		"""
+
+		steps = self._model_prompt_log['steps']
+		if not isinstance(steps, list):  # Defensive guard for future format edits.
+			raise TypeError('model prompt log steps must be a list')
+		steps.append(
+			{
+				'step': step + 1,
+				'prompt': prompt,
+				'image': {
+					'media_type': 'image/png',
+					'detail': 'high',
+					'path': str(screenshot_path.relative_to(self.task_dir)),
+				},
+			}
+		)
+		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
 	async def run(self) -> AgentRunOutcome:
 		started_at = time.monotonic()
 		outcome = AgentRunOutcome(status='FAIL')
 		self._partial_outcome = outcome
+		self._reset_model_prompt_log()
 		memory = ''
 		last_outcome = 'The task has just started.'
 		consecutive_errors = 0
@@ -369,6 +409,7 @@ class ProtocolIIIAgent:
 				outcome.status = 'FAIL_TASK_TIMEOUT'
 				outcome.error = 'Task deadline elapsed before the next model decision'
 				break
+			self._record_model_prompt(step=step, prompt=prompt, screenshot_path=raw_path)
 			try:
 				response = await _await_with_hard_timeout(
 					self.llm.ainvoke(messages, output_format=AgentDecision),

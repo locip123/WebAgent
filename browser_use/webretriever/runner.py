@@ -25,7 +25,7 @@ ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
 DEFAULT_MAX_CONCURRENCY = 3
 MAX_CONCURRENCY = 8
-MAX_TASK_TIMEOUT_SECONDS = 600.0
+MAX_TASK_TIMEOUT_SECONDS = 900.0
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
 

@@ -64,6 +64,7 @@ _NETWORK_BODY_PAGE_CHARACTERS = 60_000
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _MAX_DOWNLOAD_TEXT = 250_000
 _MAX_ARCHIVE_FILES = 1_000
+_DOWNLOAD_PLACEHOLDER_URL = ':'
 _MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
 _MAX_ARCHIVE_TOTAL_BYTES = 250 * 1024 * 1024
 _MAX_ARCHIVE_WARNINGS = 100
@@ -540,7 +541,7 @@ class BrowserRuntime:
 		self._ensure_started()
 		await self._enforce_search_policy()
 		await self._drain_download_tasks()
-		page = self._active_page()
+		page = await self._active_page_for_observation()
 		await self._clear_markers(remove_attributes=True)
 
 		step_name = self._safe_step_name(step)
@@ -825,7 +826,7 @@ class BrowserRuntime:
 			if id(page) not in self._rollback_pages and not self._closed:
 				self._rollback_pages.add(id(page))
 				self._spawn_policy(self._rollback_forbidden_page(page))
-		elif url and url != 'about:blank':
+		elif url and url not in {'about:blank', _DOWNLOAD_PLACEHOLDER_URL}:
 			self._record_url(url)
 			self._last_safe_urls[id(page)] = url
 
@@ -1867,7 +1868,7 @@ class BrowserRuntime:
 		await self._drain_policy_tasks()
 		for page in list(self._live_owned_pages()):
 			if not is_forbidden_search_url(page.url):
-				if page.url and page.url != 'about:blank':
+				if page.url and page.url not in {'about:blank', _DOWNLOAD_PLACEHOLDER_URL}:
 					self._last_safe_urls[id(page)] = page.url
 				continue
 			if known_page_ids is not None and id(page) not in known_page_ids:
@@ -2059,6 +2060,47 @@ class BrowserRuntime:
 		self.page = live[-1]
 		return self.page
 
+	async def _active_page_for_observation(self) -> Page:
+		page = self._active_page()
+		if page.url != _DOWNLOAD_PLACEHOLDER_URL:
+			return page
+
+		opener: Page | None = None
+		with contextlib.suppress(Exception):
+			opener = await page.opener()
+		if (
+			opener is None
+			or opener is page
+			or opener.is_closed()
+			or opener.url == _DOWNLOAD_PLACEHOLDER_URL
+			or is_forbidden_search_url(opener.url)
+		):
+			opener = next(
+				(
+					candidate
+					for candidate in reversed(self._live_owned_pages())
+					if candidate is not page
+					and candidate.url != _DOWNLOAD_PLACEHOLDER_URL
+					and not is_forbidden_search_url(candidate.url)
+				),
+				None,
+			)
+
+		if opener is None:
+			with contextlib.suppress(Exception):
+				await page.close(run_before_unload=False)
+			self.page = None
+			raise RuntimeError("Download placeholder page ':' has no live safe opener or fallback page")
+
+		self.logger.info(
+			'Closing download placeholder page and restoring active page: %s',
+			redact_cdp_url(opener.url),
+		)
+		self.page = opener
+		with contextlib.suppress(Exception):
+			await page.close(run_before_unload=False)
+		return opener
+
 	def _live_owned_pages(self) -> list[Page]:
 		return [page for page in self._owned_pages if not page.is_closed()]
 
@@ -2069,7 +2111,7 @@ class BrowserRuntime:
 			raise RuntimeError('Call BrowserRuntime.start(website) first')
 
 	def _record_url(self, url: str, *, unless_last: bool = False) -> None:
-		if not url or url == 'about:blank':
+		if not url or url in {'about:blank', _DOWNLOAD_PLACEHOLDER_URL}:
 			return
 		if unless_last and self.visited_urls and self.visited_urls[-1] == url:
 			return

@@ -261,6 +261,11 @@ def test_task_artifacts_create_scaffolds_and_update_atomically(tmp_path: Path) -
 	assert result['status'] == 'PENDING'
 	assert 'answer' not in result
 	assert json.loads(writer.capture_path.read_text(encoding='utf-8'))['all_requests'] == []
+	assert json.loads(writer.model_prompt_log_path.read_text(encoding='utf-8')) == {
+		'format': 'webretriever-model-prompts/v1',
+		'system_prompt': '',
+		'steps': [],
+	}
 
 	writer.write_result(
 		status='SUCCESS',
