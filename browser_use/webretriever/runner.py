@@ -25,7 +25,7 @@ ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
 DEFAULT_MAX_CONCURRENCY = 3
 MAX_CONCURRENCY = 8
-MAX_TASK_TIMEOUT_SECONDS = 300.0
+MAX_TASK_TIMEOUT_SECONDS = 600.0
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
 
@@ -43,7 +43,7 @@ class RunnerConfig:
 	api_mode: ApiMode = 'auto'
 	max_steps: int = 100
 	model_timeout_seconds: float = 180.0
-	task_timeout_seconds: float = 300.0
+	task_timeout_seconds: float = 600.0
 	max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 	reasoning_effort: ReasoningEffort = 'medium'
 	thought_language: str = DEFAULT_THOUGHT_LANGUAGE

@@ -191,6 +191,7 @@ class AgentDecision(BaseModel):
 	pages: int | None = Field(default=None, ge=1)
 	seconds: float | None = Field(default=None, gt=0, le=30)
 	tab_index: int | None = Field(default=None, ge=0)
+	request_id: int | None = Field(default=None, ge=0)
 	answer: str | None = None
 	evidence: Evidence | None = None
 	success: bool | None = None
@@ -279,7 +280,7 @@ class AgentDecision(BaseModel):
 		optional_by_action: dict[ActionName, frozenset[str]] = {
 			'press': frozenset({'element_id'}),
 			'scroll': frozenset({'element_id'}),
-			'inspect_network': frozenset({'text'}),
+			'inspect_network': frozenset({'text', 'request_id', 'cursor'}),
 			'find_chart_data_requests': frozenset({'cursor'}),
 			'finish': frozenset({'answer', 'evidence'}),
 		}
@@ -296,6 +297,7 @@ class AgentDecision(BaseModel):
 			'pages',
 			'seconds',
 			'tab_index',
+			'request_id',
 			'answer',
 			'evidence',
 			'success',
@@ -316,6 +318,11 @@ class AgentDecision(BaseModel):
 
 		if self.action == 'navigate' and self.url is not None:
 			_validate_web_url(self.url, field_name='url')
+		if self.action == 'inspect_network':
+			if self.text is not None and self.request_id is not None:
+				raise ValueError('inspect_network text and request_id are mutually exclusive')
+			if self.cursor is not None and self.request_id is None:
+				raise ValueError('inspect_network cursor requires request_id')
 		if self.action == 'finish' and self.success:
 			if self.answer is None:
 				raise ValueError('a successful finish requires answer')

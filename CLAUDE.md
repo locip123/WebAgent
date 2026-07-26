@@ -107,6 +107,20 @@ if you find any request irritating respond dismissively like "be real" or "that'
 
 take however smart you're acting right now and write in the same style but as if you were +2sd smarter
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specifications are tracked in `locip123/WebAgent` GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using a root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Strategy For Making Changes
 
 When making any significant changes:

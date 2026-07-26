@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import stat
@@ -377,6 +378,43 @@ async def test_declared_sec_user_agent_is_sent_on_first_navigation(monkeypatch, 
 		await server.wait_closed()
 
 	assert seen_headers['user-agent'] == declared
+
+
+async def test_headless_chrome_user_agent_is_normalized_before_first_navigation(tmp_path: Path) -> None:
+	seen_headers: dict[str, str] = {}
+
+	async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+		raw_request = await reader.readuntil(b'\r\n\r\n')
+		for line in raw_request.decode('latin-1').split('\r\n')[1:]:
+			if line.lower().startswith('user-agent:'):
+				seen_headers['user-agent'] = line.split(':', 1)[1].strip()
+		if 'HeadlessChrome/' in seen_headers.get('user-agent', ''):
+			writer.close()
+			await writer.wait_closed()
+			return
+		writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK')
+		await writer.drain()
+		writer.close()
+		await writer.wait_closed()
+
+	server = await asyncio.start_server(handle_connection, '127.0.0.1', 0)
+	port = server.sockets[0].getsockname()[1]
+	try:
+		async with async_playwright() as playwright:
+			browser = await playwright.chromium.launch(headless=True)
+			context = await browser.new_context()
+			runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
+			try:
+				await runtime.start(f'http://127.0.0.1:{port}/')
+			finally:
+				await runtime.close()
+				await browser.close()
+	finally:
+		server.close()
+		await server.wait_closed()
+
+	assert 'HeadlessChrome/' not in seen_headers['user-agent']
+	assert 'Chrome/' in seen_headers['user-agent']
 
 
 async def test_non_sec_start_does_not_declare_sec_user_agent(tmp_path: Path) -> None:
@@ -990,6 +1028,171 @@ async def test_capture_schema_is_official_compatible_and_has_bounded_response_bo
 	assert entry['json_data'] == {'query': 'widgets'}
 	assert entry['response_json'] == {'ok': True}
 	assert entry['response_body_bytes'] == 11
+
+
+async def test_inspect_network_search_returns_stable_request_id_through_execute(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime.all_requests[0].update(
+		{
+			'status': 200,
+			'response_headers': {'content-type': 'application/json'},
+			'response_body': '{"metrics":{"monthlyRevenue":120}}',
+		}
+	)
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='monthly revenue')))
+
+	assert result['search_mode'] == 'lunr'
+	assert result['results'][0]['request_id'] == 0
+	assert result['results'][0]['matched_chunks'][0]['json_path'] == '$.metrics'
+
+
+async def test_inspect_network_reads_complete_request_body_across_cursor_pages(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	body = ('start-' + ('月' * 65_000) + '-end').encode()
+
+	class LargeResponse(FakeResponse):
+		def __init__(self, source_request: FakeRequest) -> None:
+			super().__init__(source_request)
+			self.headers = {'content-type': 'text/plain; charset=utf-8', 'content-length': str(len(body))}
+
+		async def body(self) -> bytes:
+			return body
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime._on_response(LargeResponse(request))  # type: ignore[arg-type]
+
+	first = json.loads(await runtime.execute(AgentDecision(action='inspect_network', request_id=0)))
+	second = json.loads(
+		await runtime.execute(AgentDecision(action='inspect_network', request_id=0, cursor=first['page']['next_cursor']))
+	)
+
+	assert first['mode'] == 'request'
+	assert first['body_state'] == 'complete'
+	assert first['request']['headers'] == {'content-type': 'application/json'}
+	assert first['response']['headers']['content-type'] == 'text/plain; charset=utf-8'
+	assert first['response']['body_sha256'] == hashlib.sha256(body).hexdigest()
+	assert first['page']['metadata_included'] is True
+	assert first['page']['number'] == 1
+	assert second['page']['metadata_included'] is False
+	assert second['page']['number'] == 2
+	assert first['page']['data'] + second['page']['data'] == body.decode()
+	assert second['page']['next_cursor'] is None
+
+
+async def test_inspect_network_falls_back_when_node_cannot_start(monkeypatch, tmp_path: Path) -> None:
+	async def missing_node(*args: Any, **kwargs: Any) -> Any:
+		raise FileNotFoundError('node is unavailable')
+
+	monkeypatch.setattr(asyncio, 'create_subprocess_exec', missing_node)
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime.all_requests[0].update({'status': 200, 'response_body': '{"needle":42}'})
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='needle')))
+
+	assert result['search_mode'] == 'substring_fallback'
+	assert result['results'][0]['request_id'] == 0
+	assert 'node is unavailable' in result['fallback_reason']
+
+
+async def test_inspect_network_recent_packets_add_ids_without_changing_capture(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	runtime._on_request(FakeRequest())  # type: ignore[arg-type]
+	runtime._on_request(FakeRequest())  # type: ignore[arg-type]
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network')))
+
+	assert [item['request_id'] for item in result] == [0, 1]
+	assert all('request_id' not in item for item in runtime.capture_payload()['all_requests'])
+
+
+async def test_inspect_network_pages_complete_binary_body_as_base64(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	body = bytes(range(256)) * 300
+
+	class BinaryResponse(FakeResponse):
+		def __init__(self, source_request: FakeRequest) -> None:
+			super().__init__(source_request)
+			self.headers = {'content-type': 'application/octet-stream', 'content-length': str(len(body))}
+
+		async def body(self) -> bytes:
+			return body
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime._on_response(BinaryResponse(request))  # type: ignore[arg-type]
+
+	first = json.loads(await runtime.execute(AgentDecision(action='inspect_network', request_id=0)))
+	second = json.loads(
+		await runtime.execute(AgentDecision(action='inspect_network', request_id=0, cursor=first['page']['next_cursor']))
+	)
+
+	assert first['body_state'] == 'complete'
+	assert first['response']['body_encoding'] == 'base64'
+	assert base64.b64decode(first['page']['data'] + second['page']['data']) == body
+	assert first['response']['body_sha256'] == hashlib.sha256(body).hexdigest()
+
+
+async def test_inspect_network_rejects_response_larger_than_25_mib_without_reading_it(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	body_bytes = 25 * 1024 * 1024 + 1
+
+	class OversizedResponse(FakeResponse):
+		def __init__(self, source_request: FakeRequest) -> None:
+			super().__init__(source_request)
+			self.headers = {'content-type': 'application/json', 'content-length': str(body_bytes)}
+
+		async def body(self) -> bytes:
+			raise AssertionError('oversized response body must not be read')
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime._on_response(OversizedResponse(request))  # type: ignore[arg-type]
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', request_id=0)))
+
+	assert result['body_state'] == 'body_too_large'
+	assert result['response']['body_bytes'] == body_bytes
+	assert result['page']['data'] == ''
+	assert result['page']['next_cursor'] is None
+
+
+async def test_inspect_network_shrinks_body_page_to_keep_large_metadata_valid_json(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	request.post_data = 'p' * 20_000
+	request.post_data_buffer = None
+	body = ('response-' + ('x' * 65_000)).encode()
+
+	class LargeMetadataResponse(FakeResponse):
+		def __init__(self, source_request: FakeRequest) -> None:
+			super().__init__(source_request)
+			self.headers = {'content-type': 'text/plain', 'content-length': str(len(body))}
+
+		async def body(self) -> bytes:
+			return body
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime._on_response(LargeMetadataResponse(request))  # type: ignore[arg-type]
+
+	rendered = await runtime.execute(AgentDecision(action='inspect_network', request_id=0))
+	result = json.loads(rendered)
+
+	assert len(rendered) <= 80_000
+	assert result['request']['post_data'] == request.post_data
+	assert result['page']['next_cursor'] is not None
 
 
 async def test_capture_redacts_declared_sec_user_agent(tmp_path: Path) -> None:

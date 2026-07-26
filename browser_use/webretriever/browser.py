@@ -11,11 +11,13 @@ import asyncio
 import base64
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -56,6 +58,9 @@ _MAX_ELEMENT_TEXT = 240
 _MAX_PAGE_TEXT = 80_000
 _MAX_RENDERED_TEXT = 100_000
 _MAX_RESPONSE_BODY_BYTES = 128 * 1024
+_NETWORK_SEARCH_TIMEOUT_SECONDS = 30.0
+_NETWORK_SEARCH_NODE_HEAP_MIB = 512
+_NETWORK_BODY_PAGE_CHARACTERS = 60_000
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _MAX_DOWNLOAD_TEXT = 250_000
 _MAX_ARCHIVE_FILES = 1_000
@@ -437,7 +442,7 @@ class BrowserRuntime:
 		logger: logging.Logger,
 		*,
 		navigation_timeout_ms: int = 60_000,
-		action_timeout_ms: int = 20_000,
+		action_timeout_ms: int = 30_000,
 		screenshot_timeout_ms: int = 20_000,
 		cdp_screenshot_timeout_ms: int = 20_000,
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
@@ -467,9 +472,12 @@ class BrowserRuntime:
 		self._page_handlers: dict[int, list[tuple[str, Callable[..., Any]]]] = {}
 		self._context_handlers: list[tuple[str, Callable[..., Any]]] = []
 		self._request_entries: dict[int, dict[str, Any]] = {}
+		self._request_entries_by_id: dict[int, dict[str, Any]] = {}
+		self._request_ids_by_entry: dict[int, int] = {}
 		self._network_request_entries: dict[int, dict[str, Any]] = {}
 		self._network_entries_by_id: dict[int, dict[str, Any]] = {}
 		self._network_responses: dict[int, Response] = {}
+		self._network_page_cursors: dict[str, tuple[int, int, str, int]] = {}
 		self._next_network_request_id = 0
 		self._page_ids: dict[int, int] = {}
 		self._page_document_generations: dict[int, int] = {}
@@ -712,9 +720,12 @@ class BrowserRuntime:
 		self._owned_pages.clear()
 		self._element_bindings.clear()
 		self._request_entries.clear()
+		self._request_entries_by_id.clear()
+		self._request_ids_by_entry.clear()
 		self._network_request_entries.clear()
 		self._network_entries_by_id.clear()
 		self._network_responses.clear()
+		self._network_page_cursors.clear()
 		self._page_ids.clear()
 		self._page_document_generations.clear()
 		self._reserved_download_paths.clear()
@@ -766,10 +777,18 @@ class BrowserRuntime:
 		self._record_url(page.url, unless_last=True)
 
 	async def _configure_owned_page(self, page: Page) -> None:
-		"""Apply the declared SEC identity before an owned page navigates."""
+		"""Apply the task-appropriate User-Agent before an owned page navigates."""
 
 		if self.declared_user_agent and is_sec_url(self.website):
 			await page.set_extra_http_headers({'User-Agent': self.declared_user_agent})
+			return
+
+		user_agent = await page.evaluate('navigator.userAgent')
+		if not isinstance(user_agent, str):
+			return
+		normalized_user_agent = user_agent.replace('HeadlessChrome/', 'Chrome/')
+		if normalized_user_agent != user_agent:
+			await page.set_extra_http_headers({'User-Agent': normalized_user_agent})
 
 	def _capture_request_headers(self, headers: Mapping[str, str]) -> dict[str, str]:
 		"""Copy request headers while keeping configured contact details private."""
@@ -890,6 +909,8 @@ class BrowserRuntime:
 				entry['raw_post_data'] = raw_post_data
 			self.all_requests.append(entry)
 			self._request_entries[id(request)] = entry
+			self._request_entries_by_id[request_id] = entry
+			self._request_ids_by_entry[id(entry)] = request_id
 
 	def _on_response(self, response: Response) -> None:
 		network_entry = self._network_request_entries.get(id(response.request))
@@ -1010,6 +1031,7 @@ class BrowserRuntime:
 		try:
 			body = await asyncio.wait_for(response.body(), timeout=max(1, self.action_timeout_ms / 1000))
 			entry['response_body_bytes'] = len(body)
+			entry['response_body_sha256'] = hashlib.sha256(body).hexdigest()
 			if len(body) > max_body_bytes:
 				entry['response_body_state'] = 'body_too_large'
 				entry['response_error'] = f'response body {len(body)} exceeds {max_body_bytes} byte limit'
@@ -1229,7 +1251,7 @@ class BrowserRuntime:
 		if action == 'find':
 			return await self._find(params)
 		if action == 'inspect_network':
-			return self._inspect_network(params)
+			return await self._inspect_network(params)
 		if action == 'calculate':
 			return self._calculate(params)
 		if action in {'done', 'finish', 'answer', 'noop'}:
@@ -1462,13 +1484,287 @@ class BrowserRuntime:
 		except OSError:
 			return text
 
-	def _inspect_network(self, params: dict[str, Any]) -> str:
-		query = str(self._first(params, 'query', 'text', default='')).lower()
+	async def _inspect_network(self, params: dict[str, Any]) -> str:
+		request_id_value = self._first(params, 'request_id')
+		if request_id_value is not None:
+			return await self._inspect_network_request(
+				int(request_id_value),
+				cursor=self._first(params, 'cursor'),
+			)
+
+		query = str(self._first(params, 'query', 'text', default=''))
 		limit = min(max(int(self._first(params, 'limit', default=10)), 1), 50)
-		items = self.all_requests
-		if query:
-			items = [item for item in items if query in json.dumps(item, ensure_ascii=False).lower()]
-		return json.dumps(items[-limit:], ensure_ascii=False, indent=2)[:_MAX_PAGE_TEXT]
+		if not query:
+			items = []
+			for item in self.all_requests[-limit:]:
+				output = copy.deepcopy(item)
+				request_id = self._request_ids_by_entry.get(id(item))
+				if request_id is not None:
+					output['request_id'] = request_id
+				items.append(output)
+			return json.dumps(items, ensure_ascii=False, indent=2)[:_MAX_PAGE_TEXT]
+
+		await self._settle_network_capture_bounded(_NETWORK_SEARCH_TIMEOUT_SECONDS)
+		requests = []
+		for item in self.all_requests:
+			request_id = self._request_ids_by_entry.get(id(item))
+			if request_id is None:
+				continue
+			requests.append(
+				{
+					'request_id': request_id,
+					'timestamp': item.get('timestamp'),
+					'url': item.get('url'),
+					'method': item.get('method'),
+					'status': item.get('status'),
+					'resource_type': item.get('resource_type'),
+					'post_data': item.get('post_data'),
+					'json_data': item.get('json_data'),
+					'response_headers': item.get('response_headers'),
+					'response_body': item.get('response_body'),
+					'response_body_truncated': item.get('response_body_truncated', False),
+				}
+			)
+		payload = {'query': query, 'requests': requests}
+		result = await self._run_network_search(payload)
+		return json.dumps(result, ensure_ascii=False, indent=2)[:_MAX_PAGE_TEXT]
+
+	async def _inspect_network_request(self, request_id: int, *, cursor: Any = None) -> str:
+		if request_id not in self._request_entries_by_id:
+			raise ValueError(f'Unknown inspect_network request_id {request_id}')
+
+		metadata_included = cursor is None
+		if cursor is None:
+			await self._settle_network_capture_bounded(_NETWORK_SEARCH_TIMEOUT_SECONDS)
+			snapshot = await self._materialize_inspect_request(request_id)
+			offset = 0
+			page_number = 1
+		else:
+			cursor_state = self._network_page_cursors.get(str(cursor))
+			if cursor_state is None or cursor_state[0] != request_id:
+				raise ValueError('inspect_network cursor is invalid for this request_id')
+			snapshot = await self.materialize_network_request(request_id, max_body_bytes=_MAX_DOWNLOAD_BYTES)
+			offset = cursor_state[1]
+			page_number = cursor_state[3]
+
+		body_state, body_encoding, body_data = self._inspect_response_body(snapshot, request_id)
+		body_sha256 = str(snapshot.get('response_body_sha256', ''))
+		if not body_sha256 and body_data:
+			if body_encoding == 'base64':
+				with contextlib.suppress(ValueError):
+					body_sha256 = hashlib.sha256(base64.b64decode(body_data, validate=True)).hexdigest()
+			else:
+				body_sha256 = hashlib.sha256(body_data.encode('utf-8')).hexdigest()
+
+		if cursor is not None and cursor_state[2] != body_sha256:
+			raise ValueError('inspect_network cursor no longer matches the response body')
+
+		response = {
+			'status': snapshot.get('status'),
+			'headers': copy.deepcopy(snapshot.get('response_headers', {})),
+			'body_encoding': body_encoding,
+			'body_bytes': snapshot.get('response_body_bytes'),
+			'body_characters': len(body_data),
+			'body_sha256': body_sha256 or None,
+			'body_truncated': bool(snapshot.get('response_body_truncated')),
+			'error': snapshot.get('response_error'),
+		}
+		output: dict[str, Any] = {
+			'mode': 'request',
+			'request_id': request_id,
+			'url': snapshot.get('url'),
+			'body_state': body_state,
+			'response': response,
+			'page': {
+				'metadata_included': metadata_included,
+				'number': page_number,
+				'offset': offset,
+				'data': '',
+				'next_cursor': None,
+			},
+		}
+		if metadata_included:
+			response_only = {
+				'status',
+				'response_headers',
+				'response_body',
+				'response_json',
+				'response_body_base64',
+				'response_body_encoding',
+				'response_body_bytes',
+				'response_body_sha256',
+				'response_body_state',
+				'response_body_truncated',
+				'response_body_omitted',
+				'response_error',
+				'failure',
+			}
+			output['request'] = {key: copy.deepcopy(value) for key, value in snapshot.items() if key not in response_only}
+
+		page_length = self._fit_network_body_page(output, body_data, offset)
+		page_data = body_data[offset : offset + page_length]
+		next_offset = offset + len(page_data)
+		next_cursor: str | None = None
+		if next_offset < len(body_data):
+			next_cursor = secrets.token_urlsafe(24)
+			self._network_page_cursors[next_cursor] = (request_id, next_offset, body_sha256, page_number + 1)
+		output['page']['data'] = page_data
+		output['page']['next_cursor'] = next_cursor
+		rendered = json.dumps(output, ensure_ascii=False, indent=2)
+		if len(rendered) > _MAX_PAGE_TEXT:
+			raise ValueError('inspect_network request metadata exceeds the action output limit')
+		return rendered
+
+	@staticmethod
+	def _fit_network_body_page(output: dict[str, Any], body_data: str, offset: int) -> int:
+		remaining = max(0, len(body_data) - offset)
+		length = min(_NETWORK_BODY_PAGE_CHARACTERS, remaining)
+		cursor_placeholder = 'x' * 32
+		while True:
+			output['page']['data'] = body_data[offset : offset + length]
+			output['page']['next_cursor'] = cursor_placeholder if length < remaining else None
+			rendered_length = len(json.dumps(output, ensure_ascii=False, indent=2))
+			if rendered_length <= _MAX_PAGE_TEXT:
+				if remaining and length == 0:
+					raise ValueError('inspect_network request metadata leaves no room for response data')
+				return length
+			if length == 0:
+				raise ValueError('inspect_network request metadata exceeds the action output limit')
+			length = max(0, length - max(1, rendered_length - _MAX_PAGE_TEXT))
+
+	async def _materialize_inspect_request(self, request_id: int) -> dict[str, Any]:
+		deadline = asyncio.get_running_loop().time() + _NETWORK_SEARCH_TIMEOUT_SECONDS
+		while True:
+			snapshot = await self.materialize_network_request(request_id, max_body_bytes=_MAX_DOWNLOAD_BYTES)
+			if snapshot.get('response_body_state') != 'pending':
+				return snapshot
+			remaining = deadline - asyncio.get_running_loop().time()
+			if remaining <= 0:
+				return snapshot
+			await asyncio.sleep(min(0.1, remaining))
+
+	def _inspect_response_body(self, snapshot: Mapping[str, Any], request_id: int) -> tuple[str, str, str]:
+		state = str(snapshot.get('response_body_state', 'unavailable'))
+		if isinstance(snapshot.get('response_body'), str):
+			return ('complete' if state == 'complete' else 'partial', 'text', str(snapshot['response_body']))
+		if isinstance(snapshot.get('response_body_base64'), str):
+			return ('complete' if state == 'complete' else 'partial', 'base64', str(snapshot['response_body_base64']))
+
+		captured = self._request_entries_by_id[request_id]
+		if isinstance(captured.get('response_body'), str):
+			return 'partial', 'text', str(captured['response_body'])
+		if isinstance(captured.get('response_body_base64'), str):
+			return 'partial', 'base64', str(captured['response_body_base64'])
+		if state == 'body_too_large':
+			return 'body_too_large', 'none', ''
+		if state in {'error', 'failed'}:
+			return 'error', 'none', ''
+		return 'unavailable', 'none', ''
+
+	async def _settle_network_capture_bounded(self, timeout_seconds: float) -> None:
+		deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+		while self._background_tasks:
+			remaining = deadline - asyncio.get_running_loop().time()
+			if remaining <= 0:
+				return
+			tasks = tuple(self._background_tasks)
+			done, _ = await asyncio.wait(tasks, timeout=remaining)
+			if not done:
+				return
+			self._background_tasks.difference_update(done)
+			for task in done:
+				with contextlib.suppress(asyncio.CancelledError, Exception):
+					task.result()
+
+	async def _run_network_search(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+		script = Path(__file__).with_name('lunr_network_search.js')
+		try:
+			process = await asyncio.create_subprocess_exec(
+				'node',
+				f'--max-old-space-size={_NETWORK_SEARCH_NODE_HEAP_MIB}',
+				str(script),
+				stdin=asyncio.subprocess.PIPE,
+				stdout=asyncio.subprocess.PIPE,
+				stderr=asyncio.subprocess.PIPE,
+			)
+		except OSError as exc:
+			return self._substring_network_search(payload, f'{type(exc).__name__}: {exc}')
+		input_bytes = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
+		try:
+			stdout, stderr = await asyncio.wait_for(
+				process.communicate(input_bytes),
+				timeout=_NETWORK_SEARCH_TIMEOUT_SECONDS,
+			)
+		except asyncio.CancelledError:
+			with contextlib.suppress(ProcessLookupError):
+				process.kill()
+			await process.wait()
+			raise
+		except TimeoutError:
+			with contextlib.suppress(ProcessLookupError):
+				process.kill()
+			await process.wait()
+			return self._substring_network_search(payload, 'Node search exceeded 30 seconds')
+		if process.returncode != 0:
+			reason = stderr.decode('utf-8', errors='replace')[:500] or f'Node search exited {process.returncode}'
+			return self._substring_network_search(payload, reason)
+		try:
+			result = json.loads(stdout)
+		except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+			return self._substring_network_search(payload, f'Invalid Node search output: {exc}')
+		if not isinstance(result, dict):
+			return self._substring_network_search(payload, 'Node search output was not an object')
+		return result
+
+	@staticmethod
+	def _substring_network_search(payload: Mapping[str, Any], reason: str) -> dict[str, Any]:
+		query = str(payload.get('query', ''))
+		query_lower = query.casefold()
+		requests = payload.get('requests')
+		if not isinstance(requests, list):
+			requests = []
+		results = []
+		for request in reversed(requests):
+			if not isinstance(request, Mapping):
+				continue
+			serialized = json.dumps(request, ensure_ascii=False)
+			start = serialized.casefold().find(query_lower)
+			if start < 0:
+				continue
+			context_start = max(0, start - 500)
+			context_end = min(len(serialized), start + len(query) + 1_000)
+			results.append(
+				{
+					'rank': len(results) + 1,
+					'request_id': request.get('request_id'),
+					'score': None,
+					'matched_query_terms': [query],
+					'matched_fields': ['serialized_request'],
+					'duplicate_count': 1,
+					'request': {
+						'timestamp': request.get('timestamp'),
+						'url': request.get('url'),
+						'method': request.get('method'),
+						'status': request.get('status'),
+						'resource_type': request.get('resource_type'),
+						'post_data': request.get('post_data'),
+					},
+					'matched_chunks': [{'score': None, 'text': serialized[context_start:context_end]}],
+				}
+			)
+			if len(results) == 10:
+				break
+		return {
+			'search_mode': 'substring_fallback',
+			'fallback_reason': reason,
+			'query': query,
+			'indexed_requests': len(requests),
+			'pending_response_bodies': sum(
+				1 for request in requests if isinstance(request, Mapping) and request.get('status') is None
+			),
+			'omitted_due_to_budget': 0,
+			'results': results,
+		}
 
 	@classmethod
 	def _calculate(cls, params: dict[str, Any]) -> str:

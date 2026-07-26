@@ -149,7 +149,10 @@ def test_load_tasks_rejects_duplicate_indices_and_ids(tmp_path: Path, field: str
 		{'action': 'close_tab', 'tab_index': 1},
 		{'action': 'read_element', 'element_id': 1},
 		{'action': 'find_text', 'text': 'needle'},
+		{'action': 'inspect_network'},
 		{'action': 'inspect_network', 'text': '/api/data'},
+		{'action': 'inspect_network', 'request_id': 42},
+		{'action': 'inspect_network', 'request_id': 42, 'cursor': 'opaque-page-2'},
 		{'action': 'find_chart_data_requests'},
 		{'action': 'find_chart_data_requests', 'cursor': 'scan-id:1'},
 		{
@@ -224,6 +227,8 @@ def test_agent_decision_rejects_conflicting_nested_gateway_action() -> None:
 		},
 		{'action': 'call_data_analysis_assistant', 'analysis_query': '   ', 'data_dir': '/tmp/data'},
 		{'action': 'find_chart_data_requests', 'analysis_query': 'Analyze this.'},
+		{'action': 'inspect_network', 'text': 'revenue', 'request_id': 42},
+		{'action': 'inspect_network', 'cursor': 'opaque-page-2'},
 	],
 )
 def test_agent_decision_rejects_missing_or_irrelevant_parameters(payload: dict[str, object]) -> None:
