@@ -15,7 +15,7 @@ from PIL import Image
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.webretriever.agent import ProtocolIIIAgent
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
-from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
+from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, build_step_prompt_trace, build_system_prompt
 
 
 def _png_bytes() -> bytes:
@@ -48,6 +48,20 @@ class FakeRuntime:
 		return 'Action completed.'
 
 
+@dataclass(slots=True)
+class ChangingObservation(FakeObservation):
+	marker: str = 'first-state'
+
+	def render_text(self) -> str:
+		return f'Visible browser state: {self.marker}'
+
+
+class ChangingObservationRuntime(FakeRuntime):
+	async def observe(self, step: int) -> ChangingObservation:
+		self.observed_steps.append(step)
+		return ChangingObservation(marker='second-state' if step >= 2 else 'first-state')
+
+
 class BlockingExecuteRuntime(FakeRuntime):
 	def __init__(self) -> None:
 		super().__init__()
@@ -68,6 +82,22 @@ class FakeLLM:
 	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
 		self.calls.append((messages, output_format))
 		return SimpleNamespace(completion=next(self.decisions), usage=None)
+
+
+class PromptLogInspectingLLM(FakeLLM):
+	def __init__(self, decisions: list[AgentDecision], prompt_log_path: Path) -> None:
+		super().__init__(decisions)
+		self.prompt_log_path = prompt_log_path
+		self.persisted_before_requests: list[dict[str, Any]] = []
+
+	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
+		prompt_log = json.loads(self.prompt_log_path.read_text(encoding='utf-8'))
+		self.persisted_before_requests.append(prompt_log['steps'][-1])
+		self.calls.append((messages, output_format))
+		return SimpleNamespace(
+			completion=next(self.decisions),
+			usage=SimpleNamespace(input_tokens=3, output_tokens=2),
+		)
 
 
 class FakeChartNetworkInspector:
@@ -169,6 +199,14 @@ def _model_text(calls: list[tuple[list[Any], Any]]) -> str:
 	return '\n'.join(message.text for messages, _ in calls for message in messages)
 
 
+def test_system_prompt_keeps_conditional_bls_recovery_out_of_the_stable_core() -> None:
+	prompt = build_system_prompt()
+
+	assert 'https://api.bls.gov/publicAPI/v2/timeseries/data/<SERIES_ID>' not in prompt
+	assert 'CES5000000001' not in prompt
+	assert '2895' not in prompt
+
+
 @pytest.mark.asyncio
 async def test_agent_success_is_grounded_and_ground_truth_never_enters_prompt(tmp_path: Path):
 	secret = 'SECRET_GROUND_TRUTH_9f6a'
@@ -203,16 +241,15 @@ async def test_agent_success_is_grounded_and_ground_truth_never_enters_prompt(tm
 
 
 @pytest.mark.asyncio
-async def test_agent_writes_each_model_prompt_before_request(tmp_path: Path):
+async def test_agent_writes_line_oriented_model_prompts_by_default(tmp_path: Path):
 	llm = FakeLLM(
 		[
-			AgentDecision(action='wait', seconds=0.1, thought='Wait for the page to settle.'),
 			AgentDecision(
 				action='finish',
 				answer='42',
 				evidence=['The current page states 42.'],
 				success=True,
-			),
+			)
 		]
 	)
 
@@ -221,18 +258,104 @@ async def test_agent_writes_each_model_prompt_before_request(tmp_path: Path):
 		llm=llm,
 		runtime=FakeRuntime(),
 		task_dir=tmp_path,
-		max_steps=2,
 	).run()
 
 	assert outcome.status == 'SUCCESS'
 	prompt_log = json.loads((tmp_path / 'model_prompts.json').read_text(encoding='utf-8'))
-	assert prompt_log['system_prompt'] == llm.calls[0][0][0].text
+	assert prompt_log['format'] == 'webretriever-model-prompts/v2-lines'
+	assert prompt_log['system_prompt'] == llm.calls[0][0][0].text.split('\n')
+	assert prompt_log['steps'][0]['prompt'] == llm.calls[0][0][1].text.split('\n')
+	assert '\n'.join(prompt_log['steps'][0]['prompt']) == llm.calls[0][0][1].text
+	assert set(prompt_log['steps'][0]) == {'step', 'prompt', 'image'}
+	assert 'SECRET_GROUND_TRUTH_9f6a' not in json.dumps(prompt_log, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_agent_can_write_structured_model_prompts_before_request(tmp_path: Path):
+	llm = PromptLogInspectingLLM(
+		[
+			AgentDecision(action='wait', seconds=0.1, thought='Wait for the page to settle.'),
+			AgentDecision(
+				action='finish',
+				answer='42',
+				evidence=['The current page states 42.'],
+				success=True,
+			),
+		],
+		tmp_path / 'model_prompts.json',
+	)
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=FakeRuntime(),
+		task_dir=tmp_path,
+		max_steps=2,
+		structured_prompt_log=True,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	prompt_log = json.loads((tmp_path / 'model_prompts.json').read_text(encoding='utf-8'))
+	assert prompt_log['format'] == 'webretriever-model-prompts/v2-structured'
+	assert prompt_log['metadata']['message_order'] == ['system_prompt', 'steps[].prompt', 'steps[].image']
+	assert prompt_log['task'] == _task_with_ground_truth().prompt_payload()
+	assert prompt_log['system_prompt']['rendered_text'] == llm.calls[0][0][0].text
+	assert prompt_log['system_prompt']['metrics']['characters'] == len(llm.calls[0][0][0].text)
 	assert [entry['step'] for entry in prompt_log['steps']] == [1, 2]
-	assert [entry['prompt'] for entry in prompt_log['steps']] == [call[0][1].text for call in llm.calls]
+	assert [entry['prompt']['rendered_text'] for entry in prompt_log['steps']] == [
+		call[0][1].text for call in llm.calls
+	]
+	assert [
+		section['id'] for section in prompt_log['steps'][0]['prompt']['sections']
+	] == [
+		'authoritative_task',
+		'execution_state',
+		'browser_observation',
+		'trusted_operational_guidance',
+		'decision_instructions',
+	]
+	assert prompt_log['steps'][0]['prompt']['sections'][2]['fields']['rendered_text'] == (
+		'Visible page text: independently verified result is 42.'
+	)
+	assert prompt_log['steps'][0]['prompt']['metrics']['estimated_tokens'] > 0
+	assert prompt_log['steps'][0]['prompt']['metrics']['selected_playbooks'] == []
+	assert prompt_log['steps'][0]['model_call']['duration_seconds'] >= 0
+	assert prompt_log['steps'][0]['model_call']['usage'] == {'input_tokens': 3, 'output_tokens': 2}
+	assert prompt_log['steps'][0]['model_call']['error'] is None
+	assert all('model_call' not in entry for entry in llm.persisted_before_requests)
 	assert [entry['image'] for entry in prompt_log['steps']] == [
 		{'media_type': 'image/png', 'detail': 'high', 'path': 'trajectory/0.png'},
 		{'media_type': 'image/png', 'detail': 'high', 'path': 'trajectory/1.png'},
 	]
+	assert 'SECRET_GROUND_TRUTH_9f6a' not in json.dumps(prompt_log, ensure_ascii=False)
+
+
+def test_step_prompt_trace_structures_rendered_browser_observation() -> None:
+	trace = build_step_prompt_trace(
+		task='Read the visible result.',
+		website='https://example.com/start',
+		step=2,
+		max_steps=100,
+		observation=(
+			'URL: https://example.com/result\n\nTitle: Result\n\nViewport: 1440x900\n\nTabs:\n'
+			"  0: 'Result' https://example.com/result [active]\n\nInteractive elements:\n"
+			'  [3] button name="Next"\n\nRecent XHR/Fetch:\n  GET https://example.com/api [200]\n\n'
+			'Downloads:\n  (none)\n\nPage text:\nVerified result: 42'
+		),
+		history=[{'step': 1, 'thought': 'Opened the result.', 'outcome': 'Navigation completed.'}],
+		memory='Verified: source is open.',
+		last_outcome='Navigation completed.',
+	)
+
+	sections = {section['id']: section for section in trace.sections}
+	assert trace.text.startswith('===== AUTHORITATIVE TASK =====')
+	assert sections['authoritative_task']['fields']['starting_website'] == 'https://example.com/start'
+	assert sections['execution_state']['fields']['step'] == 3
+	assert sections['execution_state']['fields']['recent_trajectory'][0]['step'] == 1
+	assert sections['browser_observation']['trust'] == 'untrusted_browser_content'
+	assert sections['browser_observation']['fields']['viewport'] == {'text': '1440x900', 'width': 1440, 'height': 900}
+	assert sections['browser_observation']['fields']['page_text'] == 'Verified result: 42'
+	assert sections['decision_instructions']['text'].startswith('The attached image is the current Playwright screenshot')
 
 
 @pytest.mark.asyncio
@@ -270,6 +393,7 @@ async def test_agent_stops_on_model_timeout_without_browser_action(tmp_path: Pat
 		task_dir=tmp_path,
 		model_timeout_seconds=0.01,
 		max_consecutive_model_timeouts=1,
+		structured_prompt_log=True,
 	)
 
 	outcome = await agent.run()
@@ -278,6 +402,8 @@ async def test_agent_stops_on_model_timeout_without_browser_action(tmp_path: Pat
 	assert outcome.error is not None and '0.01 seconds' in outcome.error
 	assert runtime.executed == []
 	assert (tmp_path / 'trajectory_visual' / '0.png').is_file()
+	prompt_log = json.loads((tmp_path / 'model_prompts.json').read_text(encoding='utf-8'))
+	assert 'exceeded 0.01 seconds' in prompt_log['steps'][0]['model_call']['error']
 
 
 @pytest.mark.asyncio
@@ -431,6 +557,82 @@ async def test_agent_stops_at_configured_max_steps(tmp_path: Path):
 	assert runtime.observed_steps == [0, 1]
 	assert len(runtime.executed) == 2
 	assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_third_identical_action_on_unchanged_observation(tmp_path: Path):
+	decision = AgentDecision(action='wait', seconds=0.1, thought='Wait for the same page.')
+	runtime = FakeRuntime()
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(
+			[
+				decision,
+				decision,
+				decision,
+				AgentDecision(
+					action='finish',
+					answer='42',
+					evidence=['The current page states 42.'],
+					success=True,
+				),
+			]
+		),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=4,
+	)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'SUCCESS'
+	assert len(runtime.executed) == 2
+	blocked = json.loads(outcome.steps[2]['outcome'])
+	assert blocked['status'] == 'repeated_unchanged_action'
+	assert blocked['repeat_count'] == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_resets_identical_action_count_when_action_changes(tmp_path: Path):
+	runtime = FakeRuntime()
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(
+			[
+				AgentDecision(action='wait', seconds=0.1),
+				AgentDecision(action='wait', seconds=0.1),
+				AgentDecision(action='wait', seconds=0.2),
+				AgentDecision(action='wait', seconds=0.1),
+			],
+		),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=4,
+	)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'FAIL_MAX_STEPS'
+	assert len(runtime.executed) == 4
+	assert all('repeated_unchanged_action' not in step['outcome'] for step in outcome.steps)
+
+
+@pytest.mark.asyncio
+async def test_agent_resets_identical_action_count_when_observation_changes(tmp_path: Path):
+	runtime = ChangingObservationRuntime()
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM([AgentDecision(action='wait', seconds=0.1) for _ in range(3)]),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=3,
+	)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'FAIL_MAX_STEPS'
+	assert len(runtime.executed) == 3
+	assert all('repeated_unchanged_action' not in step['outcome'] for step in outcome.steps)
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,7 @@ class RunnerConfig:
 	max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 	reasoning_effort: ReasoningEffort = 'medium'
 	thought_language: str = DEFAULT_THOUGHT_LANGUAGE
+	structured_prompt_log: bool = False
 	local_browser: bool = False
 	headless: bool = True
 	rerun_failed: bool = False
@@ -377,6 +378,7 @@ async def _run_task(
 				max_steps=config.max_steps,
 				model_timeout_seconds=config.model_timeout_seconds,
 				thought_language=config.thought_language,
+				structured_prompt_log=config.structured_prompt_log,
 				task_deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
 			)
 			outcome = await _await_with_hard_timeout(

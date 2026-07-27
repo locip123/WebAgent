@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json, prepare_task_directory
+from browser_use.webretriever.artifacts import (
+	MODEL_PROMPT_LOG_FORMAT,
+	TaskArtifactWriter,
+	atomic_write_json,
+	prepare_task_directory,
+	prompt_text_lines,
+)
 from browser_use.webretriever.models import AgentDecision, CompetitionTask, load_tasks
 
 
@@ -152,9 +158,9 @@ def test_load_tasks_rejects_duplicate_indices_and_ids(tmp_path: Path, field: str
 		{'action': 'inspect_network'},
 		{'action': 'inspect_network', 'text': '/api/data'},
 		{'action': 'inspect_network', 'request_id': 42},
-		{'action': 'inspect_network', 'request_id': 42, 'cursor': 'opaque-page-2'},
+		{'action': 'inspect_network', 'request_id': 42, 'network_cursor': 'opaque-page-2'},
 		{'action': 'find_chart_data_requests'},
-		{'action': 'find_chart_data_requests', 'cursor': 'scan-id:1'},
+		{'action': 'find_chart_data_requests', 'chart_cursor': 'scan-id:1'},
 		{
 			'action': 'call_data_analysis_assistant',
 			'analysis_query': 'Which month has the highest ratio?',
@@ -195,6 +201,38 @@ def test_agent_decision_flattens_action_named_gateway_envelope() -> None:
 	assert decision.action == 'type'
 	assert decision.element_id == 8
 	assert decision.text == 'Adolescent fertility rate'
+
+
+@pytest.mark.parametrize(
+	'action,typed_field',
+	[
+		('inspect_network', 'network_cursor'),
+		('find_chart_data_requests', 'chart_cursor'),
+	],
+)
+def test_agent_decision_maps_legacy_cursor_to_its_typed_action_field(action: str, typed_field: str) -> None:
+	payload: dict[str, object] = {'action': action, 'cursor': 'legacy-page-2'}
+	if action == 'inspect_network':
+		payload['request_id'] = 42
+
+	decision = AgentDecision.model_validate(payload)
+
+	assert getattr(decision, typed_field) == 'legacy-page-2'
+	assert 'cursor' not in AgentDecision.model_json_schema()['properties']
+	assert 'cursor' not in decision.action_payload()
+
+
+@pytest.mark.parametrize(
+	'payload',
+	[
+		{'action': 'inspect_network', 'request_id': 42, 'chart_cursor': 'wrong-tool'},
+		{'action': 'find_chart_data_requests', 'network_cursor': 'wrong-tool'},
+		{'action': 'click', 'cursor': 'wrong-tool', 'element_id': 1},
+	],
+)
+def test_agent_decision_rejects_cross_tool_cursors(payload: dict[str, object]) -> None:
+	with pytest.raises(ValidationError):
+		AgentDecision.model_validate(payload)
 
 
 def test_agent_decision_rejects_conflicting_nested_gateway_action() -> None:
@@ -261,11 +299,11 @@ def test_task_artifacts_create_scaffolds_and_update_atomically(tmp_path: Path) -
 	assert result['status'] == 'PENDING'
 	assert 'answer' not in result
 	assert json.loads(writer.capture_path.read_text(encoding='utf-8'))['all_requests'] == []
-	assert json.loads(writer.model_prompt_log_path.read_text(encoding='utf-8')) == {
-		'format': 'webretriever-model-prompts/v1',
-		'system_prompt': '',
-		'steps': [],
-	}
+	prompt_log = json.loads(writer.model_prompt_log_path.read_text(encoding='utf-8'))
+	assert prompt_log == {'format': MODEL_PROMPT_LOG_FORMAT, 'system_prompt': [], 'steps': []}
+	assert 'private reference answer' not in json.dumps(prompt_log, ensure_ascii=False)
+	assert prompt_text_lines('first\n\nthird\n') == ['first', '', 'third', '']
+	assert '\n'.join(prompt_text_lines('first\n\nthird\n')) == 'first\n\nthird\n'
 
 	writer.write_result(
 		status='SUCCESS',

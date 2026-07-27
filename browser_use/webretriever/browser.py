@@ -21,6 +21,7 @@ import secrets
 import stat
 import tempfile
 import time
+import unicodedata
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -778,7 +779,7 @@ class BrowserRuntime:
 		self._record_url(page.url, unless_last=True)
 
 	async def _configure_owned_page(self, page: Page) -> None:
-		"""Apply the task-appropriate User-Agent before an owned page navigates."""
+		"""Configure the User-Agent consistently before an owned page navigates."""
 
 		if self.declared_user_agent and is_sec_url(self.website):
 			await page.set_extra_http_headers({'User-Agent': self.declared_user_agent})
@@ -788,8 +789,23 @@ class BrowserRuntime:
 		if not isinstance(user_agent, str):
 			return
 		normalized_user_agent = user_agent.replace('HeadlessChrome/', 'Chrome/')
-		if normalized_user_agent != user_agent:
-			await page.set_extra_http_headers({'User-Agent': normalized_user_agent})
+		if normalized_user_agent == user_agent:
+			return
+
+		# Keep the HTTP header and JavaScript-visible value in sync for the page's
+		# future documents. This must run before its first navigation.
+		await page.set_extra_http_headers({'User-Agent': normalized_user_agent})
+		await page.add_init_script(
+			f"""
+			(() => {{
+				const userAgent = {json.dumps(normalized_user_agent)};
+				Object.defineProperty(Navigator.prototype, 'userAgent', {{
+					configurable: true,
+					get: () => userAgent,
+				}});
+			}})();
+			"""
+		)
 
 	def _capture_request_headers(self, headers: Mapping[str, str]) -> dict[str, str]:
 		"""Copy request headers while keeping configured contact details private."""
@@ -807,10 +823,9 @@ class BrowserRuntime:
 			return
 		self._register_page(page, make_active=True)
 		# A target=_blank link or script-created popup is registered by the
-		# browser, not by one of our explicit new-page actions. Schedule the same
-		# page-scoped declaration for its follow-up requests.
-		if self.declared_user_agent and is_sec_url(self.website):
-			self._spawn_background(self._configure_owned_page(page))
+		# browser, not by one of our explicit new-page actions. Apply the same
+		# page-scoped User-Agent configuration for its follow-up requests.
+		self._spawn_background(self._configure_owned_page(page))
 
 	def _on_page_closed(self, page: Page) -> None:
 		if self.page is page:
@@ -1490,7 +1505,7 @@ class BrowserRuntime:
 		if request_id_value is not None:
 			return await self._inspect_network_request(
 				int(request_id_value),
-				cursor=self._first(params, 'cursor'),
+				cursor=self._first(params, 'network_cursor', 'cursor'),
 			)
 
 		query = str(self._first(params, 'query', 'text', default=''))
@@ -1528,7 +1543,36 @@ class BrowserRuntime:
 			)
 		payload = {'query': query, 'requests': requests}
 		result = await self._run_network_search(payload)
+		# Lunr tokenizes a query, so a response containing only a few generic
+		# terms can rank highly without containing the complete requested phrase.
+		# Count literal response-body matches separately so callers can distinguish
+		# relevance from an exact hit. Request metadata is intentionally excluded:
+		# a phrase echoed in a URL or request payload is not retrieved evidence.
+		result = {
+			'exact_match_count': self._exact_network_response_match_count(query, requests),
+			**result,
+		}
 		return json.dumps(result, ensure_ascii=False, indent=2)[:_MAX_PAGE_TEXT]
+
+	@staticmethod
+	def _exact_network_response_match_count(query: str, requests: Sequence[Mapping[str, Any]]) -> int:
+		"""Count captured response bodies containing ``query`` as one full phrase.
+
+		The count is per captured request (rather than per textual occurrence), and
+		uses Unicode NFKC normalization plus case folding. This keeps a title match
+		stable across harmless compatibility variants while preserving whitespace and
+		word boundaries: token-level or partial Lunr matches do not qualify.
+		"""
+
+		normalized_query = unicodedata.normalize('NFKC', query).casefold()
+		if not normalized_query:
+			return 0
+		return sum(
+			1
+			for request in requests
+			if isinstance(request.get('response_body'), str)
+			and normalized_query in unicodedata.normalize('NFKC', request['response_body']).casefold()
+		)
 
 	async def _inspect_network_request(self, request_id: int, *, cursor: Any = None) -> str:
 		if request_id not in self._request_entries_by_id:

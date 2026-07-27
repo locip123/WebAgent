@@ -286,13 +286,18 @@ class ChatOpenAI(BaseChatModel):
 						completed_text = text
 					continue
 				if event_type == 'response.completed':
-					response = event.response
+					response = getattr(event, 'response', None)
+					if response is None:
+						raise ModelProviderError(message='Responses API completion omitted its response', model=self.name)
 					return response if response.output_text else completed_text or ''.join(text_deltas)
 				if event_type == 'response.incomplete':
-					response = event.response
+					response = getattr(event, 'response', None)
+					if response is None:
+						raise ModelProviderError(message='Responses API incomplete event omitted its response', model=self.name)
 					return response if response.output_text else completed_text or ''.join(text_deltas)
 				if event_type == 'response.failed':
-					error = getattr(event.response, 'error', None)
+					response = getattr(event, 'response', None)
+					error = getattr(response, 'error', None)
 					message = getattr(error, 'message', None) or str(error or 'Responses API request failed')
 					raise ModelProviderError(message=message, model=self.name)
 				if event_type == 'error':

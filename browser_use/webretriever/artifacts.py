@@ -16,6 +16,28 @@ from pydantic import BaseModel
 from browser_use.webretriever.models import CompetitionTask
 
 MODEL_PROMPT_LOG_FILENAME = 'model_prompts.json'
+MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-lines'
+STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-structured'
+
+
+def model_prompt_log_metadata() -> dict[str, Any]:
+	"""Describe the optional detailed developer-facing model prompt trace."""
+
+	return {
+		'description': 'Structured trace of the exact multimodal messages submitted to the decision model.',
+		'message_order': ['system_prompt', 'steps[].prompt', 'steps[].image'],
+	}
+
+
+def prompt_text_lines(text: str) -> list[str]:
+	"""Store every LF-delimited prompt line visibly while retaining exact content.
+
+	JSON strings must escape literal line feeds.  A list makes each original line
+	visible in a normal pretty-printed JSON viewer; ``'\n'.join(result)`` exactly
+	reconstructs the input, including empty and trailing lines.
+	"""
+
+	return text.split('\n')
 
 try:
 	import fcntl
@@ -198,13 +220,12 @@ class TaskArtifactWriter:
 			'all_requests': [],
 		}
 
-	@staticmethod
-	def _empty_model_prompt_log() -> dict[str, Any]:
+	def _empty_model_prompt_log(self) -> dict[str, Any]:
 		"""Return the initial model-prompt log for a task with no model calls."""
 
 		return {
-			'format': 'webretriever-model-prompts/v1',
-			'system_prompt': '',
+			'format': MODEL_PROMPT_LOG_FORMAT,
+			'system_prompt': [],
 			'steps': [],
 		}
 
@@ -305,4 +326,14 @@ def prepare_task_directory(output_dir: Path | str, task: CompetitionTask) -> Pat
 	return TaskArtifactWriter(output_dir, task).prepare()
 
 
-__all__ = ['TaskArtifactWriter', 'TaskLock', 'atomic_write_json', 'prepare_task_directory']
+__all__ = [
+	'MODEL_PROMPT_LOG_FILENAME',
+	'MODEL_PROMPT_LOG_FORMAT',
+	'STRUCTURED_MODEL_PROMPT_LOG_FORMAT',
+	'TaskArtifactWriter',
+	'TaskLock',
+	'atomic_write_json',
+	'model_prompt_log_metadata',
+	'prepare_task_directory',
+	'prompt_text_lines',
+]

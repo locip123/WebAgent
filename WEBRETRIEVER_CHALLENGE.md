@@ -132,7 +132,8 @@ OUTPUT_DIR/
 │   ├── trajectory_visual/   # 带元素编号和动作标注的截图
 │   ├── downloads/           # 浏览器轨迹中下载的文档
 │   ├── result.json          # 状态、动作、URL、agent_answer、evidence
-│   └── capture.json         # XHR/Fetch 轨迹
+│   ├── capture.json         # XHR/Fetch 轨迹
+│   └── model_prompts.json   # 可复现的结构化模型输入调试轨迹
 ├── locks/                   # 每题 advisory lock 标记
 └── logs/
     ├── worker_*.log
@@ -140,6 +141,8 @@ OUTPUT_DIR/
 ```
 
 `SUCCESS` 必须同时有最终答案和至少一条带来源上下文的证据。模型超时、浏览器异常、连续动作失败或耗尽步数都会保留可诊断的失败状态和已有轨迹。
+
+默认的 `model_prompts.json` 使用 `webretriever-model-prompts/v2-lines`：`system_prompt` 与每步 `prompt` 都是逐行字符串数组，因此原始 prompt 中的每一个换行都会在 JSON 中显示为一行，避免把整段内容压成带大量 `\n` 的单一字符串。用 `"\n".join(prompt)` 可精确还原实际发送的文本。若需要详细调试 schema（任务、执行状态、浏览器观测、信任级别、字符/token 统计、启用的 playbook、裁剪原因，以及模型调用耗时/usage/error），显式添加 `--structured-prompt-log`；它会输出 `webretriever-model-prompts/v2-structured`。
 
 ## 测试
 

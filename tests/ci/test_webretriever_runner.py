@@ -122,6 +122,7 @@ def test_cli_config_uses_environment_and_cdp_alias(monkeypatch, tmp_path: Path):
 		'ws://browser.example.test/two',
 	]
 	assert config.thought_language == DEFAULT_THOUGHT_LANGUAGE
+	assert config.structured_prompt_log is False
 
 
 def test_cli_config_allows_thought_language_override(monkeypatch, tmp_path: Path):
@@ -145,6 +146,25 @@ def test_cli_config_allows_thought_language_override(monkeypatch, tmp_path: Path
 	config = cli.config_from_args(args, parser)
 
 	assert config.thought_language == 'English'
+
+
+def test_cli_config_enables_structured_prompt_log_only_when_requested(monkeypatch, tmp_path: Path):
+	monkeypatch.setenv('WEBRETRIEVER_MODEL', 'gpt-5.4')
+	monkeypatch.setenv('WEBRETRIEVER_API_KEY', 'web-key')
+	parser = cli.build_parser()
+	args = parser.parse_args(
+		[
+			'--input',
+			str(tmp_path / 'tasks.json'),
+			'--output',
+			str(tmp_path / 'output'),
+			'--cdp-url',
+			'ws://browser.example.test/one',
+			'--structured-prompt-log',
+		]
+	)
+
+	assert cli.config_from_args(args, parser).structured_prompt_log is True
 
 
 def test_cli_config_reads_cdp_urls_from_environment(monkeypatch, tmp_path: Path):
@@ -448,10 +468,10 @@ async def test_sec_tasks_are_serialized_while_other_tasks_remain_concurrent(monk
 	assert set(statuses.values()) == {'SUCCESS'}
 
 
-def test_runner_config_defaults_to_five_minute_task_timeout(tmp_path: Path):
+def test_runner_config_defaults_to_ten_minute_task_timeout(tmp_path: Path):
 	config = _config(tmp_path)
 
-	assert config.task_timeout_seconds == 300
+	assert config.task_timeout_seconds == 600
 	config.validate()
 
 
@@ -519,7 +539,7 @@ def test_task_timeout_outcome_preserves_partial_agent_history(tmp_path: Path):
 		({'max_steps': 101}, '100'),
 		({'model_timeout_seconds': 181}, '180'),
 		({'task_timeout_seconds': 0}, 'greater than 0'),
-		({'task_timeout_seconds': 301}, '300'),
+		({'task_timeout_seconds': 901}, '900'),
 		({'max_concurrency': 9}, '8'),
 		({'cdp_urls': [f'ws://browser.example.test/{index}' for index in range(9)]}, '8 concurrent CDP'),
 	],

@@ -87,3 +87,6 @@ plot.py
 .claude/
 outputs/*
 tests/*
+!tests/ci/
+tests/ci/*
+!tests/ci/test_webretriever_prompts.py

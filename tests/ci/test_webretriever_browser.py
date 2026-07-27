@@ -391,6 +391,7 @@ async def test_declared_sec_user_agent_is_sent_on_first_navigation(monkeypatch, 
 
 async def test_headless_chrome_user_agent_is_normalized_before_first_navigation(tmp_path: Path) -> None:
 	seen_headers: dict[str, str] = {}
+	observed_navigator_user_agent = ''
 
 	async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
 		raw_request = await reader.readuntil(b'\r\n\r\n')
@@ -415,6 +416,7 @@ async def test_headless_chrome_user_agent_is_normalized_before_first_navigation(
 			runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
 			try:
 				await runtime.start(f'http://127.0.0.1:{port}/')
+				observed_navigator_user_agent = await runtime.page.evaluate('navigator.userAgent')  # type: ignore[union-attr]
 			finally:
 				await runtime.close()
 				await browser.close()
@@ -424,6 +426,7 @@ async def test_headless_chrome_user_agent_is_normalized_before_first_navigation(
 
 	assert 'HeadlessChrome/' not in seen_headers['user-agent']
 	assert 'Chrome/' in seen_headers['user-agent']
+	assert observed_navigator_user_agent == seen_headers['user-agent']
 
 
 async def test_non_sec_start_does_not_declare_sec_user_agent(tmp_path: Path) -> None:
@@ -1085,8 +1088,36 @@ async def test_inspect_network_search_returns_stable_request_id_through_execute(
 	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='monthly revenue')))
 
 	assert result['search_mode'] == 'lunr'
+	# Lunr matches the camel-cased field token, but its raw body does not contain
+	# the complete phrase with a space.
+	assert result['exact_match_count'] == 0
 	assert result['results'][0]['request_id'] == 0
 	assert result['results'][0]['matched_chunks'][0]['json_path'] == '$.metrics'
+
+
+async def test_inspect_network_search_counts_complete_response_phrase(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	for body in (
+		'{"title":"QuestMobile 2025潜力营销价值媒介研究"}',
+		'{"title":"QuestMobile 2025营销市场年度报告"}',
+	):
+		request = FakeRequest()
+		runtime._on_request(request)  # type: ignore[arg-type]
+		runtime.all_requests[-1].update(
+			{
+				'status': 200,
+				'response_headers': {'content-type': 'application/json'},
+				'response_body': body,
+			}
+		)
+
+	result = json.loads(
+		await runtime.execute(AgentDecision(action='inspect_network', text='questmobile 2025潜力营销价值媒介研究'))
+	)
+
+	assert result['search_mode'] == 'lunr'
+	assert result['exact_match_count'] == 1
 
 
 async def test_inspect_network_reads_complete_request_body_across_cursor_pages(tmp_path: Path) -> None:
@@ -1138,6 +1169,7 @@ async def test_inspect_network_falls_back_when_node_cannot_start(monkeypatch, tm
 	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='needle')))
 
 	assert result['search_mode'] == 'substring_fallback'
+	assert result['exact_match_count'] == 1
 	assert result['results'][0]['request_id'] == 0
 	assert 'node is unavailable' in result['fallback_reason']
 

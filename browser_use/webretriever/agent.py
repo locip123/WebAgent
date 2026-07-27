@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -16,13 +17,23 @@ from PIL import Image, ImageDraw, ImageFont
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
-from browser_use.webretriever.artifacts import MODEL_PROMPT_LOG_FILENAME, atomic_write_json
+from browser_use.webretriever.artifacts import (
+	MODEL_PROMPT_LOG_FILENAME,
+	MODEL_PROMPT_LOG_FORMAT,
+	STRUCTURED_MODEL_PROMPT_LOG_FORMAT,
+	atomic_write_json,
+	model_prompt_log_metadata,
+	prompt_text_lines,
+)
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
 from browser_use.webretriever.network import ChartNetworkInspector
 from browser_use.webretriever.prompts import (
 	DEFAULT_THOUGHT_LANGUAGE,
-	build_step_prompt,
-	build_system_prompt,
+	PromptComposer,
+	PromptDocument,
+	PromptError,
+	PromptTarget,
+	StepContext,
 	normalize_thought_language,
 )
 
@@ -55,6 +66,22 @@ def _decision_action_payload(decision: AgentDecision) -> dict[str, Any]:
 
 def _action_string(decision: AgentDecision) -> str:
 	return json.dumps(_decision_action_payload(decision), ensure_ascii=False, separators=(',', ':'))
+
+
+def _observation_hash(rendered_observation: str) -> str:
+	"""Stable browser-state identity used only for exact-action loop protection."""
+
+	return hashlib.sha256(rendered_observation.encode('utf-8')).hexdigest()
+
+
+def _bounded_memory(value: str) -> str:
+	"""Keep the durable replacement ledger within the prompt contract."""
+
+	if len(value) <= 3_000:
+		return value
+	marker = '\n...[memory bounded to 3,000 characters]...\n'
+	head = 2_000
+	return value[:head] + marker + value[-(3_000 - head - len(marker)) :]
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -174,6 +201,7 @@ class ProtocolIIIAgent:
 		max_consecutive_model_output_errors: int = 3,
 		max_consecutive_model_timeouts: int = 2,
 		thought_language: str = DEFAULT_THOUGHT_LANGUAGE,
+		structured_prompt_log: bool = False,
 		chart_network_inspector: Any | None = None,
 		data_analysis_assistant: Any | None = None,
 		task_deadline_monotonic: float | None = None,
@@ -198,7 +226,16 @@ class ProtocolIIIAgent:
 		self.max_consecutive_model_output_errors = max_consecutive_model_output_errors
 		self.max_consecutive_model_timeouts = max_consecutive_model_timeouts
 		self.thought_language = normalize_thought_language(thought_language)
-		self.system_prompt = build_system_prompt(self.thought_language)
+		self.structured_prompt_log = structured_prompt_log
+		model_id = getattr(llm, 'model', None)
+		self.prompt_composer = PromptComposer(
+			self.task,
+			PromptTarget(model_id=str(model_id) if model_id else 'gpt-5.4'),
+			max_steps=self.max_steps,
+			thought_language=self.thought_language,
+		)
+		self.system_document = self.prompt_composer.system
+		self.system_prompt = self.system_document.text
 		self._model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self._model_prompt_log: dict[str, Any] = {}
 		self.task_deadline_monotonic = task_deadline_monotonic
@@ -317,39 +354,96 @@ class ProtocolIIIAgent:
 		return None
 
 	def _reset_model_prompt_log(self) -> None:
-		"""Start a fresh, durable log of the text and image sent to the model."""
+		"""Start a fresh, durable prompt log in the configured display format."""
+
+		if not self.structured_prompt_log:
+			self._model_prompt_log = {
+				'format': MODEL_PROMPT_LOG_FORMAT,
+				'system_prompt': prompt_text_lines(self.system_prompt),
+				'steps': [],
+			}
+			atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+			return
 
 		self._model_prompt_log = {
-			'format': 'webretriever-model-prompts/v1',
+			'format': STRUCTURED_MODEL_PROMPT_LOG_FORMAT,
+			'metadata': model_prompt_log_metadata(),
+			'task': self.task.prompt_payload(),
 			# The system message is identical for every step, so storing it once
 			# avoids duplicating a large prompt while retaining the complete input.
-			'system_prompt': self.system_prompt,
+			'system_prompt': {
+				'role': 'system',
+				'rendered_text': self.system_document.text,
+				'sections': [dict(section) for section in self.system_document.sections],
+				'metrics': dict(self.system_document.metrics),
+			},
 			'steps': [],
 		}
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
 
-	def _record_model_prompt(self, *, step: int, prompt: str, screenshot_path: Path) -> None:
+	def _record_model_prompt(
+		self,
+		*,
+		step: int,
+		prompt_document: PromptDocument,
+		screenshot_path: Path,
+	) -> None:
 		"""Atomically persist one model request before it is submitted.
 
 		The screenshot is already retained in ``trajectory``.  Referencing that
 		file keeps the JSON readable while preserving the exact image bytes that
-		were encoded into the multimodal request.
+		were encoded into the multimodal request.  The default line-oriented log
+		is intentionally simple; the detailed trace is opt-in for debug UIs.
 		"""
 
 		steps = self._model_prompt_log['steps']
 		if not isinstance(steps, list):  # Defensive guard for future format edits.
 			raise TypeError('model prompt log steps must be a list')
-		steps.append(
-			{
-				'step': step + 1,
-				'prompt': prompt,
-				'image': {
-					'media_type': 'image/png',
-					'detail': 'high',
-					'path': str(screenshot_path.relative_to(self.task_dir)),
-				},
-			}
-		)
+		image = {
+			'media_type': 'image/png',
+			'detail': 'high',
+			'path': str(screenshot_path.relative_to(self.task_dir)),
+		}
+		if not self.structured_prompt_log:
+			steps.append({'step': step + 1, 'prompt': prompt_text_lines(prompt_document.text), 'image': image})
+		else:
+			steps.append(
+				{
+					'step': step + 1,
+					'prompt': {
+						'role': prompt_document.role,
+						'rendered_text': prompt_document.text,
+						'sections': [dict(section) for section in prompt_document.sections],
+						'metrics': dict(prompt_document.metrics),
+					},
+					'image': image,
+				}
+			)
+		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	def _record_model_result(
+		self,
+		*,
+		step: int,
+		started_at: float,
+		usage: Mapping[str, int] | None = None,
+		error: str | None = None,
+	) -> None:
+		"""Add call results after the already-durable structured model input."""
+
+		if not self.structured_prompt_log:
+			return
+		steps = self._model_prompt_log.get('steps')
+		if not isinstance(steps, list) or step >= len(steps):
+			raise ValueError('model prompt result has no matching persisted input')
+		entry = steps[step]
+		if not isinstance(entry, dict):
+			raise TypeError('structured model prompt step must be an object')
+		entry['model_call'] = {
+			'duration_seconds': round(max(0.0, time.monotonic() - started_at), 3),
+			'usage': dict(usage or {}),
+			'error': error,
+		}
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
 
 	async def run(self) -> AgentRunOutcome:
@@ -362,6 +456,8 @@ class ProtocolIIIAgent:
 		consecutive_errors = 0
 		consecutive_model_output_errors = 0
 		consecutive_model_timeouts = 0
+		last_action_signature: tuple[str, str] | None = None
+		repeated_action_count = 0
 
 		for step in range(self.max_steps):
 			try:
@@ -379,16 +475,23 @@ class ProtocolIIIAgent:
 			if not raw_path.exists():
 				raw_path.write_bytes(screenshot)
 
-			prompt = build_step_prompt(
-				task=self.task.task,
-				website=self.task.website,
-				step=step,
-				max_steps=self.max_steps,
-				observation=observation.render_text(),
-				history=outcome.steps[-12:],
-				memory=memory,
-				last_outcome=last_outcome,
-			)
+			rendered_observation = observation.render_text()
+			observation_fingerprint = _observation_hash(rendered_observation)
+			try:
+				prompt_document = self.prompt_composer.compose_step(
+					StepContext(
+						step_index=step,
+						observation=observation,
+						history=tuple(outcome.steps),
+						memory=memory,
+						last_outcome=last_outcome,
+					)
+				)
+			except PromptError as exc:
+				outcome.status = 'FAIL_PROMPT'
+				outcome.error = f'Prompt composition failed: {type(exc).__name__}: {exc}'
+				break
+			prompt = prompt_document.text
 			messages = [
 				SystemMessage(content=self.system_prompt),
 				UserMessage(
@@ -409,16 +512,24 @@ class ProtocolIIIAgent:
 				outcome.status = 'FAIL_TASK_TIMEOUT'
 				outcome.error = 'Task deadline elapsed before the next model decision'
 				break
-			self._record_model_prompt(step=step, prompt=prompt, screenshot_path=raw_path)
+			self._record_model_prompt(
+				step=step,
+				prompt_document=prompt_document,
+				screenshot_path=raw_path,
+			)
+			model_call_started_at = time.monotonic()
 			try:
 				response = await _await_with_hard_timeout(
 					self.llm.ainvoke(messages, output_format=AgentDecision),
 					model_call_timeout,
 				)
 				decision = response.completion
-				_merge_usage(outcome.usage, _usage_dict(response.usage))
+				model_usage = _usage_dict(response.usage)
+				_merge_usage(outcome.usage, model_usage)
+				self._record_model_result(step=step, started_at=model_call_started_at, usage=model_usage)
 			except TimeoutError:
 				model_error = f'Model request exceeded {model_call_timeout:g} seconds'
+				self._record_model_result(step=step, started_at=model_call_started_at, error=model_error)
 				_save_visual_screenshot(
 					screenshot,
 					self.task_dir / 'trajectory_visual' / f'{step}.png',
@@ -447,6 +558,7 @@ class ProtocolIIIAgent:
 				break
 			except Exception as exc:
 				model_error = f'Model request failed: {type(exc).__name__}: {exc}'
+				self._record_model_result(step=step, started_at=model_call_started_at, error=model_error)
 				_save_visual_screenshot(
 					screenshot,
 					self.task_dir / 'trajectory_visual' / f'{step}.png',
@@ -517,6 +629,35 @@ class ProtocolIIIAgent:
 				outcome.steps.append(step_record)
 				continue
 
+			action_signature = (observation_fingerprint, action_text)
+			if action_signature == last_action_signature:
+				repeated_action_count += 1
+			else:
+				last_action_signature = action_signature
+				repeated_action_count = 1
+			if repeated_action_count >= 3:
+				last_outcome = json.dumps(
+					{
+						'action': decision.action,
+						'status': 'repeated_unchanged_action',
+						'repeat_count': repeated_action_count,
+						'error': 'identical action was not executed because the browser observation did not change',
+					},
+					ensure_ascii=False,
+					separators=(',', ':'),
+				)
+				step_record['outcome'] = last_outcome
+				outcome.steps.append(step_record)
+				memory = _bounded_memory(decision.memory)
+				consecutive_errors += 1
+				if consecutive_errors >= self.max_consecutive_action_errors:
+					outcome.status = 'FAIL_ACTIONS'
+					outcome.error = (
+						f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
+					)
+					break
+				continue
+
 			# Persist the initiated action before awaiting the browser.  A task-wide
 			# watchdog may cancel a slow browser operation, but its action, thought,
 			# and step still belong in the final timeout artifact.
@@ -525,7 +666,7 @@ class ProtocolIIIAgent:
 			action_failed = False
 			try:
 				if decision.action == 'find_chart_data_requests':
-					budget = self._chart_action_budget(decision.action, cursor=decision.cursor is not None)
+					budget = self._chart_action_budget(decision.action, cursor=decision.chart_cursor is not None)
 					if budget <= 0:
 						last_outcome = json.dumps(
 							{
@@ -533,7 +674,7 @@ class ProtocolIIIAgent:
 								'status': 'timeout',
 								'error': (
 									'insufficient task time remains for cursor inspection and finish'
-									if decision.cursor is not None
+									if decision.chart_cursor is not None
 									else 'insufficient task time remains for find plus analysis and finish'
 								),
 							},
@@ -547,7 +688,7 @@ class ProtocolIIIAgent:
 								task=self.task.task,
 								page_url=observation.url,
 								page_title=getattr(observation, 'title', ''),
-								cursor=decision.cursor,
+								cursor=decision.chart_cursor,
 								task_dir=self.task_dir,
 								task_identity=self.task.prompt_payload(),
 							),
@@ -556,7 +697,7 @@ class ProtocolIIIAgent:
 						last_outcome = execution.output
 						_merge_usage(outcome.usage, execution.usage)
 						payload = self._register_chart_artifact(last_outcome)
-						if decision.cursor is not None:
+						if decision.chart_cursor is not None:
 							action_failed = not isinstance(payload, dict) or payload.get('status') in {'stale_state', 'timeout'}
 						else:
 							action_failed = not isinstance(payload, dict) or payload.get('status') != 'ready'
@@ -626,11 +767,7 @@ class ProtocolIIIAgent:
 				if len(last_outcome) <= 20_000
 				else f'{last_outcome[:14_000]}\n...[action result truncated]...\n{last_outcome[-6_000:]}'
 			)
-			memory = (
-				decision.memory
-				if len(decision.memory) <= 6000
-				else f'{decision.memory[:4000]}\n...[memory bounded]...\n{decision.memory[-1950:]}'
-			)
+			memory = _bounded_memory(decision.memory)
 			if action_failed:
 				consecutive_errors += 1
 			else:

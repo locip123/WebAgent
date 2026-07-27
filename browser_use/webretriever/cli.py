@@ -124,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
 		'--thought-language',
 		help='language used for each model-generated thought; defaults to WEBRETRIEVER_THOUGHT_LANGUAGE or Chinese',
 	)
+	parser.add_argument(
+		'--structured-prompt-log',
+		action='store_true',
+		help='write the optional detailed prompt-trace schema instead of the default line-oriented prompt log',
+	)
 	parser.add_argument('--max-steps', type=int, default=100, help='hard-capped by the rules at 100')
 	parser.add_argument('--model-timeout', type=float, default=180.0, help='seconds; hard-capped by the rules at 180')
 	parser.add_argument(
@@ -209,6 +214,7 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 		max_concurrency=args.max_concurrency,
 		reasoning_effort=args.reasoning_effort,
 		thought_language=args.thought_language or _first_env('WEBRETRIEVER_THOUGHT_LANGUAGE') or DEFAULT_THOUGHT_LANGUAGE,
+		structured_prompt_log=args.structured_prompt_log,
 		local_browser=args.local_browser,
 		headless=not args.headed,
 		rerun_failed=args.rerun_failed,

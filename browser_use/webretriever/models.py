@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, get_args
 from urllib.parse import urlsplit
@@ -51,6 +52,70 @@ CalculationOperation: TypeAlias = Literal[
 	'argmin_growth',
 ]
 Evidence: TypeAlias = list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ActionParameterContract:
+	"""Required and optional flat fields for one structured browser action."""
+
+	required: frozenset[str] = frozenset()
+	optional: frozenset[str] = frozenset()
+	description: str = ''
+
+
+ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
+	'click': ActionParameterContract(frozenset({'element_id'}), description='click a current semantic element'),
+	'double_click': ActionParameterContract(frozenset({'element_id'}), description='double-click a current element'),
+	'type': ActionParameterContract(frozenset({'element_id', 'text'}), description='replace an input value'),
+	'select': ActionParameterContract(frozenset({'element_id', 'text'}), description='choose a visible option label/value'),
+	'press': ActionParameterContract(frozenset({'key'}), frozenset({'element_id'}), 'press one key'),
+	'scroll': ActionParameterContract(
+		frozenset({'direction', 'pages'}), frozenset({'element_id'}), 'scroll the page or a current region'
+	),
+	'hover': ActionParameterContract(frozenset({'element_id'}), description='hover a semantic element'),
+	'click_xy': ActionParameterContract(frozenset({'x', 'y'}), description='click screenshot coordinates'),
+	'hover_xy': ActionParameterContract(frozenset({'x', 'y'}), description='hover screenshot coordinates'),
+	'drag': ActionParameterContract(frozenset({'x', 'y', 'end_x', 'end_y'}), description='drag between coordinates'),
+	'back': ActionParameterContract(description='navigate back'),
+	'navigate': ActionParameterContract(frozenset({'url'}), description='open an observed or first-party absolute URL'),
+	'wait': ActionParameterContract(frozenset({'seconds'}), description='wait at most 30 seconds'),
+	'switch_tab': ActionParameterContract(frozenset({'tab_index'}), description='activate a current tab'),
+	'close_tab': ActionParameterContract(frozenset({'tab_index'}), description='close a current tab'),
+	'read_element': ActionParameterContract(frozenset({'element_id'}), description='read a current element fully'),
+	'find_text': ActionParameterContract(frozenset({'text'}), description='find text on the current page/document'),
+	'inspect_network': ActionParameterContract(
+		optional=frozenset({'text', 'request_id', 'network_cursor'}),
+		description='search captured bodies or continue one captured response',
+	),
+	'find_chart_data_requests': ActionParameterContract(
+		optional=frozenset({'chart_cursor'}), description='normalize current chart traffic or continue its saved packet'
+	),
+	'call_data_analysis_assistant': ActionParameterContract(
+		frozenset({'analysis_query', 'data_dir'}), description='analyze a validated task-local chart artifact'
+	),
+	'calculate': ActionParameterContract(
+		frozenset({'operation', 'text'}), description='calculate over browser-observed JSON numbers'
+	),
+	'finish': ActionParameterContract(
+		frozenset({'success'}), frozenset({'answer', 'evidence'}), 'finish with grounded answer/evidence or explicit failure'
+	),
+}
+
+
+def render_action_parameter_contracts() -> str:
+	"""Render the validator's field map as concise model-facing instructions."""
+
+	lines: list[str] = []
+	for action in get_args(ActionName):
+		contract = ACTION_PARAMETER_CONTRACTS[action]
+		field_parts: list[str] = []
+		if contract.required:
+			field_parts.append('required: ' + ', '.join(sorted(contract.required)))
+		if contract.optional:
+			field_parts.append('optional: ' + ', '.join(sorted(contract.optional)))
+		fields = '; '.join(field_parts) if field_parts else 'no parameters'
+		lines.append(f'- {action} ({fields}): {contract.description}.')
+	return '\n'.join(lines)
 
 
 _TASK_ALIASES: dict[str, tuple[str, ...]] = {
@@ -196,7 +261,8 @@ class AgentDecision(BaseModel):
 	evidence: Evidence | None = None
 	success: bool | None = None
 	operation: CalculationOperation | None = None
-	cursor: str | None = None
+	network_cursor: str | None = None
+	chart_cursor: str | None = None
 	analysis_query: str | None = None
 	data_dir: str | None = None
 
@@ -220,22 +286,39 @@ class AgentDecision(BaseModel):
 			data['action'] = nested.pop('action', None)
 		else:
 			if 'action' in data:
-				return value
-			action_names = set(get_args(ActionName))
-			candidates = [name for name in data if name in action_names and isinstance(data[name], Mapping)]
-			if len(candidates) != 1:
-				return value
-			action_name = candidates[0]
-			nested = dict(data.pop(action_name))
-			data['action'] = action_name
+				nested = {}
+			else:
+				action_names = set(get_args(ActionName))
+				candidates = [name for name in data if name in action_names and isinstance(data[name], Mapping)]
+				if len(candidates) != 1:
+					return value
+				action_name = candidates[0]
+				nested = dict(data.pop(action_name))
+				data['action'] = action_name
 
 		for field_name, field_value in nested.items():
 			if field_name in data and data[field_name] != field_value:
 				raise ValueError(f'conflicting nested action field: {field_name}')
 			data[field_name] = field_value
+
+		# ``cursor`` was the historical shared wire field.  Normalize it before
+		# strict validation so it remains accepted without appearing in the
+		# recommended JSON schema or permitting cross-tool cursor reuse.
+		if 'cursor' in data:
+			action = data.get('action')
+			typed_field = {
+				'inspect_network': 'network_cursor',
+				'find_chart_data_requests': 'chart_cursor',
+			}.get(action if isinstance(action, str) else '')
+			if typed_field is None:
+				return data
+			legacy_cursor = data.pop('cursor')
+			if typed_field in data and data[typed_field] != legacy_cursor:
+				raise ValueError(f'conflicting cursor fields for {action}')
+			data[typed_field] = legacy_cursor
 		return data
 
-	@field_validator('text', 'url', 'key', 'answer', 'cursor', 'analysis_query', 'data_dir')
+	@field_validator('text', 'url', 'key', 'answer', 'network_cursor', 'chart_cursor', 'analysis_query', 'data_dir')
 	@classmethod
 	def _non_empty_optional_string(cls, value: str | None) -> str | None:
 		if value is not None and not value:
@@ -253,65 +336,18 @@ class AgentDecision(BaseModel):
 
 	@model_validator(mode='after')
 	def _validate_action_parameters(self) -> AgentDecision:
-		required_by_action: dict[ActionName, frozenset[str]] = {
-			'click': frozenset({'element_id'}),
-			'double_click': frozenset({'element_id'}),
-			'type': frozenset({'element_id', 'text'}),
-			'select': frozenset({'element_id', 'text'}),
-			'press': frozenset({'key'}),
-			'scroll': frozenset({'direction', 'pages'}),
-			'hover': frozenset({'element_id'}),
-			'click_xy': frozenset({'x', 'y'}),
-			'hover_xy': frozenset({'x', 'y'}),
-			'drag': frozenset({'x', 'y', 'end_x', 'end_y'}),
-			'back': frozenset(),
-			'navigate': frozenset({'url'}),
-			'wait': frozenset({'seconds'}),
-			'switch_tab': frozenset({'tab_index'}),
-			'close_tab': frozenset({'tab_index'}),
-			'read_element': frozenset({'element_id'}),
-			'find_text': frozenset({'text'}),
-			'inspect_network': frozenset(),
-			'find_chart_data_requests': frozenset(),
-			'call_data_analysis_assistant': frozenset({'analysis_query', 'data_dir'}),
-			'calculate': frozenset({'operation', 'text'}),
-			'finish': frozenset({'success'}),
-		}
-		optional_by_action: dict[ActionName, frozenset[str]] = {
-			'press': frozenset({'element_id'}),
-			'scroll': frozenset({'element_id'}),
-			'inspect_network': frozenset({'text', 'request_id', 'cursor'}),
-			'find_chart_data_requests': frozenset({'cursor'}),
-			'finish': frozenset({'answer', 'evidence'}),
-		}
-		parameter_names = {
-			'element_id',
-			'text',
-			'url',
-			'key',
-			'x',
-			'y',
-			'end_x',
-			'end_y',
-			'direction',
-			'pages',
-			'seconds',
-			'tab_index',
-			'request_id',
-			'answer',
-			'evidence',
-			'success',
-			'operation',
-			'cursor',
-			'analysis_query',
-			'data_dir',
-		}
-		required = required_by_action[self.action]
+		parameter_names = frozenset(
+			field_name
+			for contract in ACTION_PARAMETER_CONTRACTS.values()
+			for field_name in contract.required | contract.optional
+		)
+		contract = ACTION_PARAMETER_CONTRACTS[self.action]
+		required = contract.required
 		missing = sorted(name for name in required if getattr(self, name) is None)
 		if missing:
 			raise ValueError(f'{self.action} requires: {", ".join(missing)}')
 
-		allowed = required | optional_by_action.get(self.action, frozenset())
+		allowed = required | contract.optional
 		unexpected = sorted(name for name in parameter_names - allowed if getattr(self, name) is not None)
 		if unexpected:
 			raise ValueError(f'{self.action} does not accept: {", ".join(unexpected)}')
@@ -321,8 +357,8 @@ class AgentDecision(BaseModel):
 		if self.action == 'inspect_network':
 			if self.text is not None and self.request_id is not None:
 				raise ValueError('inspect_network text and request_id are mutually exclusive')
-			if self.cursor is not None and self.request_id is None:
-				raise ValueError('inspect_network cursor requires request_id')
+			if self.network_cursor is not None and self.request_id is None:
+				raise ValueError('inspect_network network_cursor requires request_id')
 		if self.action == 'finish' and self.success:
 			if self.answer is None:
 				raise ValueError('a successful finish requires answer')
