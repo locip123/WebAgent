@@ -6,7 +6,8 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Awaitable, Mapping
+from collections import deque
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -72,6 +73,154 @@ def _observation_hash(rendered_observation: str) -> str:
 	"""Stable browser-state identity used only for exact-action loop protection."""
 
 	return hashlib.sha256(rendered_observation.encode('utf-8')).hexdigest()
+
+
+# Actions whose whole purpose is to change the viewport or the browsing position.
+# Repeating them with different parameters is normal exploration; alternating
+# between two of them over the same states is a stall.
+_NAVIGATION_ACTIONS = frozenset({'scroll', 'back', 'navigate', 'click_xy', 'switch_tab', 'drag'})
+# Read-only probes: many of these in a row without any state change means the
+# current modality is exhausted, no matter how the query string varies.
+_PROBE_ACTIONS = frozenset({'inspect_network', 'find_text', 'read_element', 'find_chart_data_requests'})
+
+
+def _action_intent(decision: AgentDecision) -> str:
+	"""Coarse action identity that ignores incidental parameter churn.
+
+	Case 62 re-submitted the same form through five different ``element_id``
+	values, case 77 issued 48 ``inspect_network`` calls with 48 different query
+	strings, and case 95 dragged the same date-picker column ten times with
+	endpoints jittering by a handful of pixels.  Each is one intent repeated, so
+	loop detection keys on the action plus only the parameters that change *what*
+	is being attempted -- never the coordinates or element handle used to reach it.
+	"""
+
+	if decision.action == 'scroll':
+		return f'scroll:{decision.direction}'
+	if decision.action in _PROBE_ACTIONS:
+		return decision.action
+	payload = _decision_action_payload(decision)
+	for incidental in ('element_id', 'x', 'y', 'end_x', 'end_y'):
+		payload.pop(incidental, None)
+	return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+
+
+def _detect_loop(
+	recent: Sequence[tuple[str, str]],
+	*,
+	oscillation_cycles: int = 3,
+	probe_family_limit: int = 6,
+	churn_span: int = 12,
+	churn_max_intents: int = 3,
+	churn_max_states: int = 2,
+) -> dict[str, Any] | None:
+	"""Classify a stalled trajectory from recent ``(intent, observation)`` pairs.
+
+	Returns ``None`` while progress looks plausible.  The exact-repeat guard this
+	supplements only fired on byte-identical observations, so every failure case
+	that alternated actions or varied one parameter escaped it entirely.
+	"""
+
+	recent = list(recent)
+	if not recent:
+		return None
+	intents = [intent for intent, _ in recent]
+	current = intents[-1]
+
+	# A<->B oscillation: two intents alternating over a small set of states.
+	window = 2 * oscillation_cycles
+	if len(intents) >= window:
+		tail = intents[-window:]
+		first, second = tail[0], tail[1]
+		if first != second and all(tail[index] == (first if index % 2 == 0 else second) for index in range(window)):
+			if first in _NAVIGATION_ACTIONS or second in _NAVIGATION_ACTIONS or first.startswith('scroll:'):
+				states = {state for _, state in recent[-window:]}
+				if len(states) <= oscillation_cycles:
+					return {
+						'pattern': 'oscillation',
+						'cycles': oscillation_cycles,
+						'alternating_intents': [first, second],
+						'distinct_states': len(states),
+					}
+
+	# Unproductive probe family: the same read-only action repeated with only
+	# parameter changes, while the observed page state never advances.
+	if current in _PROBE_ACTIONS:
+		streak = 0
+		for intent, _ in reversed(recent):
+			if intent != current:
+				break
+			streak += 1
+		if streak >= probe_family_limit:
+			return {
+				'pattern': 'unproductive_probe_family',
+				'attempts': streak,
+				'distinct_states': len({state for _, state in recent[-streak:]}),
+			}
+
+	# Intent churn: a long stretch cycling among a handful of intents while the
+	# observed state barely moves.  Case 95 spent 34 steps rotating click/drag/type
+	# over one date picker and case 62 rotated find_text/click/scroll over one form;
+	# neither alternates strictly enough for the pairwise check above to see it.
+	if len(recent) >= churn_span:
+		tail = recent[-churn_span:]
+		tail_intents = {intent for intent, _ in tail}
+		tail_states = {state for _, state in tail}
+		if len(tail_intents) <= churn_max_intents and len(tail_states) <= churn_max_states:
+			return {
+				'pattern': 'intent_churn',
+				'span': churn_span,
+				'distinct_intents': len(tail_intents),
+				'distinct_states': len(tail_states),
+			}
+	return None
+
+
+def _salvage_answer(memory: str, steps: Sequence[Mapping[str, Any]]) -> tuple[str, list[str]] | None:
+	"""Recover verified partial findings when the task deadline arrives.
+
+	Seven timeout artifacts returned ``agent_answer: ''`` while their memory
+	ledgers still held concrete verified values.  A partial, clearly-labelled
+	answer beats a blank one, so the durable ``Verified:`` section is promoted
+	into the outcome instead of being discarded.
+	"""
+
+	verified: list[str] = []
+	capturing = False
+	for raw_line in memory.splitlines():
+		line = raw_line.strip()
+		if not line:
+			continue
+		lowered = line.lower()
+		if lowered.startswith('verified'):
+			capturing = True
+			remainder = line.split(':', 1)[1].strip() if ':' in line else ''
+			if remainder:
+				verified.append(remainder)
+			continue
+		if capturing and any(
+			lowered.startswith(heading) for heading in ('constraints', 'candidates', 'tried-blocked', 'tried', 'next')
+		):
+			capturing = False
+			continue
+		if capturing:
+			verified.append(line.lstrip('-* ').strip())
+	if not verified:
+		return None
+	answer = ' '.join(verified).strip()
+	if not answer:
+		return None
+	last_url = ''
+	for record in reversed(steps):
+		candidate = str(record.get('url', '') or '')
+		if candidate:
+			last_url = candidate
+			break
+	evidence = [
+		f'Partial result salvaged at the task deadline from browser-verified findings: {answer}'
+		+ (f' (last observed page: {last_url})' if last_url else '')
+	]
+	return answer, evidence
 
 
 def _bounded_memory(value: str) -> str:
@@ -256,6 +405,9 @@ class ProtocolIIIAgent:
 		# flight.  Retain the mutable outcome so it can persist all completed work
 		# if that outer deadline cancels ``run`` before it returns.
 		self._partial_outcome: AgentRunOutcome | None = None
+		# Latest durable ledger, kept outside the loop so a cancelled run can
+		# still be salvaged by the runner's task watchdog.
+		self._last_memory: str = ''
 
 	@property
 	def partial_outcome(self) -> AgentRunOutcome | None:
@@ -276,6 +428,34 @@ class ProtocolIIIAgent:
 				trusted_manifest_hashes=self._trusted_chart_manifests,
 			)
 		return self.data_analysis_assistant
+
+	def _remember(self, value: str) -> str:
+		"""Bound the durable ledger and retain it for deadline salvage."""
+
+		self._last_memory = _bounded_memory(value)
+		return self._last_memory
+
+	def salvage_partial_answer(self) -> bool:
+		"""Promote verified memory findings into the partial outcome.
+
+		Called by the agent loop on a deadline exit and by the runner when the
+		task watchdog cancels the loop mid-action.  Never overwrites an answer
+		the model already produced.
+		"""
+
+		outcome = self._partial_outcome
+		if outcome is None:
+			return False
+		return self._salvage_into(outcome, self._last_memory)
+
+	def _salvage_into(self, outcome: AgentRunOutcome, memory: str) -> bool:
+		if outcome.agent_answer:
+			return False
+		salvaged = _salvage_answer(memory, outcome.steps)
+		if salvaged is None:
+			return False
+		outcome.agent_answer, outcome.evidence = salvaged
+		return True
 
 	def _remaining_task_seconds(self) -> float:
 		if self.task_deadline_monotonic is None:
@@ -458,6 +638,10 @@ class ProtocolIIIAgent:
 		consecutive_model_timeouts = 0
 		last_action_signature: tuple[str, str] | None = None
 		repeated_action_count = 0
+		# Rolling (intent, observation) window that survives parameter churn and
+		# action alternation, which the exact-repeat guard below cannot see.
+		recent_signatures: deque[tuple[str, str]] = deque(maxlen=16)
+		blocked_loop_intents: set[str] = set()
 
 		for step in range(self.max_steps):
 			try:
@@ -477,6 +661,8 @@ class ProtocolIIIAgent:
 
 			rendered_observation = observation.render_text()
 			observation_fingerprint = _observation_hash(rendered_observation)
+			remaining = self._remaining_task_seconds()
+			remaining_task_seconds = None if remaining == float('inf') else remaining
 			try:
 				prompt_document = self.prompt_composer.compose_step(
 					StepContext(
@@ -485,6 +671,7 @@ class ProtocolIIIAgent:
 						history=tuple(outcome.steps),
 						memory=memory,
 						last_outcome=last_outcome,
+						remaining_task_seconds=remaining_task_seconds,
 					)
 				)
 			except PromptError as exc:
@@ -511,6 +698,7 @@ class ProtocolIIIAgent:
 			if model_call_timeout <= 0:
 				outcome.status = 'FAIL_TASK_TIMEOUT'
 				outcome.error = 'Task deadline elapsed before the next model decision'
+				self._salvage_into(outcome, memory)
 				break
 			self._record_model_prompt(
 				step=step,
@@ -648,14 +836,42 @@ class ProtocolIIIAgent:
 				)
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
-				memory = _bounded_memory(decision.memory)
+				memory = self._remember(decision.memory)
 				consecutive_errors += 1
 				if consecutive_errors >= self.max_consecutive_action_errors:
 					outcome.status = 'FAIL_ACTIONS'
-					outcome.error = (
-						f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
-					)
+					outcome.error = f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
 					break
+				continue
+
+			action_intent = _action_intent(decision)
+			recent_signatures.append((action_intent, observation_fingerprint))
+			loop_report = _detect_loop(recent_signatures)
+			if loop_report is not None:
+				blocked_loop_intents.add(action_intent)
+				last_outcome = json.dumps(
+					{
+						'action': decision.action,
+						'status': 'loop_detected',
+						**loop_report,
+						'error': ('this action was not executed because the recent trajectory is repeating without progress'),
+						'required_change': (
+							'abandon this approach; switch modality or target. If page text and network capture both '
+							'failed on the same value, read it visually from the screenshot at full resolution, open the '
+							'first-party export/download, or navigate to a different source page. If the remaining task '
+							'time is short, finish with the findings already verified in memory.'
+						),
+						'blocked_intents': sorted(blocked_loop_intents),
+					},
+					ensure_ascii=False,
+					separators=(',', ':'),
+				)
+				step_record['outcome'] = last_outcome
+				outcome.steps.append(step_record)
+				memory = self._remember(decision.memory)
+				# A detected loop is a planning stall, not a browser failure, so it
+				# must not consume the consecutive-action-error budget.
+				recent_signatures.clear()
 				continue
 
 			# Persist the initiated action before awaiting the browser.  A task-wide
@@ -700,7 +916,15 @@ class ProtocolIIIAgent:
 						if decision.chart_cursor is not None:
 							action_failed = not isinstance(payload, dict) or payload.get('status') in {'stale_state', 'timeout'}
 						else:
-							action_failed = not isinstance(payload, dict) or payload.get('status') != 'ready'
+							# A completed scan can validly leave the agent without normalized
+							# data.  Those outcomes trigger the visual/first-party-export
+							# fallback in the next prompt; treating them as browser failures
+							# would spend the action-error budget before that recovery runs.
+							action_failed = not isinstance(payload, dict) or payload.get('status') not in {
+								'ready',
+								'saved_raw_only',
+								'no_match',
+							}
 				elif decision.action == 'call_data_analysis_assistant':
 					budget = self._chart_action_budget(decision.action)
 					filter_mismatch = self._chart_filter_mismatch(decision.data_dir, decision.analysis_query)
@@ -767,7 +991,7 @@ class ProtocolIIIAgent:
 				if len(last_outcome) <= 20_000
 				else f'{last_outcome[:14_000]}\n...[action result truncated]...\n{last_outcome[-6_000:]}'
 			)
-			memory = _bounded_memory(decision.memory)
+			memory = self._remember(decision.memory)
 			if action_failed:
 				consecutive_errors += 1
 			else:
@@ -780,6 +1004,7 @@ class ProtocolIIIAgent:
 		else:
 			outcome.status = 'FAIL_MAX_STEPS'
 			outcome.error = f'Reached the competition limit of {self.max_steps} steps without a grounded final answer'
+			self._salvage_into(outcome, memory)
 
 		outcome.duration_seconds = round(time.monotonic() - started_at, 3)
 		return outcome

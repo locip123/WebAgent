@@ -158,6 +158,7 @@ def test_load_tasks_rejects_duplicate_indices_and_ids(tmp_path: Path, field: str
 		{'action': 'inspect_network'},
 		{'action': 'inspect_network', 'text': '/api/data'},
 		{'action': 'inspect_network', 'request_id': 42},
+		{'action': 'inspect_network', 'text': 'revenue', 'request_id': 42},
 		{'action': 'inspect_network', 'request_id': 42, 'network_cursor': 'opaque-page-2'},
 		{'action': 'find_chart_data_requests'},
 		{'action': 'find_chart_data_requests', 'chart_cursor': 'scan-id:1'},
@@ -173,6 +174,16 @@ def test_load_tasks_rejects_duplicate_indices_and_ids(tmp_path: Path, field: str
 def test_agent_decision_supports_every_flat_action(payload: dict[str, object]) -> None:
 	decision = AgentDecision.model_validate({'thought': 'next', 'memory': 'fact', **payload})
 	assert decision.action_payload()['action'] == payload['action']
+
+
+def test_agent_decision_preserves_scoped_network_search_fields() -> None:
+	decision = AgentDecision.model_validate({'action': 'inspect_network', 'text': 'revenue', 'request_id': 42})
+	payload = decision.action_payload()
+
+	assert decision.text == 'revenue'
+	assert decision.request_id == 42
+	assert payload['text'] == 'revenue'
+	assert payload['request_id'] == 42
 
 
 def test_agent_decision_flattens_nested_gateway_action() -> None:
@@ -265,7 +276,8 @@ def test_agent_decision_rejects_conflicting_nested_gateway_action() -> None:
 		},
 		{'action': 'call_data_analysis_assistant', 'analysis_query': '   ', 'data_dir': '/tmp/data'},
 		{'action': 'find_chart_data_requests', 'analysis_query': 'Analyze this.'},
-		{'action': 'inspect_network', 'text': 'revenue', 'request_id': 42},
+		{'action': 'inspect_network', 'text': 'revenue', 'request_id': 42, 'network_cursor': 'opaque-page-2'},
+		{'action': 'inspect_network', 'text': 'revenue', 'request_id': 42, 'cursor': 'opaque-page-2'},
 		{'action': 'inspect_network', 'cursor': 'opaque-page-2'},
 	],
 )

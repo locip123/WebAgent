@@ -585,3 +585,52 @@ def test_model_policy_accepts_published_maximum_versions(model: str):
 def test_model_policy_rejects_versions_above_published_caps(model: str):
 	with pytest.raises(ValueError, match='above the challenge maximum'):
 		validate_model_policy(model)
+
+
+def test_task_timeout_outcome_salvages_verified_memory_into_the_answer(tmp_path: Path):
+	agent = ProtocolIIIAgent(
+		task=CompetitionTask.model_validate(
+			{
+				'task_idx': 0,
+				'task_id': '0123456789abcdef0123456789abcdef',
+				'website': 'https://example.com',
+				'task': 'Read the result.',
+			}
+		),
+		llm=cast(Any, object()),
+		runtime=object(),
+		task_dir=tmp_path,
+	)
+	agent._partial_outcome = AgentRunOutcome(status='FAIL', steps=[{'step': 0, 'url': 'https://example.com/report'}])
+	agent._last_memory = 'Constraints: exact month.\nVerified: 2022/08 price change is -13.7 percent.\nNext: confirm 2024 values.'
+
+	outcome = _task_timeout_outcome(agent, 900)
+
+	assert outcome.status == 'FAIL_TASK_TIMEOUT'
+	assert '-13.7' in outcome.agent_answer
+	assert outcome.evidence and 'https://example.com/report' in outcome.evidence[0]
+	assert 'exact month' not in outcome.agent_answer
+	assert 'confirm 2024' not in outcome.agent_answer
+
+
+def test_task_timeout_outcome_keeps_an_existing_answer_untouched(tmp_path: Path):
+	agent = ProtocolIIIAgent(
+		task=CompetitionTask.model_validate(
+			{
+				'task_idx': 0,
+				'task_id': '0123456789abcdef0123456789abcdef',
+				'website': 'https://example.com',
+				'task': 'Read the result.',
+			}
+		),
+		llm=cast(Any, object()),
+		runtime=object(),
+		task_dir=tmp_path,
+	)
+	agent._partial_outcome = AgentRunOutcome(status='FAIL', agent_answer='42', evidence=['The page states 42.'])
+	agent._last_memory = 'Verified: something else entirely.'
+
+	outcome = _task_timeout_outcome(agent, 900)
+
+	assert outcome.agent_answer == '42'
+	assert outcome.evidence == ['The page states 42.']

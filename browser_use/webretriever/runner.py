@@ -317,6 +317,10 @@ def _task_timeout_outcome(agent: ProtocolIIIAgent | None, timeout_seconds: float
 		outcome = AgentRunOutcome(status='FAIL_TASK_TIMEOUT')
 	outcome.status = 'FAIL_TASK_TIMEOUT'
 	outcome.error = f'Task exceeded the {timeout_seconds:g}-second time limit'
+	# The watchdog can cancel the loop mid-action, so salvage here too: a partial
+	# answer built from browser-verified memory beats an empty one.
+	if agent is not None:
+		agent.salvage_partial_answer()
 	return outcome
 
 

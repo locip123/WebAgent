@@ -17,7 +17,9 @@ from browser_use.webretriever.prompts import (
 )
 
 
-def _task(*, task_idx: int = 1, website: str = 'https://example.com/start', task: str = 'Find the requested fact.') -> CompetitionTask:
+def _task(
+	*, task_idx: int = 1, website: str = 'https://example.com/start', task: str = 'Find the requested fact.'
+) -> CompetitionTask:
 	return CompetitionTask(
 		task_idx=task_idx,
 		task_id='c022cb291f864aa1a22138ec449bedf9' if task_idx == 36 else f'task-{task_idx}',
@@ -50,8 +52,20 @@ def _compose(task: CompetitionTask, observation: BrowserObservation, *, last_out
 			step_index=2,
 			observation=observation,
 			history=(
-				{'step': 0, 'url': task.website, 'thought': 'must disappear', 'action': {'action': 'click'}, 'outcome': 'Opened results.'},
-				{'step': 1, 'url': observation.url, 'thought': 'must disappear too', 'action': {'action': 'wait'}, 'outcome': last_outcome},
+				{
+					'step': 0,
+					'url': task.website,
+					'thought': 'must disappear',
+					'action': {'action': 'click'},
+					'outcome': 'Opened results.',
+				},
+				{
+					'step': 1,
+					'url': observation.url,
+					'thought': 'must disappear too',
+					'action': {'action': 'wait'},
+					'outcome': last_outcome,
+				},
 			),
 			memory='Constraints: exact year.\\nVerified: result page is open.\\nNext: verify the value.',
 			last_outcome=last_outcome,
@@ -72,6 +86,8 @@ def test_system_is_deterministic_compact_and_has_no_conditional_bls_content() ->
 	assert 'https://api.bls.gov/publicAPI' not in build_system_prompt()
 	assert '2895' not in first.system.text
 	assert 'evidence;request_id' not in first.system.text
+	assert 'Never estimate unlabelled numeric chart values from geometry.' in first.system.text
+	assert 'You may directly read visibly labelled values, table text, tooltips' in first.system.text
 
 
 def test_legacy_system_description_accepts_headings_with_commas() -> None:
@@ -100,6 +116,43 @@ def test_playbooks_are_selected_without_leaking_unrelated_guidance(
 	assert expected in document.metrics['selected_playbooks']
 	assert all(playbook not in document.metrics['selected_playbooks'] for playbook in absent)
 	assert '===== TRUSTED OPERATIONAL GUIDANCE =====' in document.text
+
+
+@pytest.mark.parametrize(
+	('status', 'required_guidance'),
+	[
+		(
+			'no_match',
+			(
+				'no target chart packet was found',
+				'Directly read the current chart',
+				'observed first-party table, export, or download',
+			),
+		),
+		(
+			'saved_raw_only',
+			(
+				'no normalized data is available',
+				'Do not decode raw packets',
+				'Do not decode raw packets or call call_data_analysis_assistant',
+				'Directly read the current chart',
+			),
+		),
+	],
+)
+def test_unavailable_chart_data_guidance_uses_visual_or_first_party_export_fallback(
+	status: str, required_guidance: tuple[str, ...]
+) -> None:
+	_, document = _compose(
+		_task(task='Read the requested value from the current chart.'),
+		_observation(downloads=[]),
+		last_outcome=json.dumps({'action': 'find_chart_data_requests', 'status': status}),
+	)
+
+	assert 'chart' in document.metrics['selected_playbooks']
+	for expected in required_guidance:
+		assert expected in document.text
+	assert 'Do not repeat the unchanged scan' in document.text
 
 
 def test_bls_access_guidance_is_conditional_and_never_contains_reference_answer() -> None:
@@ -214,7 +267,7 @@ def test_step_prompt_is_token_bounded_structured_and_deduplicates_latest_outcome
 
 	execution = next(section for section in document.sections if section['id'] == 'execution_state')
 	history = execution['fields']['recent_trajectory']
-	assert isinstance(history, list) and len(history) == 4
+	assert isinstance(history, list) and len(history) == 10
 	assert all('thought' not in item for item in history)
 	json.loads(json.dumps(history, ensure_ascii=False))
 
@@ -228,9 +281,7 @@ def test_mandatory_prompt_content_over_budget_raises_instead_of_silent_truncatio
 	)
 
 	with pytest.raises(PromptBudgetExceeded):
-		composer.compose_step(
-			StepContext(step_index=0, observation=_observation(), history=(), memory='', last_outcome='start')
-		)
+		composer.compose_step(StepContext(step_index=0, observation=_observation(), history=(), memory='', last_outcome='start'))
 
 
 def test_small_viable_budget_keeps_history_as_json_while_reducing_optional_context() -> None:
@@ -245,7 +296,12 @@ def test_small_viable_budget_keeps_history_as_json_while_reducing_optional_conte
 			step_index=4,
 			observation=_observation(page_text='page evidence ' * 20_000),
 			history=tuple(
-				{'step': index, 'url': 'https://example.com/' + 'u' * 1_000, 'action': {'action': 'click'}, 'outcome': 'o' * 2_000}
+				{
+					'step': index,
+					'url': 'https://example.com/' + 'u' * 1_000,
+					'action': {'action': 'click'},
+					'outcome': 'o' * 2_000,
+				}
 				for index in range(5)
 			),
 			memory='m' * 20_000,
@@ -278,3 +334,42 @@ def test_browser_text_that_looks_like_a_tokenizer_special_token_is_treated_as_un
 
 	assert document.metrics['estimated_tokens'] <= 1_000
 	assert '<|endoftext|>' in document.text
+
+
+def test_step_prompt_carries_remaining_time_and_a_loop_visible_history_window() -> None:
+	composer = PromptComposer(_task(), PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	document = composer.compose_step(
+		StepContext(
+			step_index=29,
+			observation=_observation(),
+			history=tuple(
+				{
+					'step': index,
+					'url': 'https://example.com/report',
+					'thought': 'private chain of thought',
+					'action': {'action': 'scroll', 'direction': 'up' if index % 2 else 'down', 'pages': 1},
+					'outcome': 'Scrolled.',
+				}
+				for index in range(30)
+			),
+			memory='Verified: report page is open.',
+			last_outcome='Scrolled.',
+			remaining_task_seconds=132.4,
+		)
+	)
+
+	execution = next(section for section in document.sections if section['id'] == 'execution_state')
+	history = execution['fields']['recent_trajectory']
+	assert len(history) >= 12, 'the window must be wide enough for the model to see its own loop'
+	assert 'Remaining task time' in document.text
+	assert '132' in document.text
+	assert execution['fields']['remaining_task_seconds'] == pytest.approx(132.4)
+	assert 'private chain of thought' not in document.text
+
+
+def test_step_prompt_omits_remaining_time_when_no_deadline_is_configured() -> None:
+	_, document = _compose(_task(), _observation())
+
+	execution = next(section for section in document.sections if section['id'] == 'execution_state')
+	assert execution['fields']['remaining_task_seconds'] is None
+	assert 'Remaining task time' not in document.text

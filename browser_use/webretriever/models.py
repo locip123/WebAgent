@@ -85,7 +85,7 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 	'find_text': ActionParameterContract(frozenset({'text'}), description='find text on the current page/document'),
 	'inspect_network': ActionParameterContract(
 		optional=frozenset({'text', 'request_id', 'network_cursor'}),
-		description='search captured bodies or continue one captured response',
+		description='search captured bodies, optionally scoped to request_id, or continue one captured response',
 	),
 	'find_chart_data_requests': ActionParameterContract(
 		optional=frozenset({'chart_cursor'}), description='normalize current chart traffic or continue its saved packet'
@@ -355,10 +355,10 @@ class AgentDecision(BaseModel):
 		if self.action == 'navigate' and self.url is not None:
 			_validate_web_url(self.url, field_name='url')
 		if self.action == 'inspect_network':
-			if self.text is not None and self.request_id is not None:
-				raise ValueError('inspect_network text and request_id are mutually exclusive')
 			if self.network_cursor is not None and self.request_id is None:
 				raise ValueError('inspect_network network_cursor requires request_id')
+			if self.text is not None and self.network_cursor is not None:
+				raise ValueError('inspect_network network_cursor cannot be combined with text')
 		if self.action == 'finish' and self.success:
 			if self.answer is None:
 				raise ValueError('a successful finish requires answer')

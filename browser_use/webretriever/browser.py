@@ -82,7 +82,7 @@ _DOCUMENT_EXTENSIONS = frozenset(_DOCUMENT_MIME_EXTENSIONS.values())
 
 
 class _ScreenshotFallbackError(RuntimeError):
-	"""Raised when Playwright screenshot timeout recovery through CDP also fails."""
+	"""Raised when recoverable Playwright screenshot failure recovery through CDP also fails."""
 
 
 class _ArchiveResourceLimitError(RuntimeError):
@@ -588,18 +588,49 @@ class BrowserRuntime:
 				timeout=self.screenshot_timeout_ms,
 			)
 		except PlaywrightTimeoutError as screenshot_timeout:
-			self.logger.warning('Playwright screenshot timed out for %s; falling back to CDP capture', path.name)
-			try:
-				screenshot = await self._capture_cdp_screenshot_before_deadline(page, path)
-			except Exception as fallback_error:
-				path.unlink(missing_ok=True)
-				raise _ScreenshotFallbackError(
-					f'Playwright screenshot timed out after {self.screenshot_timeout_ms}ms '
-					f'({screenshot_timeout}) and CDP fallback failed: '
-					f'{type(fallback_error).__name__}: {fallback_error}'
-				) from fallback_error
-			self.logger.info('Recovered screenshot %s through CDP capture', path.name)
-			return screenshot
+			return await self._recover_screenshot_through_cdp(
+				page,
+				path,
+				failure=screenshot_timeout,
+				failure_description=f'timed out after {self.screenshot_timeout_ms}ms',
+			)
+		except PlaywrightError as screenshot_error:
+			if not self._is_capture_screenshot_protocol_error(screenshot_error):
+				raise
+			return await self._recover_screenshot_through_cdp(
+				page,
+				path,
+				failure=screenshot_error,
+				failure_description='failed with Page.captureScreenshot protocol error',
+			)
+
+	@staticmethod
+	def _is_capture_screenshot_protocol_error(error: PlaywrightError) -> bool:
+		"""Match only the transient capture failure seen from Playwright's screenshot wrapper."""
+
+		return 'Protocol error (Page.captureScreenshot): Unable to capture screenshot' in str(error)
+
+	async def _recover_screenshot_through_cdp(
+		self,
+		page: Page,
+		path: Path,
+		*,
+		failure: Exception,
+		failure_description: str,
+	) -> bytes:
+		self.logger.warning(
+			'Playwright screenshot %s for %s; falling back to CDP capture', failure_description, path.name
+		)
+		try:
+			screenshot = await self._capture_cdp_screenshot_before_deadline(page, path)
+		except Exception as fallback_error:
+			path.unlink(missing_ok=True)
+			raise _ScreenshotFallbackError(
+				f'Playwright screenshot {failure_description} ({failure}) and CDP fallback failed: '
+				f'{type(fallback_error).__name__}: {fallback_error}'
+			) from fallback_error
+		self.logger.info('Recovered screenshot %s through CDP capture', path.name)
+		return screenshot
 
 	async def _capture_cdp_screenshot_before_deadline(self, page: Page, path: Path) -> bytes:
 		expired = asyncio.Event()
@@ -1502,13 +1533,21 @@ class BrowserRuntime:
 
 	async def _inspect_network(self, params: dict[str, Any]) -> str:
 		request_id_value = self._first(params, 'request_id')
+		query = str(self._first(params, 'query', 'text', default=''))
+		cursor = self._first(params, 'network_cursor', 'cursor')
+		if cursor is not None and request_id_value is None:
+			raise ValueError('inspect_network network_cursor requires request_id')
 		if request_id_value is not None:
+			request_id = int(request_id_value)
+			if query:
+				if cursor is not None:
+					raise ValueError('inspect_network network_cursor cannot be combined with text')
+				return await self._inspect_network_request_search(request_id, query)
 			return await self._inspect_network_request(
-				int(request_id_value),
-				cursor=self._first(params, 'network_cursor', 'cursor'),
+				request_id,
+				cursor=cursor,
 			)
 
-		query = str(self._first(params, 'query', 'text', default=''))
 		limit = min(max(int(self._first(params, 'limit', default=10)), 1), 50)
 		if not query:
 			items = []
@@ -1526,21 +1565,62 @@ class BrowserRuntime:
 			request_id = self._request_ids_by_entry.get(id(item))
 			if request_id is None:
 				continue
-			requests.append(
-				{
-					'request_id': request_id,
-					'timestamp': item.get('timestamp'),
-					'url': item.get('url'),
-					'method': item.get('method'),
-					'status': item.get('status'),
-					'resource_type': item.get('resource_type'),
-					'post_data': item.get('post_data'),
-					'json_data': item.get('json_data'),
-					'response_headers': item.get('response_headers'),
-					'response_body': item.get('response_body'),
-					'response_body_truncated': item.get('response_body_truncated', False),
-				}
-			)
+			requests.append(self._network_search_payload_request(request_id, item))
+		return await self._render_network_search(query, requests)
+
+	async def _inspect_network_request_search(self, request_id: int, query: str) -> str:
+		"""Search one materialized XHR/fetch response using the standard search output."""
+
+		if request_id not in self._request_entries_by_id:
+			raise ValueError(f'Unknown inspect_network request_id {request_id}')
+		await self._settle_network_capture_bounded(_NETWORK_SEARCH_TIMEOUT_SECONDS)
+		snapshot = await self._materialize_inspect_request(request_id)
+		request = self._network_search_payload_request(
+			request_id,
+			snapshot,
+			fallback=self._request_entries_by_id[request_id],
+		)
+		return await self._render_network_search(query, [request])
+
+	@staticmethod
+	def _network_search_payload_request(
+		request_id: int,
+		source: Mapping[str, Any],
+		*,
+		fallback: Mapping[str, Any] | None = None,
+	) -> dict[str, Any]:
+		"""Normalize one captured or materialized request for the shared search module."""
+
+		def value(name: str, default: Any = None) -> Any:
+			current = source.get(name)
+			if current is None and fallback is not None:
+				current = fallback.get(name)
+			return default if current is None else current
+
+		response_body = source.get('response_body')
+		if isinstance(response_body, str):
+			response_body_truncated = bool(source.get('response_body_truncated', False))
+		elif fallback is not None:
+			response_body = fallback.get('response_body')
+			response_body_truncated = bool(fallback.get('response_body_truncated', False))
+		else:
+			response_body_truncated = bool(source.get('response_body_truncated', False))
+
+		return {
+			'request_id': request_id,
+			'timestamp': value('timestamp'),
+			'url': value('url'),
+			'method': value('method'),
+			'status': value('status'),
+			'resource_type': value('resource_type'),
+			'post_data': value('post_data'),
+			'json_data': value('json_data'),
+			'response_headers': value('response_headers'),
+			'response_body': response_body,
+			'response_body_truncated': response_body_truncated,
+		}
+
+	async def _render_network_search(self, query: str, requests: Sequence[Mapping[str, Any]]) -> str:
 		payload = {'query': query, 'requests': requests}
 		result = await self._run_network_search(payload)
 		# Lunr tokenizes a query, so a response containing only a few generic

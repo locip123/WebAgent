@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -597,6 +598,53 @@ async def test_observe_recovers_raw_screenshot_timeout_with_current_cdp_png(tmp_
 	assert context.session.detached
 
 
+async def test_observe_recovers_raw_capture_screenshot_protocol_error_with_current_cdp_png(tmp_path: Path) -> None:
+	class RawScreenshotProtocolErrorPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			if len(self.screenshot_paths) == 1:
+				raise PlaywrightError(
+					'Page.screenshot: Protocol error (Page.captureScreenshot): Unable to capture screenshot'
+				)
+			Path(path).write_bytes(b'annotated-image')
+			return b'annotated-image'
+
+	class FakeCDPSession:
+		detached = False
+
+		async def send(self, method: str, params: dict[str, Any]) -> dict[str, str]:
+			assert method == 'Page.captureScreenshot'
+			return {'data': base64.b64encode(_VALID_PNG).decode('ascii')}
+
+		async def detach(self) -> None:
+			self.detached = True
+
+	class ScreenshotContext(FakeContext):
+		def __init__(self) -> None:
+			super().__init__([])
+			self.session = FakeCDPSession()
+
+		async def new_cdp_session(self, page: FakePage) -> FakeCDPSession:
+			return self.session
+
+	page = RawScreenshotProtocolErrorPage('https://example.test/')
+	context = ScreenshotContext()
+	runtime = make_started_runtime(
+		tmp_path,
+		page,
+		context=context,
+		action_timeout_ms=30_000,
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+
+	observation = await runtime.observe(0)
+
+	assert observation.screenshot == b'annotated-image'
+	assert (tmp_path / 'trajectory' / '0.png').read_bytes() == _VALID_PNG
+	assert context.session.detached
+
+
 async def test_observe_reports_both_failures_when_raw_cdp_recovery_fails(tmp_path: Path) -> None:
 	class RawScreenshotTimeoutPage(FakePage):
 		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
@@ -638,10 +686,10 @@ async def test_observe_reports_both_failures_when_raw_cdp_recovery_fails(tmp_pat
 	assert context.session.detached
 
 
-async def test_observe_does_not_use_cdp_for_raw_non_timeout_error(tmp_path: Path) -> None:
+async def test_observe_does_not_use_cdp_for_unrelated_playwright_error(tmp_path: Path) -> None:
 	class RawScreenshotErrorPage(FakePage):
 		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
-			raise RuntimeError('raw renderer failed without a timeout')
+			raise PlaywrightError('Page.screenshot: Target page, context or browser has been closed')
 
 	class NoFallbackContext(FakeContext):
 		async def new_cdp_session(self, page: FakePage) -> None:
@@ -651,7 +699,7 @@ async def test_observe_does_not_use_cdp_for_raw_non_timeout_error(tmp_path: Path
 	context = NoFallbackContext([])
 	runtime = make_started_runtime(tmp_path, page, context=context)
 
-	with pytest.raises(RuntimeError, match='raw renderer failed without a timeout'):
+	with pytest.raises(PlaywrightError, match='Target page, context or browser has been closed'):
 		await runtime.observe(0)
 
 
@@ -1118,6 +1166,96 @@ async def test_inspect_network_search_counts_complete_response_phrase(tmp_path: 
 
 	assert result['search_mode'] == 'lunr'
 	assert result['exact_match_count'] == 1
+
+
+async def test_inspect_network_search_scopes_text_to_request_id(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	for body in ('{"result":"needle in target"}', '{"result":"needle in other", "other_only":"exclusive"}'):
+		request = FakeRequest()
+		runtime._on_request(request)  # type: ignore[arg-type]
+		request_id = len(runtime.all_requests) - 1
+		runtime.all_requests[-1].update(
+			{
+				'status': 200,
+				'response_headers': {'content-type': 'application/json'},
+				'response_body': body,
+			}
+		)
+		runtime._network_entries_by_id[request_id].update({'status': 200, 'response_body_state': 'unavailable'})
+
+	scoped = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='needle', request_id=0)))
+	no_match = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='exclusive', request_id=0)))
+
+	assert scoped['indexed_requests'] == 1
+	assert scoped['exact_match_count'] == 1
+	assert [item['request_id'] for item in scoped['results']] == [0]
+	assert no_match['indexed_requests'] == 1
+	assert no_match['exact_match_count'] == 0
+	assert no_match['results'] == []
+
+
+async def test_inspect_network_scoped_search_materializes_beyond_capture_limit(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	request = FakeRequest()
+	body = ('prefix-' + ('x' * (runtime.max_response_body_bytes + 1)) + '-late-needle').encode()
+
+	class LateNeedleResponse(FakeResponse):
+		def __init__(self, source_request: FakeRequest) -> None:
+			super().__init__(source_request)
+			self.headers = {'content-type': 'text/plain; charset=utf-8', 'content-length': str(len(body))}
+
+		async def body(self) -> bytes:
+			return body
+
+	runtime._on_request(request)  # type: ignore[arg-type]
+	runtime._on_response(LateNeedleResponse(request))  # type: ignore[arg-type]
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='late-needle', request_id=0)))
+
+	assert runtime.all_requests[0]['response_body_truncated'] is True
+	assert 'response_body' not in runtime.all_requests[0]
+	assert result['exact_match_count'] == 1
+	assert [item['request_id'] for item in result['results']] == [0]
+	assert result['results'][0]['request']['response_truncated'] is False
+
+
+async def test_inspect_network_scoped_search_fallback_stays_within_request(monkeypatch, tmp_path: Path) -> None:
+	async def missing_node(*args: Any, **kwargs: Any) -> Any:
+		raise FileNotFoundError('node is unavailable')
+
+	monkeypatch.setattr(asyncio, 'create_subprocess_exec', missing_node)
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	for body in ('{"needle":"target"}', '{"needle":"other"}'):
+		request = FakeRequest()
+		runtime._on_request(request)  # type: ignore[arg-type]
+		request_id = len(runtime.all_requests) - 1
+		runtime.all_requests[-1].update({'status': 200, 'response_body': body})
+		runtime._network_entries_by_id[request_id].update({'status': 200, 'response_body_state': 'unavailable'})
+
+	result = json.loads(await runtime.execute(AgentDecision(action='inspect_network', text='needle', request_id=0)))
+
+	assert result['search_mode'] == 'substring_fallback'
+	assert [item['request_id'] for item in result['results']] == [0]
+
+
+async def test_inspect_network_rejects_scoped_search_cursor_from_raw_mapping(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+
+	with pytest.raises(ValueError, match='network_cursor cannot be combined with text'):
+		await runtime.execute(
+			{
+				'action': 'inspect_network',
+				'text': 'needle',
+				'request_id': 0,
+				'network_cursor': 'opaque-page-2',
+			}
+		)
+	with pytest.raises(ValueError, match='network_cursor requires request_id'):
+		await runtime.execute({'action': 'inspect_network', 'network_cursor': 'opaque-page-2'})
 
 
 async def test_inspect_network_reads_complete_request_body_across_cursor_pages(tmp_path: Path) -> None:

@@ -302,12 +302,8 @@ async def test_agent_can_write_structured_model_prompts_before_request(tmp_path:
 	assert prompt_log['system_prompt']['rendered_text'] == llm.calls[0][0][0].text
 	assert prompt_log['system_prompt']['metrics']['characters'] == len(llm.calls[0][0][0].text)
 	assert [entry['step'] for entry in prompt_log['steps']] == [1, 2]
-	assert [entry['prompt']['rendered_text'] for entry in prompt_log['steps']] == [
-		call[0][1].text for call in llm.calls
-	]
-	assert [
-		section['id'] for section in prompt_log['steps'][0]['prompt']['sections']
-	] == [
+	assert [entry['prompt']['rendered_text'] for entry in prompt_log['steps']] == [call[0][1].text for call in llm.calls]
+	assert [section['id'] for section in prompt_log['steps'][0]['prompt']['sections']] == [
 		'authoritative_task',
 		'execution_state',
 		'browser_observation',
@@ -795,6 +791,40 @@ def test_chart_actions_share_deadline_and_cursor_keeps_a_small_fallback_budget(t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['no_match', 'saved_raw_only'])
+async def test_unavailable_chart_scan_does_not_consume_action_error_budget(tmp_path: Path, status: str):
+	chart_inspector = FakeChartNetworkInspector(
+		json.dumps({'action': 'find_chart_data_requests', 'status': status, 'requests': [], 'datasets': []})
+	)
+	runtime = FakeRuntime()
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(
+			[
+				AgentDecision(action='find_chart_data_requests', thought='Check for normalized chart data.'),
+				AgentDecision(action='wait', seconds=0.1, thought='Read the visible chart instead.'),
+				AgentDecision(
+					action='finish',
+					answer='The chart-visible fallback succeeded.',
+					evidence=['The visible chart was read after no normalized chart data was available.'],
+					success=True,
+				),
+			]
+		),
+		runtime=runtime,
+		task_dir=tmp_path,
+		chart_network_inspector=chart_inspector,
+		max_consecutive_action_errors=1,
+	)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'SUCCESS'
+	assert chart_inspector.calls[0]['cursor'] is None
+	assert [decision.action for decision in runtime.executed] == ['wait']
+
+
+@pytest.mark.asyncio
 async def test_saved_raw_cursor_page_does_not_count_as_a_new_failed_scan(tmp_path: Path):
 	chart_inspector = FakeChartNetworkInspector(
 		'{"action":"find_chart_data_requests","status":"saved_raw_only","page_index":0,"next_cursor":null}'
@@ -822,3 +852,218 @@ async def test_saved_raw_cursor_page_does_not_count_as_a_new_failed_scan(tmp_pat
 
 	assert outcome.status == 'SUCCESS'
 	assert chart_inspector.calls[0]['cursor'] == 'scan:0'
+
+
+@dataclass(slots=True)
+class ScrollObservation(FakeObservation):
+	marker: str = 'top'
+
+	def render_text(self) -> str:
+		return f'Visible browser state: {self.marker}'
+
+
+class OscillatingRuntime(FakeRuntime):
+	"""Every scroll changes the observation, so exact-repeat guards never fire."""
+
+	async def observe(self, step: int) -> ScrollObservation:
+		self.observed_steps.append(step)
+		return ScrollObservation(marker='bottom' if step % 2 else 'top')
+
+
+@pytest.mark.asyncio
+async def test_agent_interrupts_two_action_oscillation_cycle(tmp_path: Path):
+	runtime = OscillatingRuntime()
+	decisions = []
+	for index in range(12):
+		direction = 'up' if index % 2 else 'down'
+		decisions.append(AgentDecision(action='scroll', direction=direction, pages=1, thought=f'Scroll {direction}.'))
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(decisions),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=13,
+		max_consecutive_action_errors=99,
+	)
+
+	outcome = await agent.run()
+
+	loop_steps = [step for step in outcome.steps if 'loop_detected' in str(step.get('outcome', ''))]
+	assert loop_steps, 'an A<->B oscillation must be interrupted before the deadline'
+	blocked = json.loads(loop_steps[0]['outcome'])
+	assert blocked['status'] == 'loop_detected'
+	assert blocked['pattern'] == 'oscillation'
+	assert len(runtime.executed) < 12
+
+
+@pytest.mark.asyncio
+async def test_agent_interrupts_near_duplicate_probe_family(tmp_path: Path):
+	runtime = OscillatingRuntime()
+	decisions = [
+		AgentDecision(action='inspect_network', text=f'query-{index}', thought='Search captured bodies.') for index in range(10)
+	]
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(decisions),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=11,
+		max_consecutive_action_errors=99,
+	)
+
+	outcome = await agent.run()
+
+	loop_steps = [step for step in outcome.steps if 'loop_detected' in str(step.get('outcome', ''))]
+	assert loop_steps, 'a same-action probe family with only parameter changes must be interrupted'
+	blocked = json.loads(loop_steps[0]['outcome'])
+	assert blocked['status'] == 'loop_detected'
+	assert blocked['pattern'] == 'unproductive_probe_family'
+	assert blocked['action'] == 'inspect_network'
+
+
+@pytest.mark.asyncio
+async def test_agent_interrupts_drag_retries_that_only_jitter_coordinates(tmp_path: Path):
+	"""Case 95 dragged one date-picker column with endpoints varying a few pixels."""
+
+	runtime = OscillatingRuntime()
+	decisions = []
+	for index in range(12):
+		if index % 2:
+			decisions.append(AgentDecision(action='click', element_id=index, thought='Open the day column.'))
+		else:
+			decisions.append(
+				AgentDecision(
+					action='drag',
+					x=900,
+					y=610,
+					end_x=900 + index,
+					end_y=500 + index,
+					thought='Drag the day column upward.',
+				)
+			)
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(decisions),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=13,
+		max_consecutive_action_errors=99,
+	)
+
+	outcome = await agent.run()
+
+	loop_steps = [step for step in outcome.steps if 'loop_detected' in str(step.get('outcome', ''))]
+	assert loop_steps, 'drag retries differing only by a few pixels must not read as fresh intents'
+	assert len(runtime.executed) < 12
+
+
+@pytest.mark.asyncio
+async def test_agent_interrupts_non_alternating_intent_churn(tmp_path: Path):
+	"""Case 62 rotated find_text/click/scroll over one form without ever advancing."""
+
+	runtime = OscillatingRuntime()
+	rotation = [
+		AgentDecision(action='find_text', text='Submit', thought='Locate the control.'),
+		AgentDecision(action='click', element_id=7, thought='Click the control.'),
+		AgentDecision(action='scroll', direction='down', pages=1, thought='Look further down.'),
+	]
+	decisions = [rotation[index % 3].model_copy() for index in range(12)]
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(decisions),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=13,
+		max_consecutive_action_errors=99,
+	)
+
+	outcome = await agent.run()
+
+	loop_steps = [step for step in outcome.steps if 'loop_detected' in str(step.get('outcome', ''))]
+	assert loop_steps, 'a three-intent rotation over one state must be interrupted'
+	blocked = json.loads(loop_steps[0]['outcome'])
+	assert blocked['pattern'] == 'intent_churn'
+	assert blocked['distinct_intents'] <= 3
+
+
+@pytest.mark.asyncio
+async def test_detect_loop_stays_quiet_on_progressing_exploration(tmp_path: Path):
+	"""Healthy exploration keeps changing state, so no pattern may fire."""
+
+	runtime = FakeRuntime()
+	decisions = [
+		AgentDecision(action='navigate', url=f'https://example.test/page-{index}', thought='Open the next source.')
+		for index in range(12)
+	]
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(decisions),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=13,
+		max_consecutive_action_errors=99,
+	)
+
+	outcome = await agent.run()
+
+	assert not [step for step in outcome.steps if 'loop_detected' in str(step.get('outcome', ''))]
+
+
+class SlowActionRuntime(FakeRuntime):
+	"""Executes one action slowly enough to cross the task deadline."""
+
+	async def execute(self, decision: AgentDecision) -> str:
+		self.executed.append(decision)
+		await asyncio.sleep(0.2)
+		return 'Action completed.'
+
+
+@pytest.mark.asyncio
+async def test_agent_salvages_verified_memory_when_task_deadline_elapses(tmp_path: Path):
+	runtime = SlowActionRuntime()
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM(
+			[
+				AgentDecision(
+					action='wait',
+					seconds=0.1,
+					thought='Record the verified value.',
+					memory='Verified: 2022/08 sugar price change is -13.7 percent (askci monthly article).',
+				)
+			]
+		),
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=5,
+		task_deadline_monotonic=time.monotonic() + 0.05,
+	)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'FAIL_TASK_TIMEOUT'
+	assert outcome.agent_answer, 'verified facts must be salvaged instead of returning an empty answer'
+	assert '-13.7' in outcome.agent_answer
+	assert outcome.evidence
+
+
+@pytest.mark.asyncio
+async def test_agent_reports_remaining_task_seconds_to_the_model(tmp_path: Path):
+	llm = FakeLLM([AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True)])
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=FakeRuntime(),
+		task_dir=tmp_path,
+		max_steps=3,
+		task_deadline_monotonic=time.monotonic() + 240.0,
+	)
+
+	await agent.run()
+
+	assert 'Remaining task time' in _model_text(llm.calls)
