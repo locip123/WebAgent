@@ -15,6 +15,7 @@ from browser_use.webretriever.prompts import (
 	build_system_prompt,
 	describe_system_prompt,
 )
+from browser_use.webretriever.strategy import StrategyCheckpoint, StrategyReviewRequest
 
 
 def _task(
@@ -373,3 +374,281 @@ def test_step_prompt_omits_remaining_time_when_no_deadline_is_configured() -> No
 	execution = next(section for section in document.sections if section['id'] == 'execution_state')
 	assert execution['fields']['remaining_task_seconds'] is None
 	assert 'Remaining task time' not in document.text
+
+
+def test_initial_page_strategy_review_has_an_empty_trajectory_and_requires_a_plan() -> None:
+	composer = PromptComposer(_task(), PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	document = composer.compose_step(
+		StepContext(
+			step_index=0,
+			observation=_observation(),
+			history=(),
+			memory='',
+			last_outcome='The task has just started.',
+			strategy_review=StrategyReviewRequest(
+				completed_decisions=0,
+				trajectory=(),
+				trigger='initial_page',
+			),
+		)
+	)
+
+	assert '===== REQUIRED INITIAL-PAGE STRATEGY REVIEW =====' in document.text
+	assert 'trajectory is intentionally empty' in document.text
+	assert 'all four non-empty checkpoint_* fields' in document.text
+	assert 'output each field only as a Markdown-style list' in document.text
+	assert '- [tried] first distinct strategy and its browser basis' in document.text
+	assert 'Never use inline numbering or combine items with semicolons.' in document.text
+	execution = next(section for section in document.sections if section['id'] == 'execution_state')
+	assert execution['fields']['required_strategy_review'] == {
+		'completed_decisions': 0,
+		'trigger': 'initial_page',
+		'trajectory': [],
+	}
+
+
+def test_page_entry_checkpoint_uses_every_decision_since_the_prior_review_and_stays_visible_afterward() -> None:
+	composer = PromptComposer(_task(), PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	checkpoint = StrategyCheckpoint(
+		completed_decisions=15,
+		strategy_catalog='- [tried] Site navigation.\n- [untried] official export, table view, and captured first-party chart data.',
+		active_strategy='- Inspect the official table route for the requested filters.',
+		confirmed_infeasible='- No route is confirmed infeasible yet.',
+		next_strategies='- Prioritize the table.\n- Inspect the export.\n- Inspect chart traffic.',
+	)
+	review = StrategyReviewRequest(
+		completed_decisions=15,
+		trajectory=tuple(
+			{
+				'decision': index + 1,
+				'step': index + 1,
+				'url': f'https://example.com/page-{index + 1}',
+				'title': f'Observed page {index + 1}',
+				'page_observation': f'Browser evidence {index + 1}',
+				'action': {'action': 'navigate', 'url': f'https://example.com/page-{index + 1}'},
+				'outcome': f'Completed action {index + 1}',
+			}
+			for index in range(15)
+		),
+		trigger='page_entry',
+	)
+
+	checkpoint_document = composer.compose_step(
+		StepContext(
+			step_index=15,
+			observation=_observation(),
+			history=(),
+			memory='Verified: current source is official.',
+			last_outcome='Completed decision 15.',
+			strategy_checkpoint=checkpoint,
+			strategy_review=review,
+		)
+	)
+
+	assert '===== REQUIRED PAGE-ENTRY STRATEGY REVIEW =====' in checkpoint_document.text
+	assert 'different valid page' in checkpoint_document.text
+	assert 'checkpoint_strategy_catalog' in checkpoint_document.text
+	assert 'Browser evidence 1' in checkpoint_document.text
+	assert 'Browser evidence 15' in checkpoint_document.text
+	assert 'No strategy review is due' not in checkpoint_document.text
+	execution = next(section for section in checkpoint_document.sections if section['id'] == 'execution_state')
+	assert execution['fields']['exploration_checkpoint']['covered_through_decision'] == 15
+	assert execution['fields']['durable_memory'] == 'Verified: current source is official.'
+	assert execution['fields']['required_strategy_review']['trigger'] == 'page_entry'
+	assert len(execution['fields']['required_strategy_review']['trajectory']) == 15
+
+	afterward_document = composer.compose_step(
+		StepContext(
+			step_index=16,
+			observation=_observation(),
+			history=(),
+			memory='Verified: current source is official.',
+			last_outcome='Completed decision 16.',
+			strategy_checkpoint=checkpoint,
+		)
+	)
+
+	assert '===== PERSISTENT EXPLORATION CHECKPOINT' in afterward_document.text
+	assert 'official export, table view' in afterward_document.text
+	assert 'No strategy review is due. Return null for every checkpoint_* field.' in afterward_document.text
+
+
+def test_persistent_checkpoint_renders_every_section_as_an_indented_bullet_list() -> None:
+	composer = PromptComposer(_task(), PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	checkpoint = StrategyCheckpoint(
+		completed_decisions=3,
+		strategy_catalog=(
+			'- [tried] Read the first-party results table.\n'
+			'- [untried] Open the first-party export.\n'
+			'- [low probability, untried] Inspect captured first-party chart traffic.'
+		),
+		active_strategy='- Read the first-party results table.',
+		confirmed_infeasible='- None confirmed.',
+		next_strategies='- Open the first-party export next.\n- Inspect captured first-party chart traffic.',
+	)
+
+	document = composer.compose_step(
+		StepContext(
+			step_index=3,
+			observation=_observation(),
+			history=(),
+			memory='Verified: current source is official.',
+			last_outcome='Completed decision 3.',
+			strategy_checkpoint=checkpoint,
+		)
+	)
+
+	assert '''1. All viable strategy classes (tried and untried):
+   - [tried] Read the first-party results table.
+   - [untried] Open the first-party export.
+   - [low probability, untried] Inspect captured first-party chart traffic.
+
+2. Strategy currently being tried:
+   - Read the first-party results table.
+
+3. Confirmed infeasible strategy classes:
+   - None confirmed.
+
+4. Remaining worthwhile strategy classes:
+   - Open the first-party export next.
+   - Inspect captured first-party chart traffic.''' in document.text
+
+
+def test_strategy_checkpoint_compacts_but_never_drops_since_review_decisions() -> None:
+	composer = PromptComposer(_task(), PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	checkpoint = StrategyCheckpoint(
+		completed_decisions=15,
+		strategy_catalog='- ' + 'catalog ' * 100,
+		active_strategy='- ' + 'active ' * 25,
+		confirmed_infeasible='- ' + 'blocked ' * 50,
+		next_strategies='- ' + 'next ' * 45,
+	)
+	review = StrategyReviewRequest(
+		completed_decisions=15,
+		trajectory=tuple(
+			{
+				'decision': index + 1,
+				'step': index + 1,
+				'url': f'https://example.com/very-long-route-{index}/' + 'u' * 5_000,
+				'title': 'title ' * 2_000,
+				'page_observation': 'browser observation ' * 5_000,
+				'action': {'action': 'navigate', 'url': f'https://example.com/{index}/' + 'a' * 5_000},
+				'outcome': 'action outcome ' * 5_000,
+			}
+			for index in range(15)
+		),
+		trigger='page_entry',
+	)
+	document = composer.compose_step(
+		StepContext(
+			step_index=15,
+			observation=_observation(page_text='current evidence ' * 20_000),
+			history=(),
+			memory='Verified: current source is official.',
+			last_outcome='Completed decision 15.',
+			strategy_checkpoint=checkpoint,
+			strategy_review=review,
+		)
+	)
+
+	execution = next(section for section in document.sections if section['id'] == 'execution_state')
+	assert document.metrics['estimated_tokens'] <= 20_000
+	assert len(execution['fields']['required_strategy_review']['trajectory']) == 15
+	assert document.metrics['sources']['checkpoint_trajectory']['reason'] == 'checkpoint_trajectory_compacted'
+
+
+def test_strategy_checkpoint_is_never_silently_dropped_under_a_low_prompt_budget() -> None:
+	"""A checkpoint review either retains prior strategy state or fails explicitly."""
+
+	composer = PromptComposer(
+		_task(),
+		PromptTarget(model_id='gpt-5.4', step_text_token_budget=1_500),
+		max_steps=100,
+		thought_language='简体中文',
+	)
+	checkpoint = StrategyCheckpoint(
+		completed_decisions=15,
+		strategy_catalog='- ' + 'catalog ' * 100,
+		active_strategy='- ' + 'active ' * 25,
+		confirmed_infeasible='- ' + 'blocked ' * 50,
+		next_strategies='- ' + 'next ' * 45,
+	)
+	review = StrategyReviewRequest(
+		completed_decisions=15,
+		trajectory=tuple(
+			{
+				'decision': index + 1,
+				'step': index + 1,
+				'url': f'https://example.com/{index}/' + 'u' * 5_000,
+				'title': 'title ' * 2_000,
+				'page_observation': 'browser observation ' * 5_000,
+				'action': {'action': 'navigate', 'url': f'https://example.com/{index}/' + 'a' * 5_000},
+				'outcome': 'action outcome ' * 5_000,
+			}
+			for index in range(15)
+		),
+		trigger='page_entry',
+	)
+
+	with pytest.raises(PromptBudgetExceeded) as error:
+		composer.compose_step(
+			StepContext(
+				step_index=15,
+				observation=_observation(page_text='current evidence ' * 20_000),
+				history=(),
+				memory='Verified: current source is official.' * 100,
+				last_outcome='Completed decision 15.' * 100,
+				strategy_checkpoint=checkpoint,
+				strategy_review=review,
+			)
+		)
+
+	assert 'exploration_checkpoint' in error.value.mandatory_sections
+
+
+def test_strategy_checkpoint_never_silently_drops_the_existing_fact_ledger() -> None:
+	"""A review cannot trade the fact ledger away merely to fit a small budget."""
+
+	composer = PromptComposer(
+		_task(),
+		PromptTarget(model_id='gpt-5.4', step_text_token_budget=1_750),
+		max_steps=100,
+		thought_language='简体中文',
+	)
+	checkpoint = StrategyCheckpoint(
+		completed_decisions=15,
+		strategy_catalog='- Tried table route.',
+		active_strategy='- Try export route.',
+		confirmed_infeasible='- None confirmed.',
+		next_strategies='- Export then chart traffic.',
+	)
+	review = StrategyReviewRequest(
+		completed_decisions=15,
+		trajectory=tuple(
+			{
+				'decision': index + 1,
+				'step': index + 1,
+				'url': f'https://example.com/{index}',
+				'title': 'Results',
+				'page_observation': 'Observed route.',
+				'action': {'action': 'navigate', 'url': f'https://example.com/{index}'},
+				'outcome': 'Completed.',
+			}
+			for index in range(15)
+		),
+		trigger='page_entry',
+	)
+	context = StepContext(
+		step_index=15,
+		observation=_observation(),
+		history=(),
+		memory='FACT-LEDGER ' * 100,
+		last_outcome='Completed decision 15.',
+		strategy_checkpoint=checkpoint,
+		strategy_review=review,
+	)
+
+	with pytest.raises(PromptBudgetExceeded) as error:
+		composer.compose_step(context)
+
+	assert 'exploration_checkpoint' in error.value.mandatory_sections

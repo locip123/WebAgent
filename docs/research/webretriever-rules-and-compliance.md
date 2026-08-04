@@ -6,7 +6,7 @@
 
 正式评测应继续使用**官方传入的 CDP 云端浏览器 + 标准 Playwright**。Browser Use 这类框架可以保留，但所有实际浏览器交互仍必须由 Playwright 完成。外部搜索引擎不可用；不要以代理、定制浏览器、CAPTCHA 解题服务、伪造/注入指纹或非 Playwright CDP 客户端作为正式评测的默认解法。
 
-当前公开规则没有明文列出「住宅代理、浏览器代理、反检测/stealth、指纹伪装、CAPTCHA 绕过、目标站登录」的许可或禁止条款。因此这些不是已获准能力；若确有必要，应在合入正式提交前取得主办方的书面确认。官方说明主办方会进行轨迹验证，且由选手代码保存截图、动作与 XHR/Fetch 记录，故这类行为也不应假设不可见。[官方 Guide：搜索引擎与轨迹验证](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq)；[官方 Guide：采集的轨迹与网络记录](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq)。
+当前公开 Guide 没有明文列出「住宅代理、浏览器代理、反检测/stealth、指纹伪装、CAPTCHA 绕过、目标站登录」的许可或禁止条款。用户于 2026-08-04 转述的主办方补充解释已明确：真实网站中需要人工点击的风控验证属于比赛环境的一部分，Agent 应在官方浏览器内处理。因此，应把**在 Playwright 内对可见验证控件的正常交互和等待**视为比赛 Agent 的能力；住宅代理、指纹伪装、外部 CAPTCHA 代解/通关服务等改变身份或外包验证的做法，仍不应推定为获准。官方说明主办方会进行轨迹验证，且由选手代码保存截图、动作与 XHR/Fetch 记录，故这类行为也不应假设不可见。[官方 Guide：搜索引擎与轨迹验证](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq)；[官方 Guide：采集的轨迹与网络记录](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq)。
 
 ## 官方规则：已明确的边界
 
@@ -46,7 +46,8 @@
 | 不推荐用于正式评测 | Zendriver、Nodriver | 这是以非 Playwright 的 CDP 自动化框架执行浏览器交互，与“所有浏览器交互必须通过 Playwright”的明确要求不相容。 | [Playwright 要求](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#prepare) |
 | 不推荐用于正式评测 | Puppeteer Extra Stealth | Puppeteer 不是 Playwright；即便附带 stealth 插件也不满足明确的浏览器交互方式。 | [Playwright 要求](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#prepare) |
 | 不推荐用于正式评测 | CloakBrowser、BotBrowser，以及自带 profile bundle 的定制 Chromium | 其设计前提是替换/定制浏览器或 profile；而正式评测已由官方提供和分配云端浏览器沙箱，选手不应以另一个浏览器替代。 | [官方浏览器](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq) |
-| 不推荐、先问再说 | 浏览器/住宅/轮换代理、外部 CAPTCHA 解题服务、绕过 Cloudflare/登录限制 | 当前规则没有明示许可，且会影响官方浏览器的网络身份或把交互移出可审计的 Playwright 路径。不要把“未禁止”当作允许。 | [官方浏览器与轨迹](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq) |
+| 推荐 | Playwright 内对可见 Challenge / CAPTCHA 控件的正常点击、等待和结果观察 | 这是用户转述的主办方补充解释所指的真实 Web 环境交互；必须保留完整操作和截图轨迹，不更换官方浏览器或访问身份。 | 用户转述的主办方补充解释；[官方浏览器与轨迹](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq) |
+| 不推荐、先问再说 | 浏览器/住宅/轮换代理、外部 CAPTCHA 解题服务、规避 Cloudflare/登录限制 | 这些会影响官方浏览器的网络身份或把验证交互移出可审计的 Playwright 路径。不要把“未禁止”当作允许。 | [官方浏览器与轨迹](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/#faq) |
 
 对于任何“需书面确认”项，建议向赛事空间或 [官方联系页](https://mininglamp-ai.github.io/WebRetriever_Challenge/#contact)提交一个可二选一回答的问题：**“在不更换官方 CDP 浏览器、不使用外部搜索引擎的条件下，是否允许在 Playwright 内使用 `<具体库/具体配置>`？”** 同时附上会保留完整轨迹、不会使用外部 CAPTCHA 人工/解题服务的说明。
 
@@ -60,7 +61,7 @@
 | 31：美国护照申请量 | [任务数据](../../data/data/protocol3.json)要求从 `travel.state.gov` 找出指定财年范围的最高值；[轨迹](../../outputs/protocol3_5/31_fail/result.json)显示 Cloudflare 拦截，且只有一次 5 秒等待。 | 先把“拦截页”识别为明确状态，采用一次任务内、有限且低频的正常等待/站内导航策略；若仍未放行则如实失败并保留证据。不要接入外部 CAPTCHA 服务、代理或搜索引擎。 |
 | 36：BLS Information 就业人数 | [任务数据](../../data/data/protocol3.json)要求从 `data.bls.gov` 查询一个 CES 值；[轨迹](../../outputs/protocol3_5/36_fail/result.json)显示 BLS `Access Denied` / bot activity prohibited，多个官方端点也被拒绝。 | 避免端点枚举和短时间内的连续直链访问；优先按起始页面的正常站内操作链，并在遇到拦截时收集证据、停止无效尝试。不能由该现象推出“允许修改指纹”。 |
 
-三题的任务文字均没有要求登录、提供账号凭据或完成 CAPTCHA。因此在当前公开信息下，把“登录/CAPTCHA 绕过”加入正式 Agent 并不是解决这些题目的合规默认路径。
+三题的任务文字均没有要求登录或提供账号凭据。若页面展示需要点击的验证控件，应按主办方补充解释由 Agent 在官方 Playwright 浏览器内完成可审计的页面交互；这不构成外部 CAPTCHA 代解、伪造会话或规避安全机制。
 
 ## 更优先的第一方公开数据恢复（仍通过 Playwright）
 
@@ -80,4 +81,4 @@
 2. 加入站点级低并发、请求节流、重复 URL 去重、对 `Access Denied` / Cloudflare / 限流页的早期识别，并记录证据；这既保留 Playwright 轨迹，也不触碰身份伪装。
 3. 在同一题内使用有限退避和正常站内页面路径，严格计入 100 步；不要把它实现成失败题重跑。
 4. 外部搜索引擎始终禁用；需要定位信息时只能从题目指定站点的可见页面、站内功能和经浏览器产生的网络记录中取得。
-5. 只有在主办方明确书面允许后，才评估任何 stealth、指纹注入、代理或 CAPTCHA/登录自动化方案；否则不纳入正式镜像。
+5. 将可见验证控件的识别、单次语义点击、结果等待和失败熔断纳入标准 Playwright 流程；只有在主办方明确书面允许后，才评估 stealth、指纹注入、代理或外部 CAPTCHA/登录自动化方案。

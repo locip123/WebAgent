@@ -6,14 +6,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from browser_use.llm.schema import SchemaOptimizer
 from browser_use.webretriever.artifacts import (
 	MODEL_PROMPT_LOG_FORMAT,
+	STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
 	TaskArtifactWriter,
 	atomic_write_json,
 	prepare_task_directory,
 	prompt_text_lines,
 )
 from browser_use.webretriever.models import AgentDecision, CompetitionTask, load_tasks
+from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELD_LIMITS
 
 
 def _task(**updates: object) -> CompetitionTask:
@@ -176,6 +179,37 @@ def test_agent_decision_supports_every_flat_action(payload: dict[str, object]) -
 	assert decision.action_payload()['action'] == payload['action']
 
 
+def test_agent_decision_exposes_nullable_flat_checkpoint_fields_to_strict_providers() -> None:
+	schema = SchemaOptimizer.create_optimized_json_schema(AgentDecision)
+
+	for name in (
+		'checkpoint_strategy_catalog',
+		'checkpoint_active_strategy',
+		'checkpoint_confirmed_infeasible',
+		'checkpoint_next_strategies',
+	):
+		assert name in schema['required']
+		assert {'type': 'null'} in schema['properties'][name]['anyOf']
+		string_schema = next(option for option in schema['properties'][name]['anyOf'] if option['type'] == 'string')
+		assert string_schema['maxLength'] == CHECKPOINT_DECISION_FIELD_LIMITS[name]
+		with pytest.raises(ValidationError):
+			AgentDecision(action='wait', seconds=0.1, **{name: 'x' * (CHECKPOINT_DECISION_FIELD_LIMITS[name] + 1)})
+
+	assert all(
+		'Markdown list' in schema['properties'][name]['description']
+		for name in (
+			'checkpoint_strategy_catalog',
+			'checkpoint_active_strategy',
+			'checkpoint_confirmed_infeasible',
+			'checkpoint_next_strategies',
+		)
+	)
+
+	decision = AgentDecision(action='wait', seconds=0.1, checkpoint_strategy_catalog='Table and export routes.')
+	assert decision.checkpoint_strategy_catalog == 'Table and export routes.'
+	assert all(name not in decision.action_payload() for name in schema['properties'] if name.startswith('checkpoint_'))
+
+
 def test_agent_decision_preserves_scoped_network_search_fields() -> None:
 	decision = AgentDecision.model_validate({'action': 'inspect_network', 'text': 'revenue', 'request_id': 42})
 	payload = decision.action_payload()
@@ -313,6 +347,12 @@ def test_task_artifacts_create_scaffolds_and_update_atomically(tmp_path: Path) -
 	assert json.loads(writer.capture_path.read_text(encoding='utf-8'))['all_requests'] == []
 	prompt_log = json.loads(writer.model_prompt_log_path.read_text(encoding='utf-8'))
 	assert prompt_log == {'format': MODEL_PROMPT_LOG_FORMAT, 'system_prompt': [], 'steps': []}
+	strategy_review_prompt_log = json.loads(writer.strategy_review_prompt_log_path.read_text(encoding='utf-8'))
+	assert strategy_review_prompt_log == {
+		'format': STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
+		'system_prompt': [],
+		'reviews': [],
+	}
 	assert 'private reference answer' not in json.dumps(prompt_log, ensure_ascii=False)
 	assert prompt_text_lines('first\n\nthird\n') == ['first', '', 'third', '']
 	assert '\n'.join(prompt_text_lines('first\n\nthird\n')) == 'first\n\nthird\n'

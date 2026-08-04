@@ -5,3 +5,4 @@
 - The execution entry point of the program is 'python run_webretriever.py'
 - webretriever is the agent that we need to jointly build
 - Communicate in Simplified Chinese
+- The competition task is based on the construction of a real website, and the anti-crawling/risk control mechanisms (requiring manual click verification) present on the website are part of the real Web environment, which cannot be completely avoided. Users need to design agents to solve this verification issue. Handling anti-crawling/risk control mechanisms is one of the core examination points of this challenge competition

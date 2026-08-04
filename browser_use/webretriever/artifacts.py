@@ -18,6 +18,8 @@ from browser_use.webretriever.models import CompetitionTask
 MODEL_PROMPT_LOG_FILENAME = 'model_prompts.json'
 MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-lines'
 STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-structured'
+STRATEGY_REVIEW_PROMPT_LOG_FILENAME = 'strategy_review_prompts.json'
+STRATEGY_REVIEW_PROMPT_LOG_FORMAT = 'webretriever-strategy-review-prompts/v1-lines'
 
 
 def model_prompt_log_metadata() -> dict[str, Any]:
@@ -198,6 +200,7 @@ class TaskArtifactWriter:
 		self.result_path = self.task_dir / 'result.json'
 		self.capture_path = self.task_dir / 'capture.json'
 		self.model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
+		self.strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
 		self.logs_dir = self.output_dir / 'logs'
 		self.lock_path = self.output_dir / 'locks' / f'{task.directory_name}.lock'
 		self.lock = TaskLock(self.lock_path)
@@ -229,6 +232,16 @@ class TaskArtifactWriter:
 			'steps': [],
 		}
 
+	@staticmethod
+	def _empty_strategy_review_prompt_log() -> dict[str, Any]:
+		"""Return the independent strategy-review input trace for a new task."""
+
+		return {
+			'format': STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
+			'system_prompt': [],
+			'reviews': [],
+		}
+
 	def prepare(self) -> Path:
 		"""Idempotently create the task tree and initial JSON documents."""
 
@@ -248,6 +261,8 @@ class TaskArtifactWriter:
 				atomic_write_json(self.capture_path, self._empty_capture())
 			if not self.model_prompt_log_path.exists():
 				atomic_write_json(self.model_prompt_log_path, self._empty_model_prompt_log())
+			if not self.strategy_review_prompt_log_path.exists():
+				atomic_write_json(self.strategy_review_prompt_log_path, self._empty_strategy_review_prompt_log())
 		finally:
 			if not already_acquired:
 				self.lock.release()
@@ -329,6 +344,8 @@ def prepare_task_directory(output_dir: Path | str, task: CompetitionTask) -> Pat
 __all__ = [
 	'MODEL_PROMPT_LOG_FILENAME',
 	'MODEL_PROMPT_LOG_FORMAT',
+	'STRATEGY_REVIEW_PROMPT_LOG_FILENAME',
+	'STRATEGY_REVIEW_PROMPT_LOG_FORMAT',
 	'STRUCTURED_MODEL_PROMPT_LOG_FORMAT',
 	'TaskArtifactWriter',
 	'TaskLock',

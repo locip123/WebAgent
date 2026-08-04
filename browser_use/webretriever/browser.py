@@ -1,8 +1,10 @@
-"""Playwright-only browser runtime for the WebRetriever challenge.
+"""Playwright action runtime with read-only CDP DOM inspection.
 
-The competition supplies an already-running browser over CDP.  Connection
+The competition supplies an already-running browser over CDP. Connection
 ownership deliberately stays with the runner; :class:`BrowserRuntime` owns
-only the pages it creates inside the supplied ``BrowserContext``.
+only the pages it creates inside the supplied ``BrowserContext``. CDP is used
+only to inspect DOM identity, geometry, snapshots, accessibility, and listener
+metadata; state-changing input remains Playwright mouse and keyboard actions.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import base64
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import logging
 import math
@@ -31,10 +34,13 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal, Mapping, Se
 from urllib.parse import parse_qsl, unquote, urlsplit
 from xml.etree import ElementTree
 
-from playwright.async_api import BrowserContext, Download, Frame, Locator, Page, Request, Response
+from playwright.async_api import BrowserContext, CDPSession, Dialog, Download, Frame, Locator, Page, Request, Response
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, ConfigDict
+
+from browser_use.webretriever.dom_collector import CdpCollectionError, collect_interactive_elements
+from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELDS
 
 if TYPE_CHECKING:
 	from browser_use.webretriever.models import AgentDecision
@@ -69,6 +75,8 @@ _DOWNLOAD_PLACEHOLDER_URL = ':'
 _MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
 _MAX_ARCHIVE_TOTAL_BYTES = 250 * 1024 * 1024
 _MAX_ARCHIVE_WARNINGS = 100
+_MAX_RECENT_DIALOGS = 8
+_MAX_DIALOG_MESSAGE = 2_000
 _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 _DOCUMENT_MIME_EXTENSIONS = {
 	'application/pdf': '.pdf',
@@ -253,6 +261,9 @@ class ElementRef:
 	width: float = 0.0
 	height: float = 0.0
 	selector: str = ''
+	backend_node_id: int = 0
+	frame_id: str = ''
+	signals: tuple[str, ...] = ()
 
 	def render_text(self) -> str:
 		parts = [f'[{self.index}]', self.tag]
@@ -345,7 +356,13 @@ class BrowserObservation:
 @dataclass(slots=True)
 class _ElementBinding:
 	frame: Frame
-	selector: str
+	selector: str = ''
+	backend_node_id: int = 0
+	cdp_target: Page | Frame | None = None
+	coordinate_frame: Frame | None = None
+	frame_id: str = ''
+	read_text: str = ''
+	options: tuple[tuple[str, str], ...] = ()
 
 
 class _VisibleTextParser(HTMLParser):
@@ -484,15 +501,22 @@ class BrowserRuntime:
 		self._page_ids: dict[int, int] = {}
 		self._page_document_generations: dict[int, int] = {}
 		self._element_bindings: dict[int, _ElementBinding] = {}
+		self._legacy_marker_bindings_active = False
 		self._last_safe_urls: dict[int, str] = {}
 		self._background_tasks: set[asyncio.Task[Any]] = set()
 		self._download_tasks: set[asyncio.Task[Any]] = set()
 		self._policy_tasks: set[asyncio.Task[Any]] = set()
+		self._dialog_tasks: set[asyncio.Task[Any]] = set()
 		self._screenshot_recovery_tasks: set[asyncio.Task[Any]] = set()
 		self._rollback_pages: set[int] = set()
 		self._captured_document_responses: set[tuple[str, int]] = set()
 		self._download_urls_seen: set[str] = set()
 		self._reserved_download_paths: set[Path] = set()
+		# Native JavaScript dialogs are not part of DOM text or page screenshots.
+		# Retain a bounded, task-local transcript so form-validation alerts reach
+		# the decision model through both the action result and the next observation.
+		self._recent_dialogs: list[dict[str, Any]] = []
+		self._next_dialog_id = 0
 		self._started = False
 		self._closed = False
 		self._execute_lock = asyncio.Lock()
@@ -540,7 +564,9 @@ class BrowserRuntime:
 		"""Capture raw/annotated screenshots plus a cross-frame textual state."""
 
 		self._ensure_started()
+		await self._drain_dialog_tasks()
 		await self._enforce_search_policy()
+		await self._drain_dialog_tasks()
 		await self._drain_download_tasks()
 		page = await self._active_page_for_observation()
 		await self._clear_markers(remove_attributes=True)
@@ -550,17 +576,22 @@ class BrowserRuntime:
 		visual_path = self.trajectory_visual_dir / f'{step_name}.png'
 		raw_screenshot = await self._capture_screenshot(page, raw_path)
 
-		page_text = await self._collect_page_text(page)
+		page_text = self._dialog_observation_text() + await self._collect_page_text(page)
 		elements = await self._collect_elements(page)
+		viewport = await self._viewport(page)
 		try:
-			screenshot = await self._capture_screenshot(page, visual_path)
+			visual_screenshot = await self._capture_screenshot(page, visual_path)
+			screenshot = visual_screenshot
+			if not self._legacy_marker_bindings_active:
+				screenshot = self._annotate_element_screenshot(visual_screenshot, elements, viewport)
+				if screenshot != visual_screenshot:
+					visual_path.write_bytes(screenshot)
 		except _ScreenshotFallbackError:
 			raise
 		except Exception:
 			self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
 			screenshot = raw_screenshot
 
-		viewport = await self._viewport(page)
 		tabs = await self._tabs()
 		title = await self._page_title(page)
 		return BrowserObservation(
@@ -603,6 +634,50 @@ class BrowserRuntime:
 				failure=screenshot_error,
 				failure_description='failed with Page.captureScreenshot protocol error',
 			)
+
+	@staticmethod
+	def _annotate_element_screenshot(
+		screenshot: bytes,
+		elements: Sequence[ElementRef],
+		viewport: Mapping[str, int],
+	) -> bytes:
+		"""Draw element IDs on screenshot pixels instead of injecting page overlays."""
+
+		width = int(viewport.get('width', 0))
+		height = int(viewport.get('height', 0))
+		if not screenshot or width <= 0 or height <= 0 or not elements:
+			return screenshot
+		try:
+			from PIL import Image, ImageDraw, ImageFont
+
+			with Image.open(io.BytesIO(screenshot)).convert('RGBA') as image:
+				draw = ImageDraw.Draw(image)
+				font = ImageFont.load_default()
+				scale_x = image.width / width
+				scale_y = image.height / height
+				for element in elements:
+					left = max(0.0, element.x)
+					top = max(0.0, element.y)
+					right = min(float(width), element.x + element.width)
+					bottom = min(float(height), element.y + element.height)
+					if right <= left or bottom <= top:
+						continue
+					box = (left * scale_x, top * scale_y, right * scale_x, bottom * scale_y)
+					draw.rectangle(box, outline=(255, 45, 85, 255), width=max(1, round(2 * min(scale_x, scale_y))))
+					label = str(element.index)
+					label_box = draw.textbbox((box[0], box[1]), label, font=font)
+					label_width = label_box[2] - label_box[0] + 4
+					label_height = label_box[3] - label_box[1] + 2
+					label_top = max(0.0, box[1] - label_height)
+					draw.rectangle((box[0], label_top, box[0] + label_width, label_top + label_height), fill=(255, 45, 85, 255))
+					draw.text((box[0] + 2, label_top + 1), label, fill=(255, 255, 255, 255), font=font)
+				buffer = io.BytesIO()
+				image.save(buffer, format='PNG')
+				return buffer.getvalue()
+		except Exception:
+			# Screenshot annotation is a debugging aid.  A stripped-down evaluator
+			# image or absent Pillow must not prevent the textual observation.
+			return screenshot
 
 	@staticmethod
 	def _is_capture_screenshot_protocol_error(error: PlaywrightError) -> bool:
@@ -696,13 +771,16 @@ class BrowserRuntime:
 			previous_page = page
 			previous_url = page.url
 			known_page_ids = {id(item) for item in self._live_owned_pages()}
+			dialog_cursor = self._next_dialog_id
 			await self._clear_markers(remove_attributes=False)
 
 			result = await self._perform_action(action, params)
 			if action not in {'wait'} and self.page is not None and not self.page.is_closed():
 				await self.page.wait_for_timeout(200)
+			await self._drain_dialog_tasks()
 			await self._enforce_search_policy(previous_page, previous_url, known_page_ids)
-			return result
+			await self._drain_dialog_tasks()
+			return self._append_dialog_outcome(result, since_id=dialog_cursor)
 
 	def capture_payload(self) -> dict[str, Any]:
 		"""Return the official ``capture.json`` envelope.
@@ -740,6 +818,7 @@ class BrowserRuntime:
 			for event, handler in self._page_handlers.pop(id(page), []):
 				with contextlib.suppress(Exception):
 					page.remove_listener(event, handler)
+		await self._drain_dialog_tasks()
 		await self._cancel_screenshot_recovery_tasks()
 		await self._drain_background_tasks()
 		await self._drain_download_tasks()
@@ -797,13 +876,16 @@ class BrowserRuntime:
 			frame_handler = lambda frame, owner=page: self._on_frame_navigated(owner, frame)
 			download_handler = self._on_download
 			close_handler = lambda owner=page: self._on_page_closed(owner)
+			dialog_handler = lambda dialog, owner=page: self._on_dialog(owner, dialog)
 			page.on('framenavigated', frame_handler)
 			page.on('download', download_handler)
 			page.on('close', close_handler)
+			page.on('dialog', dialog_handler)
 			self._page_handlers[id(page)] = [
 				('framenavigated', frame_handler),
 				('download', download_handler),
 				('close', close_handler),
+				('dialog', dialog_handler),
 			]
 		if make_active:
 			self.page = page
@@ -859,11 +941,65 @@ class BrowserRuntime:
 		self._spawn_background(self._configure_owned_page(page))
 
 	def _on_page_closed(self, page: Page) -> None:
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
 		if self.page is page:
 			live = [item for item in self._owned_pages if item is not page and not item.is_closed()]
 			self.page = live[-1] if live else None
 
+	def _on_dialog(self, page: Page, dialog: Dialog) -> None:
+		"""Record and dismiss a native dialog without letting it block the browser.
+
+		Playwright auto-dismisses dialogs only when no listener exists.  Once this
+		listener is registered, dismissal becomes our responsibility; doing it in a
+		task keeps the event callback synchronous while still allowing the action
+		that triggered the dialog to settle normally.
+		"""
+
+		message = str(dialog.message).strip()
+		record = {
+			'id': self._next_dialog_id,
+			'type': str(dialog.type),
+			'message': message[:_MAX_DIALOG_MESSAGE],
+			'url': str(page.url),
+		}
+		self._next_dialog_id += 1
+		self._recent_dialogs.append(record)
+		if len(self._recent_dialogs) > _MAX_RECENT_DIALOGS:
+			del self._recent_dialogs[:-_MAX_RECENT_DIALOGS]
+		self.logger.info('Browser dialog on %s: [%s] %s', redact_cdp_url(record['url']), record['type'], record['message'])
+		self._spawn_dialog(self._dismiss_dialog(dialog))
+
+	async def _dismiss_dialog(self, dialog: Dialog) -> None:
+		"""Preserve the old no-listener behavior after retaining the diagnostic."""
+
+		with contextlib.suppress(PlaywrightError):
+			await dialog.dismiss()
+
+	def _append_dialog_outcome(self, result: str, *, since_id: int) -> str:
+		new_dialogs = [record for record in self._recent_dialogs if int(record['id']) >= since_id]
+		if not new_dialogs:
+			return result
+		return result + '\nBrowser dialogs observed (untrusted):\n' + self._render_dialog_lines(new_dialogs)
+
+	def _dialog_observation_text(self) -> str:
+		if not self._recent_dialogs:
+			return ''
+		return 'Recent browser dialogs (untrusted):\n' + self._render_dialog_lines(self._recent_dialogs) + '\n\n'
+
+	@staticmethod
+	def _render_dialog_lines(records: Sequence[Mapping[str, Any]]) -> str:
+		return '\n'.join(
+			f'  [{str(record.get("type", "dialog"))}] {str(record.get("message", ""))}'
+			for record in records
+		)
+
 	def _on_frame_navigated(self, page: Page, frame: Frame) -> None:
+		# backendNodeId is scoped to one document and can be reused after any frame
+		# navigation.  Conservatively invalidate the complete observation instead
+		# of risking a stale index operating on a different control.
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
 		if frame is not page.main_frame:
 			return
 		self._page_document_generations[id(page)] = self._page_document_generations.get(id(page), 0) + 1
@@ -1215,47 +1351,107 @@ class BrowserRuntime:
 	async def _perform_action(self, action: str, params: dict[str, Any]) -> str:
 		page = self._active_page()
 		if action == 'click':
-			locator = self._target_locator(params)
-			await locator.click(timeout=self.action_timeout_ms)
-			return f'clicked element {self._target_index(params)}'
+			if self._has_explicit_selector(params):
+				await self._target_locator(params).click(timeout=self.action_timeout_ms)
+				return 'clicked selected element'
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				await self._backend_click(binding, index)
+			else:
+				await self._locator_for_index(index).click(timeout=self.action_timeout_ms)
+			return f'clicked element {index}'
 		if action == 'double_click':
-			locator = self._target_locator(params)
-			await locator.dblclick(timeout=self.action_timeout_ms)
-			return f'double-clicked element {self._target_index(params)}'
+			if self._has_explicit_selector(params):
+				await self._target_locator(params).dblclick(timeout=self.action_timeout_ms)
+				return 'double-clicked selected element'
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				await self._backend_click(binding, index, click_count=2)
+			else:
+				await self._locator_for_index(index).dblclick(timeout=self.action_timeout_ms)
+			return f'double-clicked element {index}'
 		if action == 'type':
-			locator = self._target_locator(params)
 			text = str(self._first(params, 'text', 'value', 'input_text', default=''))
-			try:
-				await locator.fill(text, timeout=self.action_timeout_ms)
-			except Exception:
-				await locator.click(timeout=self.action_timeout_ms)
-				await locator.press('ControlOrMeta+A', timeout=self.action_timeout_ms)
-				await locator.type(text, timeout=self.action_timeout_ms)
-			if self._as_bool(self._first(params, 'submit', default=False)):
-				await locator.press('Enter', timeout=self.action_timeout_ms)
-			return f'typed into element {self._target_index(params)}'
+			submit = self._as_bool(self._first(params, 'submit', default=False))
+			if self._has_explicit_selector(params):
+				locator = self._target_locator(params)
+				try:
+					await locator.fill(text, timeout=self.action_timeout_ms)
+				except Exception:
+					await locator.click(timeout=self.action_timeout_ms)
+					await locator.press('ControlOrMeta+A', timeout=self.action_timeout_ms)
+					await locator.type(text, timeout=self.action_timeout_ms)
+				if submit:
+					await locator.press('Enter', timeout=self.action_timeout_ms)
+				return 'typed into selected element'
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				await self._backend_type(binding, index, text, submit=submit)
+			else:
+				locator = self._locator_for_index(index)
+				try:
+					await locator.fill(text, timeout=self.action_timeout_ms)
+				except Exception:
+					await locator.click(timeout=self.action_timeout_ms)
+					await locator.press('ControlOrMeta+A', timeout=self.action_timeout_ms)
+					await locator.type(text, timeout=self.action_timeout_ms)
+				if submit:
+					await locator.press('Enter', timeout=self.action_timeout_ms)
+			return f'typed into element {index}'
 		if action == 'select':
-			locator = self._target_locator(params)
 			value = self._first(params, 'value', 'text', 'option')
 			if value is None:
 				raise ValueError('select requires value/text/option')
-			try:
-				selected = await locator.select_option(value=str(value), timeout=self.action_timeout_ms)
-			except Exception:
-				selected = await locator.select_option(label=str(value), timeout=self.action_timeout_ms)
-			return f'selected {selected!r} on element {self._target_index(params)}'
+			if self._has_explicit_selector(params):
+				locator = self._target_locator(params)
+				try:
+					selected = await locator.select_option(value=str(value), timeout=self.action_timeout_ms)
+				except Exception:
+					selected = await locator.select_option(label=str(value), timeout=self.action_timeout_ms)
+				return f'selected {selected!r} on selected element'
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				selected = await self._backend_select(binding, index, str(value))
+			else:
+				locator = self._locator_for_index(index)
+				try:
+					selected = await locator.select_option(value=str(value), timeout=self.action_timeout_ms)
+				except Exception:
+					selected = await locator.select_option(label=str(value), timeout=self.action_timeout_ms)
+			return f'selected {selected!r} on element {index}'
 		if action == 'press':
 			key = str(self._first(params, 'key', 'text', 'value', default='Enter'))
 			if self._has_target(params):
-				await self._target_locator(params).press(key, timeout=self.action_timeout_ms)
+				if self._has_explicit_selector(params):
+					await self._target_locator(params).press(key, timeout=self.action_timeout_ms)
+				else:
+					index = self._target_index(params)
+					binding = self._binding_for_index(index)
+					if self._is_backend_binding(binding):
+						await self._backend_focus(binding, index)
+						await page.keyboard.press(key)
+					else:
+						await self._locator_for_index(index).press(key, timeout=self.action_timeout_ms)
 			else:
 				await page.keyboard.press(key)
 			return f'pressed {key}'
 		if action == 'scroll':
 			return await self._scroll(params)
 		if action == 'hover':
-			await self._target_locator(params).hover(timeout=self.action_timeout_ms)
-			return f'hovered element {self._target_index(params)}'
+			if self._has_explicit_selector(params):
+				await self._target_locator(params).hover(timeout=self.action_timeout_ms)
+				return 'hovered selected element'
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				await self._backend_hover(binding, index)
+			else:
+				await self._locator_for_index(index).hover(timeout=self.action_timeout_ms)
+			return f'hovered element {index}'
 		if action == 'xy':
 			x = float(self._required(params, 'x'))
 			y = float(self._required(params, 'y'))
@@ -1311,7 +1507,7 @@ class BrowserRuntime:
 		if amount_value is None and self._first(params, 'pages') is not None:
 			viewport = await self._viewport(self._active_page())
 			axis_size = viewport['height'] if direction in {'up', 'down'} else viewport['width']
-			amount_value = max(axis_size, 600) * float(self._first(params, 'pages'))
+			amount_value = max(axis_size * 0.5, 300) * float(self._first(params, 'pages'))
 		amount = abs(float(amount_value if amount_value is not None else 600))
 		delta_x = float(self._first(params, 'delta_x', 'dx', default=0))
 		delta_y = float(self._first(params, 'delta_y', 'dy', default=0))
@@ -1321,8 +1517,9 @@ class BrowserRuntime:
 			else:
 				delta_x = -amount if direction == 'left' else amount
 		if self._has_target(params):
-			result = await self._target_locator(params).evaluate(
-				"""(element, delta) => {
+			if self._has_explicit_selector(params):
+				result = await self._target_locator(params).evaluate(
+					"""(element, delta) => {
 					const permitsScroll = (node, axis) => {
 						const style = getComputedStyle(node);
 						const overflow = axis === 'x' ? style.overflowX : style.overflowY;
@@ -1349,8 +1546,37 @@ class BrowserRuntime:
 						afterY: target.scrollTop,
 					};
 				}""",
-				{'x': delta_x, 'y': delta_y},
-			)
+					{'x': delta_x, 'y': delta_y},
+				)
+			else:
+				index = self._target_index(params)
+				binding = self._binding_for_index(index)
+				if self._is_backend_binding(binding):
+					await self._backend_scroll(binding, index, delta_x, delta_y)
+					return f'scrolled element {index} with Playwright pointer wheel; requested ({delta_x:g}, {delta_y:g})'
+				else:
+					result = await self._locator_for_index(index).evaluate(
+						"""(element, delta) => {
+							const permitsScroll = (node, axis) => {
+								const style = getComputedStyle(node);
+								const overflow = axis === 'x' ? style.overflowX : style.overflowY;
+								const hasRange = axis === 'x'
+									? node.scrollWidth > node.clientWidth + 1
+									: node.scrollHeight > node.clientHeight + 1;
+								return hasRange && /(auto|scroll|overlay)/.test(overflow);
+							};
+							let target = element;
+							while (target && !permitsScroll(target, 'x') && !permitsScroll(target, 'y')) {
+								target = target.parentElement;
+							}
+							target = target || document.scrollingElement || document.documentElement;
+							const beforeX = target.scrollLeft;
+							const beforeY = target.scrollTop;
+							target.scrollBy(delta.x, delta.y);
+							return {tag: target.tagName.toLowerCase(), id: target.id || '', className: typeof target.className === 'string' ? target.className : '', beforeX, beforeY, afterX: target.scrollLeft, afterY: target.scrollTop};
+						}""",
+						{'x': delta_x, 'y': delta_y},
+					)
 			target_name = str(result.get('tag', 'element'))
 			if result.get('id'):
 				target_name += f'#{result["id"]}'
@@ -1365,13 +1591,34 @@ class BrowserRuntime:
 
 	async def _drag(self, params: dict[str, Any]) -> str:
 		if self._first(params, 'source_index', 'from_index') is not None:
-			source = self._locator_for_index(int(self._first(params, 'source_index', 'from_index')))
+			source_index = int(self._first(params, 'source_index', 'from_index'))
 			target_value = self._first(params, 'target_index', 'to_index')
 			if target_value is None:
 				raise ValueError('element drag requires target_index/to_index')
-			target = self._locator_for_index(int(target_value))
-			await source.drag_to(target, timeout=self.action_timeout_ms)
-			return f'dragged element {self._first(params, "source_index", "from_index")} to {target_value}'
+			target_index = int(target_value)
+			source_binding = self._binding_for_index(source_index)
+			target_binding = self._binding_for_index(target_index)
+			if self._is_backend_binding(source_binding) and self._is_backend_binding(target_binding):
+				# A drag cannot safely auto-scroll source and target independently: the
+				# second scroll could invalidate the first point before mouse-down.
+				start_x, start_y = await self._backend_pointer(source_binding, source_index, ensure_visible=False)
+				end_x, end_y = await self._backend_pointer(target_binding, target_index, ensure_visible=False)
+				viewport = await self._viewport(self._active_page())
+				if not (
+					self._point_in_viewport(start_x, start_y, viewport)
+					and self._point_in_viewport(end_x, end_y, viewport)
+				):
+					raise ValueError('Both drag endpoints must be visible; scroll and observe before dragging')
+				mouse = self._active_page().mouse
+				await mouse.move(start_x, start_y)
+				await mouse.down()
+				await mouse.move(end_x, end_y, steps=12)
+				await mouse.up()
+			else:
+				source = self._locator_for_index(source_index)
+				target = self._locator_for_index(target_index)
+				await source.drag_to(target, timeout=self.action_timeout_ms)
+			return f'dragged element {source_index} to {target_index}'
 		start_x = float(self._first(params, 'start_x', 'from_x', 'x1', 'x'))
 		start_y = float(self._first(params, 'start_y', 'from_y', 'y1', 'y'))
 		end_x = float(self._first(params, 'end_x', 'to_x', 'x2'))
@@ -1414,12 +1661,21 @@ class BrowserRuntime:
 		else:
 			page = self._select_tab(params, pages)
 		self.page = page
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
 		await page.bring_to_front()
 		return f'switched to tab {pages.index(page)}: {page.url}'
 
 	async def _read(self, params: dict[str, Any]) -> str:
 		if self._has_target(params):
-			text = await self._target_locator(params).inner_text(timeout=self.action_timeout_ms)
+			if self._has_explicit_selector(params):
+				text = await self._target_locator(params).inner_text(timeout=self.action_timeout_ms)
+				return text[:_MAX_PAGE_TEXT]
+			index = self._target_index(params)
+			binding = self._binding_for_index(index)
+			if self._is_backend_binding(binding):
+				return await self._backend_read(binding, index)
+			text = await self._locator_for_index(index).inner_text(timeout=self.action_timeout_ms)
 			return text[:_MAX_PAGE_TEXT]
 		return await self._collect_page_text(self._active_page())
 
@@ -1462,7 +1718,9 @@ class BrowserRuntime:
 									tag: (interactive || element).tagName.toLowerCase(),
 									id: (interactive || element).id || '',
 									href: anchor ? anchor.href : '',
-									interactiveIndex: (interactive || element).getAttribute('data-webretriever-index') || '',
+									// Kept empty solely for compatibility with older locator adapters.
+									// Element identity is never read from or written to the page DOM.
+									interactiveIndex: '',
 									inViewport: rect.bottom > 0 && rect.right > 0
 										&& rect.top < window.innerHeight && rect.left < window.innerWidth,
 									revealed,
@@ -1480,8 +1738,6 @@ class BrowserRuntime:
 							details.append('revealed_for_next_observation=true')
 						if metadata.get('id'):
 							details.append(f'id={metadata["id"]}')
-						if metadata.get('interactiveIndex'):
-							details.append(f'element_id={metadata["interactiveIndex"]}')
 						if metadata.get('href'):
 							details.append(f'href={metadata["href"]}')
 						matches.append(f'frame {frame_index}: {text[:500]} | {" | ".join(details)}')
@@ -2033,7 +2289,61 @@ class BrowserRuntime:
 			self._rollback_pages.discard(id(page))
 
 	async def _collect_elements(self, page: Page) -> list[ElementRef]:
+		"""Collect indexed controls with CDP, falling back only when unavailable.
+
+		The normal path never writes an identifier into the page.  ``backendNodeId``
+		is retained privately in ``_ElementBinding`` while the model continues to
+		use this observation's small, globally unique integer indices.
+		"""
+
+		try:
+			collected = await collect_interactive_elements(self.context, page, logger=self.logger)
+		except CdpCollectionError as exc:
+			self.logger.warning('CDP DOM collection unavailable; using legacy marker collector: %s', exc)
+			return await self._collect_legacy_elements(page)
+
 		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
+		result: list[ElementRef] = []
+		bindings: dict[int, _ElementBinding] = {}
+		for index, item in enumerate(collected):
+			ref = ElementRef(
+				index=index,
+				tag=item.tag,
+				text=item.text,
+				role=item.role,
+				name=item.name,
+				placeholder=item.placeholder,
+				href=item.href,
+				input_type=item.input_type,
+				frame_index=item.frame_index,
+				frame_url=item.frame_url,
+				x=item.x,
+				y=item.y,
+				width=item.width,
+				height=item.height,
+				backend_node_id=item.backend_node_id,
+				frame_id=item.frame_id,
+				signals=item.signals,
+			)
+			result.append(ref)
+			bindings[index] = _ElementBinding(
+				frame=item.frame,
+				backend_node_id=item.backend_node_id,
+				cdp_target=item.cdp_target,
+				coordinate_frame=item.coordinate_frame,
+				frame_id=item.frame_id,
+				read_text=item.read_text,
+				options=item.options,
+			)
+		self._element_bindings = bindings
+		return result
+
+	async def _collect_legacy_elements(self, page: Page) -> list[ElementRef]:
+		"""Compatibility fallback for test doubles or an unavailable CDP target."""
+
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = True
 		result: list[ElementRef] = []
 		next_index = 0
 		for frame_index, frame in enumerate(page.frames):
@@ -2077,6 +2387,11 @@ class BrowserRuntime:
 		return result
 
 	async def _clear_markers(self, *, remove_attributes: bool) -> None:
+		# The normal CDP collector never injects DOM state. Avoid even querying for
+		# our legacy class in that path: a business page could coincidentally use the
+		# same class name, and removing it would violate the non-mutating contract.
+		if not self._legacy_marker_bindings_active:
+			return
 		page = self.page
 		if page is None or page.is_closed():
 			return
@@ -2087,9 +2402,11 @@ class BrowserRuntime:
 					{
 						'markerAttribute': _INTERACTIVE_ATTRIBUTE,
 						'overlayClass': _OVERLAY_CLASS,
-						'removeAttributes': remove_attributes,
+						'removeAttributes': remove_attributes and self._legacy_marker_bindings_active,
 					},
 				)
+		if remove_attributes:
+			self._legacy_marker_bindings_active = False
 
 	async def _collect_page_text(self, page: Page) -> str:
 		parts: list[str] = []
@@ -2140,6 +2457,238 @@ class BrowserRuntime:
 		except Exception:
 			return ''
 
+	def _binding_for_index(self, index: int) -> _ElementBinding:
+		binding = self._element_bindings.get(index)
+		if binding is None:
+			raise ValueError(f'Unknown element index {index}; call observe() before interacting')
+		return binding
+
+	@staticmethod
+	def _is_backend_binding(binding: _ElementBinding) -> bool:
+		return binding.backend_node_id > 0 and binding.cdp_target is not None
+
+	def _target_binding(self, params: Mapping[str, Any]) -> _ElementBinding:
+		return self._binding_for_index(self._target_index(params))
+
+	@staticmethod
+	def _has_explicit_selector(params: Mapping[str, Any]) -> bool:
+		return params.get('selector') is not None
+
+	def _stale_element_error(self, index: int) -> ValueError:
+		message = f'Element {index} is stale or the page changed; call observe() to obtain current element IDs'
+		return ValueError(message)
+
+	@contextlib.asynccontextmanager
+	async def _backend_session(self, binding: _ElementBinding, index: int):
+		"""Create a short-lived, read-only CDP session for an observed node."""
+
+		if binding.cdp_target is None:
+			raise ValueError('Observed element has no CDP backend binding')
+		active_page = self._active_page()
+		try:
+			binding_page = binding.frame.page
+		except Exception:
+			binding_page = active_page
+		if binding_page is not active_page:
+			raise self._stale_element_error(index)
+		session: CDPSession | None = None
+		try:
+			session = await self.context.new_cdp_session(binding.cdp_target)
+			yield session
+		finally:
+			if session is not None:
+				with contextlib.suppress(Exception):
+					await session.detach()
+
+	async def _ensure_coordinate_frame_visible(self, binding: _ElementBinding, index: int) -> None:
+		"""Use Playwright to reveal an iframe host before pointer interaction."""
+
+		page = self._active_page()
+		frame = binding.coordinate_frame or binding.frame
+		if frame is page.main_frame:
+			return
+		try:
+			owner = await frame.frame_element()
+			await owner.scroll_into_view_if_needed(timeout=self.action_timeout_ms)
+		except Exception as exc:
+			raise self._stale_element_error(index) from exc
+
+	@staticmethod
+	def _quad_center(quads: Any) -> tuple[float, float] | None:
+		best: tuple[float, float, float] | None = None
+		for quad in quads or []:
+			if not isinstance(quad, Sequence) or isinstance(quad, (str, bytes)) or len(quad) < 8:
+				continue
+			try:
+				xs = [float(quad[position]) for position in range(0, 8, 2)]
+				ys = [float(quad[position]) for position in range(1, 8, 2)]
+			except (TypeError, ValueError):
+				continue
+			width = max(xs) - min(xs)
+			height = max(ys) - min(ys)
+			area = max(0.0, width * height)
+			candidate = (area, sum(xs) / len(xs), sum(ys) / len(ys))
+			if best is None or candidate[0] > best[0]:
+				best = candidate
+		return (best[1], best[2]) if best is not None else None
+
+	async def _backend_raw_pointer(self, binding: _ElementBinding, index: int) -> tuple[float, float]:
+		"""Read a current CDP quad without changing page state."""
+
+		try:
+			async with self._backend_session(binding, index) as session:
+				center: tuple[float, float] | None = None
+				try:
+					quads_result = await session.send('DOM.getContentQuads', {'backendNodeId': binding.backend_node_id})
+					center = self._quad_center(quads_result.get('quads') if isinstance(quads_result, Mapping) else None)
+				except Exception as exc:
+					self.logger.debug('Could not read CDP content quads for element %s: %s', index, exc)
+				if center is None:
+					try:
+						box_result = await session.send('DOM.getBoxModel', {'backendNodeId': binding.backend_node_id})
+						model = box_result.get('model') if isinstance(box_result, Mapping) else None
+						center = self._quad_center([model.get('content')]) if isinstance(model, Mapping) else None
+					except Exception as exc:
+						self.logger.debug('Could not read CDP box model for element %s: %s', index, exc)
+			if center is None:
+				raise RuntimeError('the backend node has no usable content quad')
+		except Exception as exc:
+			raise self._stale_element_error(index) from exc
+		return center
+
+	async def _backend_viewport_point(self, binding: _ElementBinding, index: int) -> tuple[float, float]:
+		"""Project an observed node's read-only CDP quad into the top viewport."""
+
+		x, y = await self._backend_raw_pointer(binding, index)
+		if binding.coordinate_frame is None:
+			return x, y
+		try:
+			owner = await binding.coordinate_frame.frame_element()
+			box = await owner.bounding_box()
+			metrics = await owner.evaluate(
+				'(element) => ({left: element.clientLeft, top: element.clientTop, '
+				'offsetWidth: element.offsetWidth, offsetHeight: element.offsetHeight})'
+			)
+			if not box:
+				raise RuntimeError('iframe owner has no bounding box')
+			left = float(metrics.get('left', 0)) if isinstance(metrics, Mapping) else 0.0
+			top = float(metrics.get('top', 0)) if isinstance(metrics, Mapping) else 0.0
+			offset_width = float(metrics.get('offsetWidth', 0)) if isinstance(metrics, Mapping) else 0.0
+			offset_height = float(metrics.get('offsetHeight', 0)) if isinstance(metrics, Mapping) else 0.0
+			scale_x = float(box['width']) / offset_width if offset_width > 0 else 1.0
+			scale_y = float(box['height']) / offset_height if offset_height > 0 else 1.0
+			return float(box['x']) + (left + x) * scale_x, float(box['y']) + (top + y) * scale_y
+		except Exception as exc:
+			raise self._stale_element_error(index) from exc
+
+	@staticmethod
+	def _point_in_viewport(x: float, y: float, viewport: Mapping[str, int]) -> bool:
+		return 0 <= x < float(viewport.get('width', 0)) and 0 <= y < float(viewport.get('height', 0))
+
+	async def _scroll_towards_backend_point(
+		self,
+		binding: _ElementBinding,
+		x: float,
+		y: float,
+		viewport: Mapping[str, int],
+	) -> None:
+		"""Use Playwright wheel input to reveal a nearby observed target."""
+
+		page = self._active_page()
+		if binding.frame is not page.main_frame:
+			with contextlib.suppress(Exception):
+				owner = await binding.frame.frame_element()
+				box = await owner.bounding_box()
+				if box:
+					await page.mouse.move(float(box['x']) + float(box['width']) / 2, float(box['y']) + float(box['height']) / 2)
+		else:
+			# Mouse wheel follows the element under the pointer. Keep a root-page
+			# reveal from accidentally scrolling an iframe or nested scroller that
+			# happened to receive the prior action.
+			await page.mouse.move(1, 1)
+		width = max(1.0, float(viewport.get('width', 0)))
+		height = max(1.0, float(viewport.get('height', 0)))
+		delta_x = x - width / 2 if x < 0 or x >= width else 0.0
+		delta_y = y - height / 2 if y < 0 or y >= height else 0.0
+		if delta_x or delta_y:
+			await page.mouse.wheel(delta_x, delta_y)
+			await page.wait_for_timeout(50)
+
+	async def _backend_pointer(
+		self,
+		binding: _ElementBinding,
+		index: int,
+		*,
+		ensure_visible: bool = True,
+	) -> tuple[float, float]:
+		"""Resolve a node with CDP, but reveal and act through Playwright only."""
+
+		await self._ensure_coordinate_frame_visible(binding, index)
+		x, y = await self._backend_viewport_point(binding, index)
+		if not ensure_visible:
+			return x, y
+		for _ in range(2):
+			viewport = await self._viewport(self._active_page())
+			if self._point_in_viewport(x, y, viewport):
+				return x, y
+			await self._scroll_towards_backend_point(binding, x, y, viewport)
+			x, y = await self._backend_viewport_point(binding, index)
+		viewport = await self._viewport(self._active_page())
+		if not self._point_in_viewport(x, y, viewport):
+			raise ValueError(f'Element {index} is outside the current viewport; scroll and observe before interacting')
+		return x, y
+
+	async def _backend_focus(self, binding: _ElementBinding, index: int) -> None:
+		# A real Playwright click yields focus for input-capable controls, including
+		# controls in a closed shadow tree that have no public locator.
+		await self._backend_click(binding, index)
+
+	async def _backend_click(self, binding: _ElementBinding, index: int, *, click_count: int = 1) -> None:
+		x, y = await self._backend_pointer(binding, index)
+		await self._active_page().mouse.click(x, y, click_count=click_count)
+
+	async def _backend_hover(self, binding: _ElementBinding, index: int) -> None:
+		x, y = await self._backend_pointer(binding, index)
+		await self._active_page().mouse.move(x, y)
+
+	async def _backend_type(self, binding: _ElementBinding, index: int, text: str, *, submit: bool) -> None:
+		await self._backend_focus(binding, index)
+		keyboard = self._active_page().keyboard
+		await keyboard.press('ControlOrMeta+A')
+		await keyboard.press('Backspace')
+		insert_text = getattr(keyboard, 'insert_text', None)
+		if callable(insert_text):
+			await insert_text(text)
+		else:
+			await keyboard.type(text)
+		if submit:
+			await keyboard.press('Enter')
+
+	async def _backend_select(self, binding: _ElementBinding, index: int, value: str) -> list[str]:
+		matched = next(
+			((position, option_value) for position, (option_value, label) in enumerate(binding.options) if value in {option_value, label}),
+			None,
+		)
+		if matched is None:
+			raise ValueError(f'No option matching {value!r} exists on element {index}; observe again if choices changed')
+		position, selected_value = matched
+		await self._backend_focus(binding, index)
+		keyboard = self._active_page().keyboard
+		await keyboard.press('Home')
+		for _ in range(position):
+			await keyboard.press('ArrowDown')
+		await keyboard.press('Enter')
+		return [selected_value]
+
+	async def _backend_read(self, binding: _ElementBinding, index: int) -> str:
+		return binding.read_text[:_MAX_PAGE_TEXT]
+
+	async def _backend_scroll(self, binding: _ElementBinding, index: int, delta_x: float, delta_y: float) -> None:
+		x, y = await self._backend_pointer(binding, index)
+		mouse = self._active_page().mouse
+		await mouse.move(x, y)
+		await mouse.wheel(delta_x, delta_y)
+
 	def _target_locator(self, params: Mapping[str, Any]) -> Locator:
 		selector = self._first(params, 'selector')
 		if selector is not None:
@@ -2147,9 +2696,9 @@ class BrowserRuntime:
 		return self._locator_for_index(self._target_index(params))
 
 	def _locator_for_index(self, index: int) -> Locator:
-		binding = self._element_bindings.get(index)
-		if binding is None:
-			raise ValueError(f'Unknown element index {index}; call observe() before interacting')
+		binding = self._binding_for_index(index)
+		if not binding.selector:
+			raise ValueError(f'Element {index} is backend-bound and must be acted on through its current CDP binding')
 		return binding.frame.locator(binding.selector).first
 
 	def _target_index(self, params: Mapping[str, Any]) -> int:
@@ -2253,10 +2802,20 @@ class BrowserRuntime:
 		task = asyncio.create_task(coroutine)
 		self._policy_tasks.add(task)
 
+	def _spawn_dialog(self, coroutine: Coroutine[Any, Any, Any]) -> None:
+		task = asyncio.create_task(coroutine)
+		self._dialog_tasks.add(task)
+
 	async def _drain_policy_tasks(self) -> None:
 		while self._policy_tasks:
 			tasks = tuple(self._policy_tasks)
 			self._policy_tasks.difference_update(tasks)
+			await asyncio.gather(*tasks, return_exceptions=True)
+
+	async def _drain_dialog_tasks(self) -> None:
+		while self._dialog_tasks:
+			tasks = tuple(self._dialog_tasks)
+			self._dialog_tasks.difference_update(tasks)
 			await asyncio.gather(*tasks, return_exceptions=True)
 
 	async def _drain_background_tasks(self) -> None:
@@ -2290,7 +2849,16 @@ class BrowserRuntime:
 	@staticmethod
 	def _decision_dict(decision: AgentDecision | Mapping[str, Any]) -> dict[str, Any]:
 		if isinstance(decision, Mapping):
-			return dict(decision)
+			data = dict(decision)
+			for field_name in CHECKPOINT_DECISION_FIELDS:
+				data.pop(field_name, None)
+			return data
+		action_payload = getattr(decision, 'action_payload', None)
+		if callable(action_payload):
+			dumped = action_payload()
+			if not isinstance(dumped, Mapping):
+				raise TypeError('AgentDecision.action_payload() did not return a mapping')
+			return {str(key): value for key, value in dumped.items()}
 		model_dump = getattr(decision, 'model_dump', None)
 		if callable(model_dump):
 			dumped = model_dump(exclude_none=True)

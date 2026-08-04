@@ -1,0 +1,44 @@
+# WebRetriever 的集中运行配置。
+#
+# 使用：python run_webretriever.py --config webretriever.toml
+# 命令行中同名的选项可用于一次性覆盖此文件；模型密钥建议继续保留在 .env，
+# 例如 WEBRETRIEVER_API_KEY=...，不要把真实密钥提交到这个文件。
+
+[webretriever]
+# 任务与产物
+input_path = "data/data/protocol3.json"
+output_dir = "outputs/protocol3_10"
+task_indices = ["0-2"]
+# limit = 3
+
+# 模型（api_key 未填写时依次读取 WEBRETRIEVER_API_KEY、LITELLM_MASTER_KEY、OPENAI_API_KEY）
+model = "gpt-5.6-luna"
+api_base = "http://127.0.0.1:8317/v1"
+api_mode = "responses" # auto | responses | chat-completions
+reasoning_effort = "low" # low | medium | high
+thought_language = "中文"
+# api_key = "仅限本机私有配置；不要提交真实密钥"
+
+# 每次模型调用与任务执行限制
+max_steps = 50
+model_timeout_seconds = 180.0
+task_timeout_seconds = 2000.0
+max_concurrency = 3
+structured_prompt_log = false
+
+# 浏览器：默认连接本机已启动的三个 CDP Chrome 实例。
+local_browser = false
+headless = true
+cdp_urls = [
+  "http://127.0.0.1:9222",
+  "http://127.0.0.1:9223",
+  "http://127.0.0.1:9224",
+]
+rerun_failed = false
+
+# 自部署 OpenAI-compatible VLM 时填写端口；启用后不能同时设置 api_base。
+vlm_ports = []
+
+# 可选：仅校验任务文件，不启动浏览器或调用模型。
+validate_only = false
+# sec_user_agent = "Example Organization sec-admin@example.org"

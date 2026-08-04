@@ -307,6 +307,23 @@ def test_search_detection_does_not_use_unsafe_substrings() -> None:
 	assert not is_forbidden_search_url('https://notgoogle.com/search?q=x')
 
 
+def test_browser_action_dispatch_strips_strategy_checkpoint_metadata() -> None:
+	decision = AgentDecision(
+		action='wait',
+		seconds=0.1,
+		checkpoint_strategy_catalog='Tried table route; untried export route.',
+		checkpoint_active_strategy='Inspect the export.',
+		checkpoint_confirmed_infeasible='None confirmed.',
+		checkpoint_next_strategies='Export first.',
+	)
+
+	assert not any(key.startswith('checkpoint_') for key in BrowserRuntime._decision_dict(decision))
+	assert not any(
+		key.startswith('checkpoint_')
+		for key in BrowserRuntime._decision_dict({'action': 'wait', 'seconds': 0.1, 'checkpoint_strategy_catalog': 'metadata'})
+	)
+
+
 @pytest.mark.parametrize('url', ['https://sec.gov', 'https://www.sec.gov/', 'https://data.sec.gov/submissions/CIK.json'])
 def test_sec_detection_matches_only_sec_hosts(url: str) -> None:
 	assert is_sec_url(url)
@@ -947,7 +964,7 @@ async def test_model_actions_double_click_hover_xy_drag_and_page_scroll(tmp_path
 	assert ('move', 10.0, 20.0, {}) in page.mouse.calls
 	assert ('move', 1.0, 2.0, {}) in page.mouse.calls
 	assert ('move', 101.0, 202.0, {'steps': 12}) in page.mouse.calls
-	assert ('wheel', 0.0, 1440.0) in page.mouse.calls
+	assert ('wheel', 0.0, 720.0) in page.mouse.calls
 
 
 async def test_scroll_pages_can_target_an_observed_element(tmp_path: Path) -> None:
@@ -958,8 +975,8 @@ async def test_scroll_pages_can_target_an_observed_element(tmp_path: Path) -> No
 
 	result = await runtime.execute(AgentDecision(action='scroll', element_id=2, direction='up', pages=1))
 
-	assert locator.calls == [('evaluate', {'x': 0.0, 'y': -720.0})]
-	assert result == 'scrolled nav#sidebar from (0, 100) to (0, 820); requested (0, -720)'
+	assert locator.calls == [('evaluate', {'x': 0.0, 'y': -360.0})]
+	assert result == 'scrolled nav#sidebar from (0, 100) to (0, 820); requested (0, -360)'
 
 
 async def test_direct_search_navigation_is_rejected_and_click_escape_is_rolled_back(tmp_path: Path) -> None:
@@ -1535,6 +1552,37 @@ async def test_observe_keeps_normal_target_blank_page_active(httpserver, tmp_pat
 			assert runtime.page is not None
 			assert runtime.page.url == target_url
 			assert len(context.pages) == 2
+		finally:
+			await runtime.close()
+			await browser.close()
+
+
+async def test_runtime_captures_and_dismisses_native_dialog(httpserver, tmp_path: Path) -> None:
+	httpserver.expect_request('/dialog-form').respond_with_data(
+		'''<html><body>
+		<button onclick="alert('Validation failed: select at least one day.')">Submit</button>
+		<p>Form remains usable after the alert.</p>
+		</body></html>''',
+		content_type='text/html',
+	)
+
+	async with async_playwright() as playwright:
+		browser = await playwright.chromium.launch(headless=True)
+		context = await browser.new_context()
+		runtime = BrowserRuntime(context, tmp_path, logging.getLogger('test-webretriever'))
+		try:
+			await runtime.start(httpserver.url_for('/dialog-form'))
+			initial = await runtime.observe(0)
+			submit = next(element for element in initial.elements if element.text == 'Submit')
+
+			result = await runtime.execute({'action': 'click', 'element_id': submit.index})
+			observation = await runtime.observe(1)
+
+			assert 'Browser dialogs observed (untrusted):' in result
+			assert '[alert] Validation failed: select at least one day.' in result
+			assert 'Recent browser dialogs (untrusted):' in observation.page_text
+			assert 'Validation failed: select at least one day.' in observation.page_text
+			assert 'Form remains usable after the alert.' in observation.page_text
 		finally:
 			await runtime.close()
 			await browser.close()

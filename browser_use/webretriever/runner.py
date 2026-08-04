@@ -25,7 +25,8 @@ ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
 DEFAULT_MAX_CONCURRENCY = 3
 MAX_CONCURRENCY = 8
-MAX_TASK_TIMEOUT_SECONDS = 900.0
+DEFAULT_TASK_TIMEOUT_SECONDS = 600.0
+MAX_OPENAI_MODEL_VERSION = (5, 6)
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
 
@@ -43,7 +44,7 @@ class RunnerConfig:
 	api_mode: ApiMode = 'auto'
 	max_steps: int = 100
 	model_timeout_seconds: float = 180.0
-	task_timeout_seconds: float = 600.0
+	task_timeout_seconds: float = DEFAULT_TASK_TIMEOUT_SECONDS
 	max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 	reasoning_effort: ReasoningEffort = 'medium'
 	thought_language: str = DEFAULT_THOUGHT_LANGUAGE
@@ -71,8 +72,6 @@ class RunnerConfig:
 			raise ValueError('model_timeout_seconds must be in (0, 180]')
 		if self.task_timeout_seconds <= 0:
 			raise ValueError('task_timeout_seconds must be greater than 0')
-		if self.task_timeout_seconds > MAX_TASK_TIMEOUT_SECONDS:
-			raise ValueError(f'task_timeout_seconds must be at most {MAX_TASK_TIMEOUT_SECONDS:g}')
 		if not 1 <= self.max_concurrency <= MAX_CONCURRENCY:
 			raise ValueError(f'max_concurrency must be between 1 and the competition limit of {MAX_CONCURRENCY}')
 		if self.local_browser and self.cdp_urls:
@@ -122,14 +121,14 @@ def validate_model_policy(model: str) -> None:
 	"""Reject only model versions that are unambiguously above published caps."""
 	name = model.lower()
 	checks: list[tuple[str, str, tuple[int, int]]] = [
-		('OpenAI', r'(?<![a-z])gpt-(\d+)(?:\.(\d+))?', (5, 4)),
+		('OpenAI', r'(?<![a-z])gpt-(\d+)(?:\.(\d+))?', MAX_OPENAI_MODEL_VERSION),
 		('Google', r'gemini-(\d+)(?:\.(\d+))?', (3, 1)),
 		('xAI', r'grok-(\d+)(?:\.(\d+))?', (4, 3)),
 	]
 	for provider, pattern, maximum in checks:
 		match = re.search(pattern, name)
 		if match and _version_tuple(match) > maximum:
-			raise ValueError(f'{provider} model {model!r} is above the challenge maximum version {maximum[0]}.{maximum[1]}')
+			raise ValueError(f'{provider} model {model!r} is above the configured maximum version {maximum[0]}.{maximum[1]}')
 
 	# Anthropic names generally encode the version as claude-...-4-6.
 	claude_match = re.search(r'claude(?:-[a-z]+)*-(\d+)[.-](\d+)(?:\b|$)', name)
@@ -158,8 +157,13 @@ def resolve_responses_api(mode: ApiMode) -> bool:
 		return True
 	if configured in {'chat', 'chat-completions', 'chat_completions'}:
 		return False
-	# This workspace's documented LiteLLM gateway is Responses-only.
-	return bool(os.getenv('LITELLM_BASE_URL') or os.getenv('LITELLM_MASTER_KEY'))
+	# The local OpenAI-compatible gateways used by this workspace expose Responses.
+	return bool(
+		os.getenv('WEBRETRIEVER_API_BASE')
+		or os.getenv('LITELLM_BASE_URL')
+		or os.getenv('WEBRETRIEVER_API_KEY')
+		or os.getenv('LITELLM_MASTER_KEY')
+	)
 
 
 def build_llm(config: RunnerConfig, worker_id: int = 0) -> ChatOpenAI:

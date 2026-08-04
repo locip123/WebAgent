@@ -16,6 +16,7 @@ from browser_use.llm.exceptions import ModelProviderError
 from browser_use.webretriever.agent import ProtocolIIIAgent
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, build_step_prompt_trace, build_system_prompt
+from browser_use.webretriever.strategy import STRATEGY_CHECKPOINT_INTERVAL, ExplorationCheckpointTracker, StrategyCheckpointError
 
 
 def _png_bytes() -> bytes:
@@ -48,6 +49,22 @@ class FakeRuntime:
 		return 'Action completed.'
 
 
+class NavigatingRuntime(FakeRuntime):
+	def __init__(self, start_url: str = 'https://example.com/start') -> None:
+		super().__init__()
+		self.current_url = start_url
+
+	async def observe(self, step: int) -> FakeObservation:
+		self.observed_steps.append(step)
+		return FakeObservation(url=self.current_url)
+
+	async def execute(self, decision: AgentDecision) -> str:
+		self.executed.append(decision)
+		if decision.action == 'navigate' and decision.url is not None:
+			self.current_url = decision.url
+		return 'Action completed.'
+
+
 @dataclass(slots=True)
 class ChangingObservation(FakeObservation):
 	marker: str = 'first-state'
@@ -75,13 +92,27 @@ class BlockingExecuteRuntime(FakeRuntime):
 
 
 class FakeLLM:
-	def __init__(self, decisions: list[AgentDecision]) -> None:
+	def __init__(self, decisions: list[AgentDecision], *, auto_complete_checkpoints: bool = True) -> None:
 		self.decisions = iter(decisions)
 		self.calls: list[tuple[list[Any], Any]] = []
+		self.auto_complete_checkpoints = auto_complete_checkpoints
+
+	def _next_completion(self, messages: list[Any]) -> AgentDecision:
+		decision = next(self.decisions)
+		prompt = messages[-1].text
+		if self.auto_complete_checkpoints and '===== REQUIRED ' in prompt and ' STRATEGY REVIEW =====' in prompt:
+			missing = {
+				field: value
+				for field, value in _checkpoint_fields('AUTO-CHECKPOINT').items()
+				if getattr(decision, field) is None
+			}
+			if missing:
+				return decision.model_copy(update=missing)
+		return decision
 
 	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
 		self.calls.append((messages, output_format))
-		return SimpleNamespace(completion=next(self.decisions), usage=None)
+		return SimpleNamespace(completion=self._next_completion(messages), usage=None)
 
 
 class PromptLogInspectingLLM(FakeLLM):
@@ -95,7 +126,7 @@ class PromptLogInspectingLLM(FakeLLM):
 		self.persisted_before_requests.append(prompt_log['steps'][-1])
 		self.calls.append((messages, output_format))
 		return SimpleNamespace(
-			completion=next(self.decisions),
+			completion=self._next_completion(messages),
 			usage=SimpleNamespace(input_tokens=3, output_tokens=2),
 		)
 
@@ -150,7 +181,7 @@ class TimeoutOnceLLM(FakeLLM):
 		if not self.timeout_returned:
 			self.timeout_returned = True
 			await asyncio.sleep(60)
-		return SimpleNamespace(completion=next(self.decisions), usage=None)
+		return SimpleNamespace(completion=self._next_completion(messages), usage=None)
 
 
 class InvalidOnceLLM(FakeLLM):
@@ -163,7 +194,7 @@ class InvalidOnceLLM(FakeLLM):
 		if not self.invalid_returned:
 			self.invalid_returned = True
 			raise ModelProviderError('1 validation error for AgentDecision\naction\n  Field required')
-		return SimpleNamespace(completion=next(self.decisions), usage=None)
+		return SimpleNamespace(completion=self._next_completion(messages), usage=None)
 
 
 class FirstActionThenHangingLLM:
@@ -175,7 +206,12 @@ class FirstActionThenHangingLLM:
 		self.calls += 1
 		if self.calls == 1:
 			return SimpleNamespace(
-				completion=AgentDecision(action='wait', seconds=0.1, thought='Record this action first.'),
+				completion=AgentDecision(
+					action='wait',
+					seconds=0.1,
+					thought='Record this action first.',
+					**_checkpoint_fields('FIRST-ACTION-CHECKPOINT'),
+				),
 				usage=None,
 			)
 		self.second_call_started.set()
@@ -268,6 +304,19 @@ async def test_agent_writes_line_oriented_model_prompts_by_default(tmp_path: Pat
 	assert '\n'.join(prompt_log['steps'][0]['prompt']) == llm.calls[0][0][1].text
 	assert set(prompt_log['steps'][0]) == {'step', 'prompt', 'image'}
 	assert 'SECRET_GROUND_TRUTH_9f6a' not in json.dumps(prompt_log, ensure_ascii=False)
+	strategy_review_log = json.loads((tmp_path / 'strategy_review_prompts.json').read_text(encoding='utf-8'))
+	assert strategy_review_log['format'] == 'webretriever-strategy-review-prompts/v1-lines'
+	assert strategy_review_log['system_prompt'] == llm.calls[0][0][0].text.split('\n')
+	assert len(strategy_review_log['reviews']) == 1
+	assert strategy_review_log['reviews'][0] == {
+		'step': 1,
+		'trigger': 'initial_page',
+		'completed_decisions': 0,
+		'trajectory_decision_count': 0,
+		'prompt': llm.calls[0][0][1].text.split('\n'),
+		'image': {'media_type': 'image/png', 'detail': 'high', 'path': 'trajectory/0.png'},
+	}
+	assert 'SECRET_GROUND_TRUTH_9f6a' not in json.dumps(strategy_review_log, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -1067,3 +1116,279 @@ async def test_agent_reports_remaining_task_seconds_to_the_model(tmp_path: Path)
 	await agent.run()
 
 	assert 'Remaining task time' in _model_text(llm.calls)
+
+
+def _checkpoint_fields(marker: str) -> dict[str, str]:
+	return {
+		'checkpoint_strategy_catalog': f'- {marker}: tried navigation.\n- {marker}: untried official table and export routes.',
+		'checkpoint_active_strategy': f'- {marker}: inspect the official table route.',
+		'checkpoint_confirmed_infeasible': f'- {marker}: no strategy is confirmed infeasible.',
+		'checkpoint_next_strategies': f'- {marker}: table first.\n- {marker}: export second.',
+	}
+
+
+@pytest.mark.asyncio
+async def test_agent_refreshes_persistent_strategy_checkpoint_on_initial_page_and_after_twenty_decisions(tmp_path: Path):
+	decisions = [
+		AgentDecision(
+			action='navigate',
+			url='https://example.com/route-1',
+			thought='Create the initial strategy checkpoint and begin.',
+			**_checkpoint_fields('INITIAL-CHECKPOINT'),
+		)
+	]
+	decisions.extend(
+		AgentDecision(action='navigate', url=f'https://example.com/route-{index}', thought=f'Open route {index}.')
+		for index in range(2, 21)
+	)
+	decisions.append(
+		AgentDecision(
+			action='navigate',
+			url='https://example.com/route-21',
+			thought='Refresh the periodic strategy checkpoint and continue.',
+			**_checkpoint_fields('PERIODIC-CHECKPOINT'),
+		)
+	)
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	llm = FakeLLM(decisions)
+	runtime = FakeRuntime()
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=22,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	assert len(llm.calls) == 22, 'the review must share the normal model call rather than add one'
+	model_texts = [call[0][1].text for call in llm.calls]
+	assert 'REQUIRED INITIAL-PAGE STRATEGY REVIEW' in model_texts[0]
+	assert 'REQUIRED 20-DECISION STRATEGY REVIEW' not in model_texts[19]
+	assert 'REQUIRED 20-DECISION STRATEGY REVIEW' in model_texts[20]
+	assert '"decision":1' in model_texts[20]
+	assert '"decision":20' in model_texts[20]
+	assert 'PERIODIC-CHECKPOINT' in model_texts[21]
+	assert all('checkpoint_' not in action for action in outcome.actions)
+	assert len(runtime.executed) == 21
+
+
+@pytest.mark.asyncio
+async def test_agent_refreshes_strategy_checkpoint_immediately_after_entering_a_new_page(tmp_path: Path):
+	llm = FakeLLM(
+		[
+			AgentDecision(
+				action='navigate',
+				url='https://example.com/results#top',
+				thought='Plan from the starting page and open the result page.',
+				**_checkpoint_fields('INITIAL-CHECKPOINT'),
+			),
+			AgentDecision(
+				action='finish',
+				answer='42',
+				evidence=['The result page states 42.'],
+				success=True,
+				thought='Replan on the entered page before returning the grounded answer.',
+				**_checkpoint_fields('PAGE-ENTRY-CHECKPOINT'),
+			),
+		]
+	)
+	runtime = NavigatingRuntime()
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=2,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	assert len(llm.calls) == 2
+	assert 'REQUIRED INITIAL-PAGE STRATEGY REVIEW' in llm.calls[0][0][1].text
+	page_prompt = llm.calls[1][0][1].text
+	assert 'REQUIRED PAGE-ENTRY STRATEGY REVIEW' in page_prompt
+	assert '"decision":1' in page_prompt
+	assert len(runtime.executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_counts_locally_blocked_repeated_decisions_in_the_strategy_review(tmp_path: Path):
+	decisions = [
+		AgentDecision(
+			action='navigate',
+			url='https://example.com/initial-route',
+			thought='Create the initial strategy checkpoint.',
+			**_checkpoint_fields('INITIAL-CHECKPOINT'),
+		)
+	]
+	decisions.extend(AgentDecision(action='wait', seconds=0.1, thought='Wait for the unchanged page.') for _ in range(19))
+	decisions.append(
+		AgentDecision(
+			action='navigate',
+			url='https://example.com/recovery',
+			thought='Switch strategy after the repeated probes.',
+			**_checkpoint_fields('PERIODIC-CHECKPOINT'),
+		)
+	)
+	decisions.append(AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True))
+	llm = FakeLLM(decisions)
+	runtime = FakeRuntime()
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=22,
+		max_consecutive_action_errors=99,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	checkpoint_prompt = llm.calls[20][0][1].text
+	assert 'REQUIRED 20-DECISION STRATEGY REVIEW' in checkpoint_prompt
+	assert 'repeated_unchanged_action' in checkpoint_prompt
+	assert len(runtime.executed) == 4, 'locally blocked decisions count but do not execute another browser action'
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_the_same_checkpoint_when_the_four_fields_are_missing(tmp_path: Path):
+	decisions = [
+		AgentDecision(
+			action='navigate',
+			url='https://example.com/route-1',
+			thought='Create the initial strategy checkpoint.',
+			**_checkpoint_fields('INITIAL-CHECKPOINT'),
+		)
+	]
+	decisions.extend(
+		AgentDecision(action='navigate', url=f'https://example.com/route-{index}', thought=f'Open route {index}.')
+		for index in range(2, 21)
+	)
+	decisions.extend(
+		[
+			AgentDecision(
+				action='navigate',
+				url='https://example.com/missing-checkpoint',
+				thought='This response deliberately omits the required checkpoint fields.',
+			),
+			AgentDecision(
+				action='navigate',
+				url='https://example.com/accepted-checkpoint',
+				thought='Provide the required checkpoint fields and continue.',
+				**_checkpoint_fields('RECOVERED-CHECKPOINT'),
+			),
+			AgentDecision(action='finish', answer='42', evidence=['The page states 42.'], success=True),
+		]
+	)
+	llm = FakeLLM(decisions, auto_complete_checkpoints=False)
+	runtime = FakeRuntime()
+
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=23,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	assert 'REQUIRED 20-DECISION STRATEGY REVIEW' in llm.calls[20][0][1].text
+	assert 'REQUIRED 20-DECISION STRATEGY REVIEW' in llm.calls[21][0][1].text
+	assert all(decision.url != 'https://example.com/missing-checkpoint' for decision in runtime.executed)
+	assert 'RECOVERED-CHECKPOINT' in llm.calls[22][0][1].text
+	strategy_review_log = json.loads((tmp_path / 'strategy_review_prompts.json').read_text(encoding='utf-8'))
+	assert [(entry['step'], entry['trigger']) for entry in strategy_review_log['reviews']] == [
+		(1, 'initial_page'),
+		(21, 'periodic'),
+		(22, 'periodic'),
+	]
+	assert [
+		'\n'.join(entry['prompt']) for entry in strategy_review_log['reviews']
+	] == [llm.calls[index][0][1].text for index in (0, 20, 21)]
+
+
+def _strategy_record(url: str) -> dict[str, object]:
+	return {
+		'url': url,
+		'title': 'Observed page',
+		'page_observation': 'Browser-derived evidence.',
+		'action': {'action': 'wait'},
+		'outcome': 'Completed.',
+	}
+
+
+def _accept_strategy_review(tracker: ExplorationCheckpointTracker) -> None:
+	tracker.accept_review(
+		strategy_catalog='- Tried visible evidence.\n- An official table remains available.',
+		active_strategy='- Inspect the current official page.',
+		confirmed_infeasible='- No strategy is confirmed infeasible.',
+		next_strategies='- Read the table.\n- Inspect a first-party export.',
+	)
+
+
+def test_strategy_tracker_rejects_non_list_checkpoint_fields() -> None:
+	tracker = ExplorationCheckpointTracker()
+	assert tracker.review_request(current_page_url='https://example.com/start') is not None
+
+	with pytest.raises(StrategyCheckpointError, match='checkpoint_next_strategies must be a Markdown list'):
+		tracker.accept_review(
+			strategy_catalog='- [untried] Inspect the official table.',
+			active_strategy='- Inspect the official table.',
+			confirmed_infeasible='- None confirmed.',
+			next_strategies='Inspect the first-party export next.',
+		)
+
+	assert tracker.checkpoint is None
+
+
+def test_strategy_tracker_distinguishes_initial_page_entry_fragments_and_download_placeholders() -> None:
+	tracker = ExplorationCheckpointTracker()
+
+	initial = tracker.review_request(current_page_url='https://example.com/start#overview')
+	assert initial is not None
+	assert initial.trigger == 'initial_page'
+	assert initial.completed_decisions == 0
+	assert initial.trajectory == ()
+	_accept_strategy_review(tracker)
+
+	tracker.record_decision(_strategy_record('https://example.com/start#table'))
+	assert tracker.review_request(current_page_url='https://example.com/start#footer') is None
+
+	page_entry = tracker.review_request(current_page_url='https://example.com/results#top')
+	assert page_entry is not None
+	assert page_entry.trigger == 'page_entry'
+	assert page_entry.completed_decisions == 1
+	assert [item['decision'] for item in page_entry.trajectory] == [1]
+	_accept_strategy_review(tracker)
+
+	tracker.record_decision(_strategy_record('https://example.com/results'))
+	assert tracker.review_request(current_page_url=':') is None
+	tracker.record_decision(_strategy_record(':'))
+	assert tracker.review_request(current_page_url='https://example.com/results') is None
+
+
+def test_strategy_tracker_uses_twenty_decisions_and_resets_the_since_review_trajectory() -> None:
+	tracker = ExplorationCheckpointTracker()
+	assert tracker.review_request(current_page_url='https://example.com/start') is not None
+	_accept_strategy_review(tracker)
+
+	for _ in range(STRATEGY_CHECKPOINT_INTERVAL):
+		tracker.record_decision(_strategy_record('https://example.com/start'))
+
+	periodic = tracker.review_request(current_page_url='https://example.com/start')
+	assert periodic is not None
+	assert periodic.trigger == 'periodic'
+	assert periodic.completed_decisions == STRATEGY_CHECKPOINT_INTERVAL
+	assert len(periodic.trajectory) == STRATEGY_CHECKPOINT_INTERVAL
+	assert periodic.trajectory[0]['decision'] == 1
+	assert periodic.trajectory[-1]['decision'] == STRATEGY_CHECKPOINT_INTERVAL
+	_accept_strategy_review(tracker)
+
+	tracker.record_decision(_strategy_record('https://example.com/start'))
+	page_entry = tracker.review_request(current_page_url='https://example.com/next')
+	assert page_entry is not None
+	assert page_entry.trigger == 'page_entry'
+	assert page_entry.completed_decisions == STRATEGY_CHECKPOINT_INTERVAL + 1
+	assert [item['decision'] for item in page_entry.trajectory] == [STRATEGY_CHECKPOINT_INTERVAL + 1]

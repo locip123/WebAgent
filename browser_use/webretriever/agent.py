@@ -21,6 +21,8 @@ from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam
 from browser_use.webretriever.artifacts import (
 	MODEL_PROMPT_LOG_FILENAME,
 	MODEL_PROMPT_LOG_FORMAT,
+	STRATEGY_REVIEW_PROMPT_LOG_FILENAME,
+	STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
 	STRUCTURED_MODEL_PROMPT_LOG_FORMAT,
 	atomic_write_json,
 	model_prompt_log_metadata,
@@ -36,6 +38,11 @@ from browser_use.webretriever.prompts import (
 	PromptTarget,
 	StepContext,
 	normalize_thought_language,
+)
+from browser_use.webretriever.strategy import (
+	ExplorationCheckpointTracker,
+	StrategyCheckpointError,
+	StrategyReviewRequest,
 )
 
 T = TypeVar('T')
@@ -58,7 +65,7 @@ class AgentRunOutcome:
 
 
 def _decision_action_payload(decision: AgentDecision) -> dict[str, Any]:
-	payload = decision.model_dump(exclude_none=True, mode='json')
+	payload = decision.action_payload()
 	for field_name in ('thought', 'memory', 'answer', 'evidence', 'success'):
 		if decision.action != 'finish' or field_name in ('thought', 'memory'):
 			payload.pop(field_name, None)
@@ -233,6 +240,60 @@ def _bounded_memory(value: str) -> str:
 	return value[:head] + marker + value[-(3_000 - head - len(marker)) :]
 
 
+def _compact_checkpoint_observation(rendered_observation: str, *, limit: int = 900) -> str:
+	"""Retain enough prior-page context for one adaptive strategy review."""
+
+	normalized = re.sub(r'\s+', ' ', rendered_observation).strip()
+	if len(normalized) <= limit:
+		return normalized
+	marker = ' ...[browser observation compacted]... '
+	head = (limit * 2) // 3
+	tail = max(0, limit - head - len(marker))
+	return normalized[:head] + marker + (normalized[-tail:] if tail else '')
+
+
+def _checkpoint_trajectory_record(
+	*,
+	step: int,
+	observation: Any,
+	rendered_observation: str,
+	decision: AgentDecision,
+	outcome: str,
+) -> dict[str, Any]:
+	"""Build the browser-derived record consumed only by a future checkpoint."""
+
+	return {
+		'step': step + 1,
+		'url': str(getattr(observation, 'url', '')),
+		'title': str(getattr(observation, 'title', '')),
+		'page_observation': _compact_checkpoint_observation(rendered_observation),
+		'action': _decision_action_payload(decision),
+		'outcome': _compact_checkpoint_observation(outcome, limit=1_200),
+	}
+
+
+def _record_exploration_decision(
+	tracker: ExplorationCheckpointTracker,
+	*,
+	step: int,
+	observation: Any,
+	rendered_observation: str,
+	decision: AgentDecision,
+	outcome: str,
+) -> None:
+	"""Count every completed valid decision, including failed or locally blocked ones."""
+
+	tracker.record_decision(
+		_checkpoint_trajectory_record(
+			step=step,
+			observation=observation,
+			rendered_observation=rendered_observation,
+			decision=decision,
+			outcome=outcome,
+		)
+	)
+
+
 def _usage_dict(usage: Any) -> dict[str, int]:
 	if usage is None:
 		return {}
@@ -387,6 +448,8 @@ class ProtocolIIIAgent:
 		self.system_prompt = self.system_document.text
 		self._model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self._model_prompt_log: dict[str, Any] = {}
+		self._strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
+		self._strategy_review_prompt_log: dict[str, Any] = {}
 		self.task_deadline_monotonic = task_deadline_monotonic
 		self._trusted_chart_manifests: dict[str, str] = {}
 		self._ready_chart_data_dirs: set[str] = set()
@@ -536,6 +599,7 @@ class ProtocolIIIAgent:
 	def _reset_model_prompt_log(self) -> None:
 		"""Start a fresh, durable prompt log in the configured display format."""
 
+		self._reset_strategy_review_prompt_log()
 		if not self.structured_prompt_log:
 			self._model_prompt_log = {
 				'format': MODEL_PROMPT_LOG_FORMAT,
@@ -560,6 +624,18 @@ class ProtocolIIIAgent:
 			'steps': [],
 		}
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	def _reset_strategy_review_prompt_log(self) -> None:
+		"""Start the independent, complete input trace for strategy-review calls."""
+
+		self._strategy_review_prompt_log = {
+			'format': STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
+			# As in model_prompts.json, retain the shared system message once while
+			# every review entry retains its exact user text and screenshot reference.
+			'system_prompt': prompt_text_lines(self.system_prompt),
+			'reviews': [],
+		}
+		atomic_write_json(self._strategy_review_prompt_log_path, self._strategy_review_prompt_log)
 
 	def _record_model_prompt(
 		self,
@@ -600,6 +676,40 @@ class ProtocolIIIAgent:
 				}
 			)
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	def _record_strategy_review_prompt(
+		self,
+		*,
+		step: int,
+		strategy_review: StrategyReviewRequest,
+		prompt_document: PromptDocument,
+		screenshot_path: Path,
+	) -> None:
+		"""Persist the complete input of each initial, page-entry, or periodic review.
+
+		The regular ``model_prompts.json`` contains every decision call.  This
+		separate file lets investigators inspect only strategy-review calls without
+		reconstructing them from the broader trajectory.
+		"""
+
+		reviews = self._strategy_review_prompt_log['reviews']
+		if not isinstance(reviews, list):  # Defensive guard for future format edits.
+			raise TypeError('strategy review prompt log reviews must be a list')
+		reviews.append(
+			{
+				'step': step + 1,
+				'trigger': strategy_review.trigger,
+				'completed_decisions': strategy_review.completed_decisions,
+				'trajectory_decision_count': len(strategy_review.trajectory),
+				'prompt': prompt_text_lines(prompt_document.text),
+				'image': {
+					'media_type': 'image/png',
+					'detail': 'high',
+					'path': str(screenshot_path.relative_to(self.task_dir)),
+				},
+			}
+		)
+		atomic_write_json(self._strategy_review_prompt_log_path, self._strategy_review_prompt_log)
 
 	def _record_model_result(
 		self,
@@ -642,6 +752,7 @@ class ProtocolIIIAgent:
 		# action alternation, which the exact-repeat guard below cannot see.
 		recent_signatures: deque[tuple[str, str]] = deque(maxlen=16)
 		blocked_loop_intents: set[str] = set()
+		exploration_tracker = ExplorationCheckpointTracker()
 
 		for step in range(self.max_steps):
 			try:
@@ -663,6 +774,7 @@ class ProtocolIIIAgent:
 			observation_fingerprint = _observation_hash(rendered_observation)
 			remaining = self._remaining_task_seconds()
 			remaining_task_seconds = None if remaining == float('inf') else remaining
+			strategy_review = exploration_tracker.review_request(current_page_url=observation.url)
 			try:
 				prompt_document = self.prompt_composer.compose_step(
 					StepContext(
@@ -672,6 +784,8 @@ class ProtocolIIIAgent:
 						memory=memory,
 						last_outcome=last_outcome,
 						remaining_task_seconds=remaining_task_seconds,
+						strategy_checkpoint=exploration_tracker.checkpoint,
+						strategy_review=strategy_review,
 					)
 				)
 			except PromptError as exc:
@@ -705,6 +819,13 @@ class ProtocolIIIAgent:
 				prompt_document=prompt_document,
 				screenshot_path=raw_path,
 			)
+			if strategy_review is not None:
+				self._record_strategy_review_prompt(
+					step=step,
+					strategy_review=strategy_review,
+					prompt_document=prompt_document,
+					screenshot_path=raw_path,
+				)
 			model_call_started_at = time.monotonic()
 			try:
 				response = await _await_with_hard_timeout(
@@ -776,6 +897,50 @@ class ProtocolIIIAgent:
 				outcome.error = model_error
 				break
 
+			if strategy_review is not None:
+				try:
+					exploration_tracker.accept_review(
+						strategy_catalog=decision.checkpoint_strategy_catalog,
+						active_strategy=decision.checkpoint_active_strategy,
+						confirmed_infeasible=decision.checkpoint_confirmed_infeasible,
+						next_strategies=decision.checkpoint_next_strategies,
+					)
+				except StrategyCheckpointError as exc:
+					model_error = f'Model response omitted or invalidated the required strategy checkpoint: {exc}'
+					self._record_model_result(
+						step=step,
+						started_at=model_call_started_at,
+						usage=model_usage,
+						error=model_error,
+					)
+					_save_visual_screenshot(
+						screenshot,
+						self.task_dir / 'trajectory_visual' / f'{step}.png',
+						model_error,
+						observation,
+					)
+					consecutive_model_output_errors += 1
+					consecutive_model_timeouts = 0
+					last_outcome = (
+						'ERROR: The prior model response did not include one complete required strategy checkpoint, so no browser '
+						'action was executed. Return all four non-empty checkpoint_* fields and one normal action. '
+						f'Diagnostic: {str(exc)[:1000]}'
+					)
+					outcome.steps.append(
+						{
+							'step': step,
+							'url': observation.url,
+							'thought': '',
+							'action': {},
+							'outcome': last_outcome,
+						}
+					)
+					if consecutive_model_output_errors < self.max_consecutive_model_output_errors:
+						continue
+					outcome.status = 'FAIL_MODEL'
+					outcome.error = model_error
+					break
+
 			consecutive_model_output_errors = 0
 			consecutive_model_timeouts = 0
 			action_text = _action_string(decision)
@@ -802,6 +967,14 @@ class ProtocolIIIAgent:
 				if decision.success is True and answer and evidence:
 					step_record['outcome'] = 'Task completed with browser-grounded evidence.'
 					outcome.steps.append(step_record)
+					_record_exploration_decision(
+						exploration_tracker,
+						step=step,
+						observation=observation,
+						rendered_observation=rendered_observation,
+						decision=decision,
+						outcome=step_record['outcome'],
+					)
 					outcome.status = 'SUCCESS'
 					outcome.agent_answer = answer
 					outcome.evidence = evidence
@@ -809,12 +982,28 @@ class ProtocolIIIAgent:
 				if decision.success is False:
 					step_record['outcome'] = 'Agent declared the task unsuccessful.'
 					outcome.steps.append(step_record)
+					_record_exploration_decision(
+						exploration_tracker,
+						step=step,
+						observation=observation,
+						rendered_observation=rendered_observation,
+						decision=decision,
+						outcome=step_record['outcome'],
+					)
 					outcome.status = 'FAIL'
 					outcome.error = answer or 'Agent could not complete the task'
 					break
 				last_outcome = 'ERROR: finish(success=true) requires a non-empty answer and at least one evidence item.'
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
+				_record_exploration_decision(
+					exploration_tracker,
+					step=step,
+					observation=observation,
+					rendered_observation=rendered_observation,
+					decision=decision,
+					outcome=last_outcome,
+				)
 				continue
 
 			action_signature = (observation_fingerprint, action_text)
@@ -836,6 +1025,14 @@ class ProtocolIIIAgent:
 				)
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
+				_record_exploration_decision(
+					exploration_tracker,
+					step=step,
+					observation=observation,
+					rendered_observation=rendered_observation,
+					decision=decision,
+					outcome=last_outcome,
+				)
 				memory = self._remember(decision.memory)
 				consecutive_errors += 1
 				if consecutive_errors >= self.max_consecutive_action_errors:
@@ -868,6 +1065,14 @@ class ProtocolIIIAgent:
 				)
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
+				_record_exploration_decision(
+					exploration_tracker,
+					step=step,
+					observation=observation,
+					rendered_observation=rendered_observation,
+					decision=decision,
+					outcome=last_outcome,
+				)
 				memory = self._remember(decision.memory)
 				# A detected loop is a planning stall, not a browser failure, so it
 				# must not consume the consecutive-action-error budget.
@@ -990,6 +1195,14 @@ class ProtocolIIIAgent:
 				last_outcome
 				if len(last_outcome) <= 20_000
 				else f'{last_outcome[:14_000]}\n...[action result truncated]...\n{last_outcome[-6_000:]}'
+			)
+			_record_exploration_decision(
+				exploration_tracker,
+				step=step,
+				observation=observation,
+				rendered_observation=rendered_observation,
+				decision=decision,
+				outcome=step_record['outcome'],
 			)
 			memory = self._remember(decision.memory)
 			if action_failed:

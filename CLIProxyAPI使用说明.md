@@ -35,5 +35,7 @@ cli-proxy-api -codex-device-login
   # 密码
   Keeper-Login-6zr8Qp2Lm5Vx9Nd
 
+  xray run -config /usr/local/etc/xray/config.json
+
 
 

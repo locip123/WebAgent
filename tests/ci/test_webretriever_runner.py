@@ -10,6 +10,7 @@ import pytest
 
 from browser_use.webretriever import cli
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
+from browser_use.webretriever.configuration import ConfigurationError, load_file_configuration
 from browser_use.webretriever.models import CompetitionTask
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
 from browser_use.webretriever.runner import (
@@ -91,6 +92,82 @@ def test_cli_parser_accepts_task_and_output_aliases(tmp_path: Path, input_flag: 
 	assert args.input_path == tmp_path / 'tasks.json'
 	assert args.output_dir == tmp_path / 'output'
 	assert args.max_concurrency == 3
+
+
+def test_cli_loads_toml_configuration_and_cli_overrides_task_selection(monkeypatch, tmp_path: Path):
+	monkeypatch.setenv('WEBRETRIEVER_MODEL', 'environment-model-that-must-not-win')
+	config_path = tmp_path / 'webretriever.toml'
+	config_path.write_text(
+		'''[webretriever]
+input_path = "tasks.json"
+output_dir = "output"
+model = "gpt-5.4"
+api_key = "config-key"
+api_base = "https://gateway.example.test/v1"
+api_mode = "responses"
+reasoning_effort = "low"
+thought_language = "中文"
+max_steps = 99
+model_timeout_seconds = 120.0
+task_timeout_seconds = 300.0
+max_concurrency = 2
+structured_prompt_log = true
+local_browser = true
+headless = false
+rerun_failed = true
+cdp_urls = []
+vlm_ports = []
+task_indices = ["1,4-6"]
+limit = 5
+validate_only = false
+''',
+		encoding='utf-8',
+	)
+
+	configuration = load_file_configuration(config_path)
+	parser = cli.build_parser(configuration)
+	args = parser.parse_args(['--task-index', '9', '--no-headed'])
+	config = cli.config_from_args(args, parser)
+
+	assert config.input_path == Path('tasks.json')
+	assert config.output_dir == Path('output')
+	assert config.model == 'gpt-5.4'
+	assert config.api_key == 'config-key'
+	assert config.api_mode == 'responses'
+	assert config.max_steps == 99
+	assert config.model_timeout_seconds == 120
+	assert config.task_timeout_seconds == 300
+	assert config.max_concurrency == 2
+	assert config.structured_prompt_log is True
+	assert config.local_browser is True
+	assert config.headless is True
+	assert config.rerun_failed is True
+	assert config.task_indices == frozenset({9})
+	assert config.limit == 5
+
+
+def test_cli_validate_only_reads_input_path_from_toml(tmp_path: Path, capsys):
+	input_path = tmp_path / 'tasks.json'
+	_write_task_file(input_path)
+	config_path = tmp_path / 'webretriever.toml'
+	config_path.write_text(f'[webretriever]\ninput_path = "{input_path}"\nvalidate_only = true\n', encoding='utf-8')
+
+	exit_code = cli.main(['--config', str(config_path)])
+
+	assert exit_code == 0
+	assert json.loads(capsys.readouterr().out)['task_count'] == 1
+
+
+def test_toml_configuration_rejects_unknown_or_mistyped_settings(tmp_path: Path):
+	config_path = tmp_path / 'webretriever.toml'
+	config_path.write_text('[webretriever]\nunknown_setting = true\n', encoding='utf-8')
+
+	with pytest.raises(ConfigurationError, match='unsupported'):
+		load_file_configuration(config_path)
+
+	config_path.write_text('[webretriever]\nmax_steps = "100"\n', encoding='utf-8')
+	with pytest.raises(ConfigurationError, match='must be an integer'):
+		load_file_configuration(config_path)
 
 
 def test_cli_config_uses_environment_and_cdp_alias(monkeypatch, tmp_path: Path):
@@ -539,7 +616,6 @@ def test_task_timeout_outcome_preserves_partial_agent_history(tmp_path: Path):
 		({'max_steps': 101}, '100'),
 		({'model_timeout_seconds': 181}, '180'),
 		({'task_timeout_seconds': 0}, 'greater than 0'),
-		({'task_timeout_seconds': 901}, '900'),
 		({'max_concurrency': 9}, '8'),
 		({'cdp_urls': [f'ws://browser.example.test/{index}' for index in range(9)]}, '8 concurrent CDP'),
 	],
@@ -547,6 +623,10 @@ def test_task_timeout_outcome_preserves_partial_agent_history(tmp_path: Path):
 def test_runner_config_rejects_values_above_competition_limits(tmp_path: Path, override: dict[str, object], message: str):
 	with pytest.raises(ValueError, match=message):
 		_config(tmp_path, **override).validate()
+
+
+def test_runner_config_allows_task_timeout_above_the_previous_hard_cap(tmp_path: Path):
+	_config(tmp_path, task_timeout_seconds=2000).validate()
 
 
 def test_runner_config_forbids_rerunning_failed_tasks_in_formal_cdp_mode(tmp_path: Path):
