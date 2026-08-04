@@ -44,6 +44,7 @@ from browser_use.webretriever.strategy import (
 	StrategyCheckpointError,
 	StrategyReviewRequest,
 )
+from browser_use.webretriever.verification import VerificationAction, VerificationController
 
 T = TypeVar('T')
 _FIND_CHART_MAX_SECONDS = 60.0
@@ -62,6 +63,7 @@ class AgentRunOutcome:
 	error: str | None = None
 	duration_seconds: float = 0.0
 	usage: dict[str, int] = field(default_factory=dict)
+	verification: dict[str, object] = field(default_factory=dict)
 
 
 def _decision_action_payload(decision: AgentDecision) -> dict[str, Any]:
@@ -753,6 +755,7 @@ class ProtocolIIIAgent:
 		recent_signatures: deque[tuple[str, str]] = deque(maxlen=16)
 		blocked_loop_intents: set[str] = set()
 		exploration_tracker = ExplorationCheckpointTracker()
+		verification = VerificationController(target_url=self.task.website)
 
 		for step in range(self.max_steps):
 			try:
@@ -769,6 +772,54 @@ class ProtocolIIIAgent:
 			# overlays.  Fakes may not, so retain a small compatibility fallback.
 			if not raw_path.exists():
 				raw_path.write_bytes(screenshot)
+
+			verification_decision = verification.decide(observation)
+			if verification_decision.action is VerificationAction.BLOCKED:
+				step_record = {
+					'step': step,
+					'url': observation.url,
+					'thought': '验证状态机：可见验证在有界等待后仍未完成。',
+					'action': {'action': 'verification_blocked'},
+					'outcome': verification_decision.reason,
+				}
+				outcome.thoughts.append(step_record['thought'])
+				outcome.steps.append(step_record)
+				outcome.status = 'FAIL_VERIFICATION'
+				outcome.error = verification_decision.reason
+				break
+			if verification_decision.action in {VerificationAction.CLICK, VerificationAction.WAIT}:
+				payload: dict[str, Any]
+				if verification_decision.action is VerificationAction.CLICK:
+					payload = {'action': 'click', 'element_id': verification_decision.element_id}
+				else:
+					payload = {'action': 'wait', 'seconds': verification_decision.wait_seconds}
+				action_text = json.dumps({**payload, 'source': 'verification_controller'}, ensure_ascii=False, separators=(',', ':'))
+				thought = f'验证状态机：{verification_decision.reason}。'
+				_save_visual_screenshot(
+					screenshot,
+					self.task_dir / 'trajectory_visual' / f'{step}.png',
+					action_text,
+					observation,
+					verification_decision.element_id,
+				)
+				outcome.actions.append(action_text)
+				outcome.thoughts.append(thought)
+				step_record = {'step': step, 'url': observation.url, 'thought': thought, 'action': payload}
+				try:
+					last_outcome = await self.runtime.execute(payload)
+					consecutive_errors = 0
+				except Exception as exc:
+					last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
+					consecutive_errors += 1
+				step_record['outcome'] = last_outcome
+				outcome.steps.append(step_record)
+				if consecutive_errors >= self.max_consecutive_action_errors:
+					outcome.status = 'FAIL_ACTIONS'
+					outcome.error = f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
+					break
+				continue
+			if verification_decision.state.value == 'passed':
+				last_outcome = 'Visible verification completed; continue in the same browser context.'
 
 			rendered_observation = observation.render_text()
 			observation_fingerprint = _observation_hash(rendered_observation)
@@ -1117,15 +1168,18 @@ class ProtocolIIIAgent:
 						)
 						last_outcome = execution.output
 						_merge_usage(outcome.usage, execution.usage)
-						payload = self._register_chart_artifact(last_outcome)
+						chart_payload = self._register_chart_artifact(last_outcome)
 						if decision.chart_cursor is not None:
-							action_failed = not isinstance(payload, dict) or payload.get('status') in {'stale_state', 'timeout'}
+							action_failed = not isinstance(chart_payload, dict) or chart_payload.get('status') in {
+								'stale_state',
+								'timeout',
+							}
 						else:
 							# A completed scan can validly leave the agent without normalized
 							# data.  Those outcomes trigger the visual/first-party-export
 							# fallback in the next prompt; treating them as browser failures
 							# would spend the action-error budget before that recovery runs.
-							action_failed = not isinstance(payload, dict) or payload.get('status') not in {
+							action_failed = not isinstance(chart_payload, dict) or chart_payload.get('status') not in {
 								'ready',
 								'saved_raw_only',
 								'no_match',
@@ -1175,10 +1229,10 @@ class ProtocolIIIAgent:
 						last_outcome = execution.output
 						_merge_usage(outcome.usage, execution.usage)
 						try:
-							payload = json.loads(last_outcome)
+							analysis_payload: Any = json.loads(last_outcome)
 						except (TypeError, json.JSONDecodeError):
-							payload = None
-						action_failed = not isinstance(payload, dict) or payload.get('status') != 'ok'
+							analysis_payload = None
+						action_failed = not isinstance(analysis_payload, dict) or analysis_payload.get('status') != 'ok'
 				else:
 					last_outcome = await self.runtime.execute(decision)
 			except TimeoutError:
@@ -1220,4 +1274,5 @@ class ProtocolIIIAgent:
 			self._salvage_into(outcome, memory)
 
 		outcome.duration_seconds = round(time.monotonic() - started_at, 3)
+		outcome.verification = verification.summary()
 		return outcome

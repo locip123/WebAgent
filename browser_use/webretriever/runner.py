@@ -7,25 +7,35 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, async_playwright
 
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json
 from browser_use.webretriever.browser import BrowserRuntime, cdp_headers_for_url, is_sec_url, redact_cdp_url
+from browser_use.webretriever.connection import BrowserConnector, BrowserDriver
+from browser_use.webretriever.experiment import (
+	PATCHRIGHT_EXPERIMENT_TASK_INDICES,
+	ExperimentRecord,
+	ExperimentSummary,
+	patchright_qualification_report_passes,
+	write_experiment_summary,
+)
 from browser_use.webretriever.models import CompetitionTask, load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, normalize_thought_language
+from browser_use.webretriever.verification import VerificationState
 
 ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
 DEFAULT_MAX_CONCURRENCY = 3
 MAX_CONCURRENCY = 8
 DEFAULT_TASK_TIMEOUT_SECONDS = 600.0
+DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES = PATCHRIGHT_EXPERIMENT_TASK_INDICES
 MAX_OPENAI_MODEL_VERSION = (5, 6)
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
@@ -54,6 +64,11 @@ class RunnerConfig:
 	rerun_failed: bool = False
 	task_indices: frozenset[int] | None = None
 	limit: int | None = None
+	browser_driver: BrowserDriver = BrowserDriver.PLAYWRIGHT
+	experiment_mode: bool = False
+	experiment_repeat_index: int = 0
+	experiment_endpoint_label: str | None = None
+	patchright_qualification_report: Path | None = None
 
 	def validate(self) -> None:
 		if not self.model.strip():
@@ -84,6 +99,18 @@ class RunnerConfig:
 			raise ValueError('the competition permits at most 8 concurrent CDP browsers')
 		if self.limit is not None and self.limit < 1:
 			raise ValueError('limit must be at least 1')
+		if self.experiment_mode and self.local_browser:
+			raise ValueError('experiment_mode requires one or more CDP URLs, not local_browser')
+		if self.experiment_repeat_index < 0:
+			raise ValueError('experiment_repeat_index must be non-negative')
+		if self.experiment_endpoint_label is not None:
+			if not self.experiment_endpoint_label.strip() or len(self.experiment_endpoint_label) > 80:
+				raise ValueError('experiment_endpoint_label must be a non-empty label no longer than 80 characters')
+		if self.browser_driver is BrowserDriver.PATCHRIGHT and not self.experiment_mode:
+			if self.patchright_qualification_report is None:
+				raise ValueError('Patchright requires a passing --patchright-qualification-report before a formal CDP run')
+			if not patchright_qualification_report_passes(self.patchright_qualification_report):
+				raise ValueError('Patchright qualification report is missing or did not pass the experiment gate')
 		self.sec_user_agent = normalize_sec_user_agent(self.sec_user_agent)
 		self.thought_language = normalize_thought_language(self.thought_language)
 		validate_model_policy(self.model)
@@ -249,6 +276,10 @@ def _result_payload(
 	task_started_at: datetime | None = None,
 	task_elapsed_seconds: float = 0.0,
 	task_timeout_seconds: float | None = None,
+	browser_driver: BrowserDriver | None = None,
+	browser_driver_fallback_reason: str | None = None,
+	endpoint_label: str | None = None,
+	experiment_repeat_index: int | None = None,
 ) -> dict[str, Any]:
 	payload: dict[str, Any] = {
 		**task.prompt_payload(),
@@ -264,6 +295,7 @@ def _result_payload(
 		'model': model,
 		'thought_language': thought_language,
 		'usage': outcome.usage,
+		'verification': outcome.verification,
 		# ``duration_seconds`` predates the task watchdog and measures only the
 		# agent loop.  Keep it for compatibility while exposing the end-to-end
 		# task timing used for the timeout decision.
@@ -274,6 +306,14 @@ def _result_payload(
 		payload['task_started_at'] = task_started_at.isoformat()
 	if task_timeout_seconds is not None:
 		payload['task_timeout_seconds'] = task_timeout_seconds
+	if browser_driver is not None:
+		payload['browser_driver'] = browser_driver.value
+	if browser_driver_fallback_reason is not None:
+		payload['browser_driver_fallback_reason'] = browser_driver_fallback_reason
+	if endpoint_label is not None:
+		payload['experiment_endpoint_label'] = endpoint_label
+	if experiment_repeat_index is not None:
+		payload['experiment_repeat_index'] = experiment_repeat_index
 	return payload
 
 
@@ -335,6 +375,9 @@ async def _run_task(
 	config: RunnerConfig,
 	llm: ChatOpenAI,
 	logger: logging.Logger,
+	browser_driver: BrowserDriver | None = None,
+	browser_driver_fallback_reason: str | None = None,
+	endpoint_label: str | None = None,
 ) -> str:
 	writer = TaskArtifactWriter(config.output_dir, task)
 	writer.prepare()
@@ -421,6 +464,10 @@ async def _run_task(
 				task_started_at=task_started_at,
 				task_elapsed_seconds=time.monotonic() - task_started_monotonic,
 				task_timeout_seconds=config.task_timeout_seconds,
+				browser_driver=browser_driver if config.experiment_mode else None,
+				browser_driver_fallback_reason=browser_driver_fallback_reason if config.experiment_mode else None,
+				endpoint_label=endpoint_label if config.experiment_mode else None,
+				experiment_repeat_index=config.experiment_repeat_index if config.experiment_mode else None,
 			)
 		)
 		logger.info('Finished task %s/%s with status %s', task.task_idx, task.task_id, outcome.status)
@@ -432,12 +479,16 @@ async def _run_task(
 async def _consume_tasks(
 	*,
 	worker_id: int,
-	context: BrowserContext,
+	context: BrowserContext | None,
 	queue: asyncio.Queue[CompetitionTask],
 	config: RunnerConfig,
 	llm: ChatOpenAI,
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
+	browser_driver: BrowserDriver | None = None,
+	browser_driver_fallback_reason: str | None = None,
+	endpoint_label: str | None = None,
+	browser: Browser | None = None,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
@@ -448,16 +499,28 @@ async def _consume_tasks(
 		try:
 			is_sec_task = is_sec_url(task.website)
 			acquired_sec_slot = False
+			task_context: BrowserContext | None = context
+			created_experiment_context = False
 			try:
+				if config.experiment_mode:
+					if browser is None:
+						raise RuntimeError('experiment_mode requires a connected CDP browser')
+					task_context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
+					created_experiment_context = True
+				if task_context is None:
+					raise RuntimeError('worker has no browser context')
 				if is_sec_task:
 					await sec_task_semaphore.acquire()
 					acquired_sec_slot = True
 				statuses[task.task_id] = await _run_task(
-					context=context,
+					context=task_context,
 					task=task,
 					config=config,
 					llm=llm,
 					logger=logger,
+					browser_driver=browser_driver,
+					browser_driver_fallback_reason=browser_driver_fallback_reason,
+					endpoint_label=endpoint_label,
 				)
 			except Exception as exc:
 				# Artifact I/O and other runner-level failures must not abandon the
@@ -474,6 +537,11 @@ async def _consume_tasks(
 			finally:
 				if acquired_sec_slot:
 					sec_task_semaphore.release()
+				if created_experiment_context and task_context is not None:
+					try:
+						await task_context.close()
+					except Exception as exc:
+						logger.warning('Could not close isolated experiment context: %s', exc)
 		finally:
 			queue.task_done()
 
@@ -481,7 +549,6 @@ async def _consume_tasks(
 async def _cdp_worker(
 	*,
 	worker_id: int,
-	playwright: Playwright,
 	cdp_url: str,
 	queue: asyncio.Queue[CompetitionTask],
 	config: RunnerConfig,
@@ -491,31 +558,46 @@ async def _cdp_worker(
 	logger = _worker_logger(config.output_dir, worker_id)
 	llm = build_llm(config, worker_id)
 	logger.info('Connecting to CDP browser %s', redact_cdp_url(cdp_url))
-	browser: Browser | None = None
+	connection = None
 	try:
-		browser = await playwright.chromium.connect_over_cdp(
+		connection = await BrowserConnector().connect(
+			config.browser_driver,
 			cdp_url,
 			headers=cdp_headers_for_url(cdp_url) or None,
-			timeout=60_000,
 		)
-		context = browser.contexts[0] if browser.contexts else await browser.new_context(accept_downloads=True)
+		browser = connection.browser
+		if connection.fallback_reason is not None:
+			logger.warning(
+				'Patchright could not attach before task start; using Playwright fallback: %s', connection.fallback_reason
+			)
+		context = (
+			None
+			if config.experiment_mode
+			else browser.contexts[0]
+			if browser.contexts
+			else await browser.new_context(accept_downloads=True)
+		)
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
+			browser=browser,
 			queue=queue,
 			config=config,
 			llm=llm,
 			statuses=statuses,
 			sec_task_semaphore=sec_task_semaphore,
+			browser_driver=connection.driver,
+			browser_driver_fallback_reason=connection.fallback_reason,
+			endpoint_label=config.experiment_endpoint_label or f'cdp-{worker_id}',
 		)
 	except Exception as exc:
 		# Playwright connection errors may repeat the endpoint verbatim.  Avoid
 		# traceback logging here so evaluator access tokens never reach artifacts.
 		logger.error('CDP worker failed for %s: %s', redact_cdp_url(cdp_url), redact_cdp_url(str(exc)))
 	finally:
-		if browser is not None:
+		if connection is not None:
 			try:
-				await browser.close()
+				await connection.close()
 			except Exception as exc:
 				logger.warning('Could not close CDP connection: %s', redact_cdp_url(str(exc)))
 
@@ -539,6 +621,7 @@ async def _local_worker(
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
+			browser=browser,
 			queue=queue,
 			config=config,
 			llm=llm,
@@ -577,8 +660,8 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	statuses: dict[str, str] = {}
 	sec_task_semaphore = asyncio.Semaphore(1)
 	worker_count = min(config.max_concurrency, len(tasks))
-	async with async_playwright() as playwright:
-		if config.local_browser:
+	if config.local_browser:
+		async with async_playwright() as playwright:
 			browser = await playwright.chromium.launch(headless=config.headless)
 			try:
 				await asyncio.gather(
@@ -596,23 +679,22 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 				)
 			finally:
 				await browser.close()
-		else:
-			worker_urls = config.cdp_urls[:worker_count]
-			worker_count = len(worker_urls)
-			await asyncio.gather(
-				*(
-					_cdp_worker(
-						worker_id=worker_id,
-						playwright=playwright,
-						cdp_url=cdp_url,
-						queue=queue,
-						config=config,
-						statuses=statuses,
-						sec_task_semaphore=sec_task_semaphore,
-					)
-					for worker_id, cdp_url in enumerate(worker_urls)
+	else:
+		worker_urls = config.cdp_urls[:worker_count]
+		worker_count = len(worker_urls)
+		await asyncio.gather(
+			*(
+				_cdp_worker(
+					worker_id=worker_id,
+					cdp_url=cdp_url,
+					queue=queue,
+					config=config,
+					statuses=statuses,
+					sec_task_semaphore=sec_task_semaphore,
 				)
+				for worker_id, cdp_url in enumerate(worker_urls)
 			)
+		)
 
 	# A connection failure must still produce one diagnostic result per task.
 	while not queue.empty():
@@ -641,13 +723,177 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	return summary
 
 
+def _experiment_records_from_artifacts(
+	*,
+	output_dir: Path,
+	tasks: list[CompetitionTask],
+	driver: BrowserDriver,
+	endpoint_label: str,
+	repeat_index: int,
+) -> list[ExperimentRecord]:
+	"""Read one isolated run's task artifacts without retaining CDP credentials."""
+
+	records: list[ExperimentRecord] = []
+	for task in tasks:
+		writer = TaskArtifactWriter(output_dir, task)
+		try:
+			with writer.result_path.open(encoding='utf-8') as result_file:
+				payload = json.load(result_file)
+		except (FileNotFoundError, OSError, json.JSONDecodeError):
+			payload = {}
+		verification = payload.get('verification') if isinstance(payload, dict) else None
+		artifact_complete = _has_complete_experiment_evidence(
+			payload=payload,
+			verification=verification,
+			task=task,
+			driver=driver,
+			endpoint_label=endpoint_label,
+			repeat_index=repeat_index,
+		)
+		challenge_episodes = verification.get('challenge_episodes', 0) if isinstance(verification, dict) else 0
+		if type(challenge_episodes) is not int or challenge_episodes < 0:
+			challenge_episodes = 0
+		status = payload.get('status', 'FAIL_ARTIFACT') if isinstance(payload, dict) else 'FAIL_ARTIFACT'
+		answer = payload.get('agent_answer', '') if isinstance(payload, dict) else ''
+		fallback_reason = payload.get('browser_driver_fallback_reason') if isinstance(payload, dict) else None
+		records.append(
+			ExperimentRecord(
+				driver=driver,
+				endpoint_label=endpoint_label,
+				task_idx=task.task_idx,
+				task_id=task.task_id,
+				repeat_index=repeat_index,
+				challenge_episodes=challenge_episodes,
+				status=str(status),
+				agent_answer=str(answer),
+				fallback_reason=str(fallback_reason) if fallback_reason else None,
+				artifact_complete=artifact_complete,
+			)
+		)
+	return records
+
+
+def _has_complete_experiment_evidence(
+	*,
+	payload: object,
+	verification: object,
+	task: CompetitionTask,
+	driver: BrowserDriver,
+	endpoint_label: str,
+	repeat_index: int,
+) -> bool:
+	"""Require a parseable task result and its bounded verification observation.
+
+	A missing or malformed artifact must not turn into a zero-episode observation:
+	otherwise a failed Patchright run could falsely satisfy the reduction gate.
+	"""
+	if not isinstance(payload, dict) or not isinstance(verification, dict):
+		return False
+	if (
+		payload.get('task_idx') != task.task_idx
+		or payload.get('task_id') != task.task_id
+		or payload.get('browser_driver') != driver.value
+		or payload.get('experiment_endpoint_label') != endpoint_label
+		or payload.get('experiment_repeat_index') != repeat_index
+	):
+		return False
+	challenge_episodes = verification.get('challenge_episodes')
+	click_count = verification.get('click_count')
+	wait_count = verification.get('wait_count')
+	state = verification.get('state')
+	return (
+		type(challenge_episodes) is int
+		and challenge_episodes >= 0
+		and type(click_count) is int
+		and click_count >= 0
+		and type(wait_count) is int
+		and wait_count >= 0
+		and isinstance(state, str)
+		and state in {item.value for item in VerificationState}
+	)
+
+
+async def run_patchright_experiment(config: RunnerConfig) -> ExperimentSummary:
+	"""Run the agreed AB/BA Patchright matrix against isolated local CDP contexts.
+
+	For every configured endpoint, the selected tasks run twice: Playwright then
+	Patchright in round zero, Patchright then Playwright in round one.  The normal
+	runner remains responsible for screenshots, browser actions, and task output;
+	this function merely schedules isolated runs and writes the decision report.
+	"""
+
+	experiment_input = replace(config, experiment_mode=True)
+	experiment_input.validate()
+	if experiment_input.local_browser:
+		raise ValueError('Patchright experiments require CDP URLs')
+	if len(experiment_input.cdp_urls) != 3:
+		raise ValueError('Patchright experiments require exactly three CDP URLs')
+	if experiment_input.limit is not None:
+		raise ValueError('Patchright experiments must not use --limit')
+	if experiment_input.task_indices is not None and experiment_input.task_indices != DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES:
+		raise ValueError(
+			'Patchright experiments require exactly task indices '
+			f'{sorted(DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES)}'
+		)
+	base_config = replace(
+		experiment_input,
+		task_indices=DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES,
+		max_concurrency=1,
+		experiment_mode=True,
+		rerun_failed=False,
+	)
+	tasks = _select_tasks(load_tasks(base_config.input_path), base_config)
+	if {task.task_idx for task in tasks} != DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES:
+		raise ValueError('Patchright experiment task file is missing one or more required task indices')
+
+	records: list[ExperimentRecord] = []
+	for endpoint_index, cdp_url in enumerate(base_config.cdp_urls):
+		endpoint_label = f'cdp-{endpoint_index}'
+		for repeat_index in range(2):
+			drivers = (
+				(BrowserDriver.PLAYWRIGHT, BrowserDriver.PATCHRIGHT)
+				if repeat_index == 0
+				else (BrowserDriver.PATCHRIGHT, BrowserDriver.PLAYWRIGHT)
+			)
+			for driver in drivers:
+				run_output_dir = (
+					base_config.output_dir
+					/ 'experiment_runs'
+					/ endpoint_label
+					/ f'round_{repeat_index}'
+					/ driver.value
+				)
+				run_config = replace(
+					base_config,
+					output_dir=run_output_dir,
+					cdp_urls=[cdp_url],
+					browser_driver=driver,
+					experiment_repeat_index=repeat_index,
+					experiment_endpoint_label=endpoint_label,
+				)
+				await run(run_config)
+				records.extend(
+					_experiment_records_from_artifacts(
+						output_dir=run_output_dir,
+						tasks=tasks,
+						driver=driver,
+						endpoint_label=endpoint_label,
+						repeat_index=repeat_index,
+					)
+				)
+
+	return write_experiment_summary(base_config.output_dir / 'experiment_summary.json', records)
+
+
 __all__ = [
 	'DEFAULT_MAX_CONCURRENCY',
+	'DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES',
 	'MAX_CONCURRENCY',
 	'RunnerConfig',
 	'build_llm',
 	'normalize_sec_user_agent',
 	'resolve_responses_api',
 	'run',
+	'run_patchright_experiment',
 	'validate_model_policy',
 ]

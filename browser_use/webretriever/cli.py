@@ -20,8 +20,10 @@ from browser_use.webretriever.runner import (
 	DEFAULT_MAX_CONCURRENCY,
 	DEFAULT_TASK_TIMEOUT_SECONDS,
 	MAX_CONCURRENCY,
+	BrowserDriver,
 	RunnerConfig,
 	run,
+	run_patchright_experiment,
 )
 
 
@@ -238,6 +240,24 @@ def build_parser(configuration: FileConfiguration | None = None) -> argparse.Arg
 		help='replace failed artifacts (local-browser development only; prohibited in a formal run)',
 	)
 	parser.add_argument(
+		'--browser-driver',
+		choices=tuple(driver.value for driver in BrowserDriver),
+		default=_setting(configuration, 'browser_driver', BrowserDriver.PLAYWRIGHT.value),
+		help='Playwright-compatible client used to attach to a CDP browser',
+	)
+	parser.add_argument(
+		'--patchright-qualification-report',
+		type=Path,
+		default=_setting(configuration, 'patchright_qualification_report', None),
+		help='passing experiment_summary.json required before Patchright is used outside experiment mode',
+	)
+	parser.add_argument(
+		'--patchright-experiment',
+		action=argparse.BooleanOptionalAction,
+		default=_setting(configuration, 'patchright_experiment', False),
+		help='run the two-round AB/BA experiment across the configured local CDP endpoints',
+	)
+	parser.add_argument(
 		'--validate-only',
 		action=argparse.BooleanOptionalAction,
 		default=_setting(configuration, 'validate_only', False),
@@ -301,6 +321,8 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 		rerun_failed=args.rerun_failed,
 		task_indices=task_indices,
 		limit=args.limit,
+		browser_driver=BrowserDriver(args.browser_driver),
+		patchright_qualification_report=args.patchright_qualification_report,
 	)
 	try:
 		config.validate()
@@ -339,7 +361,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 	config = config_from_args(args, parser)
 	try:
-		summary = asyncio.run(run(config))
+		if args.patchright_experiment:
+			summary = asyncio.run(run_patchright_experiment(config)).to_dict()
+		else:
+			summary = asyncio.run(run(config))
 	except KeyboardInterrupt:
 		print('Interrupted; completed task artifacts remain resumable.', file=sys.stderr)
 		return 130

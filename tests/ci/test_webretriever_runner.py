@@ -11,11 +11,13 @@ import pytest
 from browser_use.webretriever import cli
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.configuration import ConfigurationError, load_file_configuration
+from browser_use.webretriever.connection import BrowserDriver
 from browser_use.webretriever.models import CompetitionTask
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
 from browser_use.webretriever.runner import (
 	RunnerConfig,
 	_consume_tasks,
+	_experiment_records_from_artifacts,
 	_result_payload,
 	_run_task,
 	_task_timeout_outcome,
@@ -577,6 +579,28 @@ def test_result_payload_records_end_to_end_task_timing():
 	assert payload['task_timeout_seconds'] == 300
 	assert payload['thought_language'] == DEFAULT_THOUGHT_LANGUAGE
 	assert isinstance(payload['task_completed_at'], str)
+
+
+def test_missing_experiment_result_is_not_treated_as_zero_verification_episodes(tmp_path: Path):
+	task = CompetitionTask.model_validate(
+		{
+			'task_idx': 55,
+			'task_id': 'task-55',
+			'website': 'https://example.com',
+			'task': 'Read the result.',
+		}
+	)
+
+	record = _experiment_records_from_artifacts(
+		output_dir=tmp_path,
+		tasks=[task],
+		driver=BrowserDriver.PATCHRIGHT,
+		endpoint_label='cdp-0',
+		repeat_index=0,
+	)[0]
+
+	assert record.challenge_episodes == 0
+	assert record.artifact_complete is False
 
 
 def test_task_timeout_outcome_preserves_partial_agent_history(tmp_path: Path):
