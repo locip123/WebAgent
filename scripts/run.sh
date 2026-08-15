@@ -1,47 +1,20 @@
-#!/bin/bash
-# ============================================================
-# 评测入口脚本
-# 用法: bash run.sh <task_file> <output_dir> <cdp_url1> [cdp_url2] ...
-#
-# 模型 API 配置请在 config.json 中设置，main.py 会自动读取。
-# ============================================================
-set -e
+#!/usr/bin/env bash
+# Official interface: bash scripts/run.sh <task_file> <output_dir> <cdp_url_1> ...
+set -euo pipefail
 
-# 安装系统依赖（opencv 需要 libopenblas）
-apt-get install -y libopenblas-base > /dev/null 2>&1 || true
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-# ====== 参数校验 ======
-if [ $# -lt 3 ]; then
-    echo "❌ 参数不足"
-    echo "用法: bash run.sh <task_file> <output_dir> <cdp_url1> [cdp_url2] ..."
-    exit 1
+if [ "$#" -lt 3 ]; then
+  echo "Usage: bash scripts/run.sh <task_file> <output_dir> <cdp_url_1> [cdp_url_2 ...]" >&2
+  exit 2
 fi
 
-TASK_FILE="$1"
-OUTPUT_DIR="$2"
-shift 2
-CDP_URLS=("$@")
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd "$script_dir/.." && pwd)"
 
-if [ ! -f "$TASK_FILE" ]; then
-    echo "❌ 任务文件不存在: $TASK_FILE"
-    exit 1
+if [ ! -f "$1" ]; then
+  echo "Task file does not exist: $1" >&2
+  exit 2
 fi
 
-echo "📋 任务文件: $TASK_FILE"
-echo "📁 输出目录: $OUTPUT_DIR"
-echo "🔗 CDP URLs (${#CDP_URLS[@]}):"
-for u in "${CDP_URLS[@]}"; do
-    echo "  ${u:0:80}..."
-done
-
-# ====== 运行 ======
-cd "$PROJECT_DIR/src/agent"
-python3 main.py \
-    --input "$TASK_FILE" \
-    --output "$OUTPUT_DIR" \
-    --cdp_url "${CDP_URLS[@]}"
-
-echo "✅ 评测完成"
+# Keep vendored code self-contained and never echo evaluator CDP URLs or tokens.
+export PYTHONPATH="$project_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m browser_use.webretriever.submission "$@"

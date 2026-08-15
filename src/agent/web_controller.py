@@ -22,7 +22,9 @@ def connect_existing_sandbox(cdp_url, access_token):
     """Connect to existing sandbox, set global headers"""
     global _sandbox_instance, _cdp_headers
     _cdp_headers = {"X-Access-Token": access_token}
-    print(f"✅ Connected to existing sandbox, CDP: {cdp_url[:60]}...")
+    # The endpoint query can contain an access token.  Keep authentication
+    # behavior unchanged while ensuring evaluator credentials never enter logs.
+    print("✅ Connected to existing sandbox")
     return cdp_url
 
 # Internal headers cache

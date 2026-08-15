@@ -1,0 +1,17 @@
+<tables>
+{% for df in context.dfs %}
+{% include 'shared/dataframe.tmpl' with context %}
+{% endfor %}
+</tables>
+
+{% include 'shared/sql_functions.tmpl' with context %}
+
+Authoritative user question:
+{{ context.memory.get_last_message() }}
+
+Return Python code in exactly this form and nothing else:
+```python
+result = execute_sql_query("""SELECT ...""")
+```
+
+The SQL must be one read-only SELECT or WITH query over only the table names above. Perform filtering, grouping, joins, ratios, and sorting inside SQL. Return a small decisive result. Never import modules, access files or URLs, call plotting functions, or perform Python post-processing.
