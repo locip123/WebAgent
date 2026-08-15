@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.webretriever.artifacts import atomic_write_json
+from browser_use.webretriever.model_retry import invoke_with_reconnect_retries
 
 _MANIFEST_SCHEMA_VERSION = 1
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
@@ -107,6 +108,10 @@ class AnalysisTable:
 	parser: str
 	active_filters: Mapping[str, Any]
 	row_semantics: Mapping[str, Any]
+	source_urls: list[str]
+	source_artifact_id: str
+	source_sha256: str
+	source_location: str
 
 
 @dataclass(slots=True)
@@ -243,32 +248,38 @@ def _resolve_data_dir(task_dir: Path, data_dir: str | Path) -> Path:
 		trusted_task_dir = task_dir.resolve(strict=True)
 	except (FileNotFoundError, OSError) as exc:
 		raise _InvalidDataDirectory('current task directory does not exist') from exc
-	root = trusted_task_dir / 'chart_data'
 	if not isinstance(data_dir, (str, Path)):
-		raise _InvalidDataDirectory('data_dir must be a path returned by find_chart_data_requests')
+		raise _InvalidDataDirectory('data_dir must be a path returned by a ready data artifact in this task run')
 	raw = Path(data_dir)
 	if not raw.is_absolute():
-		raise _InvalidDataDirectory('data_dir must be an absolute path returned by find_chart_data_requests')
+		raise _InvalidDataDirectory('data_dir must be an absolute path returned by a ready data artifact')
 	if '..' in raw.parts:
 		raise _InvalidDataDirectory('data_dir must not contain parent-directory segments')
-	if root.is_symlink():
-		raise _InvalidDataDirectory('task chart_data root must not be a symbolic link')
-	try:
-		root_resolved = root.resolve(strict=True)
-	except (FileNotFoundError, OSError) as exc:
-		raise _InvalidDataDirectory('task chart_data root does not exist') from exc
 	# Inspect the caller-provided path before resolving it: resolving first would
 	# erase evidence that an in-root component was a symbolic link.
 	lexical = Path(os.path.abspath(os.fspath(raw)))
-	if root_resolved != root or not _is_relative_to(lexical, root_resolved):
-		raise _InvalidDataDirectory('data_dir is outside the current task chart_data directory')
-	_reject_symlinks(lexical, root_resolved, label='data_dir')
+	roots: list[Path] = []
+	for root_name in ('chart_data', 'data_artifacts'):
+		root = trusted_task_dir / root_name
+		if root.is_symlink():
+			raise _InvalidDataDirectory(f'task {root_name} root must not be a symbolic link')
+		try:
+			root_resolved = root.resolve(strict=True)
+		except (FileNotFoundError, OSError):
+			continue
+		if root_resolved != root:
+			raise _InvalidDataDirectory(f'task {root_name} root must not resolve elsewhere')
+		roots.append(root_resolved)
+	allowed_root = next((root for root in roots if lexical != root and _is_relative_to(lexical, root)), None)
+	if allowed_root is None:
+		raise _InvalidDataDirectory('data_dir is outside this task\'s chart_data or data_artifacts directories')
+	_reject_symlinks(lexical, allowed_root, label='data_dir')
 	try:
 		resolved = raw.resolve(strict=True)
 	except (FileNotFoundError, OSError) as exc:
 		raise _InvalidDataDirectory('data_dir does not exist') from exc
-	if resolved == root_resolved or not _is_relative_to(resolved, root_resolved):
-		raise _InvalidDataDirectory('data_dir is outside the current task chart_data directory')
+	if resolved == allowed_root or not _is_relative_to(resolved, allowed_root):
+		raise _InvalidDataDirectory('data_dir is outside its allowed task artifact root')
 	if not resolved.is_dir():
 		raise _InvalidDataDirectory('data_dir is not a directory')
 	return resolved
@@ -390,7 +401,7 @@ def _load_manifest_tables(
 		if not _SHA256_RE.fullmatch(expected_manifest_sha256):
 			raise _InvalidManifest('trusted manifest SHA-256 is invalid')
 		if _sha256_file(manifest_path) != expected_manifest_sha256:
-			raise _InvalidManifest('manifest checksum no longer matches find_chart_data_requests')
+			raise _InvalidManifest('manifest checksum no longer matches its runtime registration (find_chart_data_requests or browser download)')
 	try:
 		manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
 	except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -458,6 +469,24 @@ def _load_manifest_tables(
 				not isinstance(value, int) or isinstance(value, bool) for value in source_ids
 			):
 				raise _InvalidManifest(f'{table_id} source_request_ids must contain integers')
+			def source_metadata(name: str, *, default: Any) -> Any:
+				return table.get(name, dataset.get(name, default))
+			source_urls = source_metadata('source_urls', default=[])
+			if not isinstance(source_urls, list) or any(
+				not isinstance(value, str) or not value or len(value) > 4_000 for value in source_urls
+			):
+				raise _InvalidManifest(f'{table_id} source_urls must be a bounded string list')
+			source_artifact_id = source_metadata('source_artifact_id', default='')
+			if not isinstance(source_artifact_id, str) or len(source_artifact_id) > 256:
+				raise _InvalidManifest(f'{table_id} source_artifact_id must be a bounded string')
+			source_sha256 = source_metadata('source_sha256', default='')
+			if source_sha256 and (not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256)):
+				raise _InvalidManifest(f'{table_id} source_sha256 must be a SHA-256 value')
+			if not isinstance(source_sha256, str):
+				raise _InvalidManifest(f'{table_id} source_sha256 must be a string')
+			source_location = source_metadata('source_location', default='')
+			if not isinstance(source_location, str) or len(source_location) > 4_000:
+				raise _InvalidManifest(f'{table_id} source_location must be a bounded string')
 			sql_name = _safe_sql_name(table_id or dataset_id, dataset_index + len(loaded) + 1, used_sql_names)
 			loaded.append(
 				AnalysisTable(
@@ -472,6 +501,10 @@ def _load_manifest_tables(
 					parser=parser,
 					active_filters=dict(active_filters),
 					row_semantics=dict(row_semantics),
+					source_urls=list(source_urls),
+					source_artifact_id=source_artifact_id,
+					source_sha256=source_sha256,
+					source_location=source_location,
 				)
 			)
 	if not loaded:
@@ -837,6 +870,7 @@ class PandasAICodeBackend:
 	) -> GeneratedAnalysisCode:
 		if timeout_seconds <= 0:
 			raise TimeoutError
+		deadline = time.monotonic() + timeout_seconds
 		loop = asyncio.get_running_loop()
 		usage: dict[str, int] = {}
 		usage_lock = threading.Lock()
@@ -853,11 +887,14 @@ class PandasAICodeBackend:
 					prompt = instruction.to_string() if hasattr(instruction, 'to_string') else str(instruction)
 
 					async def invoke() -> Any:
-						return await llm.ainvoke([SystemMessage(content=_PANDASAI_SYSTEM_PROMPT), UserMessage(content=prompt)])
+						return await invoke_with_reconnect_retries(
+							lambda: llm.ainvoke([SystemMessage(content=_PANDASAI_SYSTEM_PROMPT), UserMessage(content=prompt)]),
+							timeout_seconds=lambda: deadline - time.monotonic(),
+						)
 
 					future = asyncio.run_coroutine_threadsafe(invoke(), loop)
 					try:
-						response = future.result(timeout=max(0.1, timeout_seconds))
+						response = future.result(timeout=max(0.1, deadline - time.monotonic()))
 					except BaseException:
 						future.cancel()
 						raise
@@ -878,7 +915,7 @@ class PandasAICodeBackend:
 				)
 				frame.schema.name = table.sql_name
 				frame.schema.description = (
-					f'Normalized chart table {table.table_id}; parser={table.parser}; '
+					f'Normalized source table {table.table_id}; parser={table.parser}; '
 					f'active_filters={_canonical_json(table.active_filters)[:1_000]}; '
 					f'row_semantics={_canonical_json(table.row_semantics)[:1_000]}'
 				)
@@ -1103,6 +1140,9 @@ def _table_summaries(tables: Sequence[AnalysisTable]) -> list[dict[str, Any]]:
 			'parser': table.parser,
 			'active_filters': _canonical_json(table.active_filters)[:2_000],
 			'row_semantics': _canonical_json(table.row_semantics)[:2_000],
+			'source_urls': table.source_urls[:8],
+			'source_artifact_id': table.source_artifact_id,
+			'source_location': table.source_location,
 		}
 		for table in tables[:16]
 	]
@@ -1136,6 +1176,10 @@ def _provenance(tables: Sequence[AnalysisTable]) -> list[dict[str, Any]]:
 			'parser': table.parser,
 			'active_filters': table.active_filters,
 			'row_semantics': table.row_semantics,
+			'source_urls': table.source_urls,
+			'source_artifact_id': table.source_artifact_id,
+			'source_sha256': table.source_sha256,
+			'source_location': table.source_location,
 		}
 		for table in tables
 	]
@@ -1197,7 +1241,7 @@ def _bounded_payload(payload: dict[str, Any], max_chars: int) -> tuple[dict[str,
 
 
 class DataAnalysisAssistant:
-	"""Validate a chart artifact and analyze its manifest-listed tables."""
+	"""Validate a task-local data artifact and analyze its manifest-listed tables."""
 
 	def __init__(
 		self,
@@ -1227,7 +1271,7 @@ class DataAnalysisAssistant:
 		self.query_executor = query_executor or IsolatedDuckDBExecutor()
 		self.max_code_repair_attempts = max_code_repair_attempts
 		# The production agent passes a mutable registry populated only from
-		# successful find_chart_data_requests results. Unit-level callers may omit
+		# successful ready-artifact registrations. Unit-level callers may omit
 		# it when directly exercising manifest validation.
 		self.trusted_manifest_hashes = trusted_manifest_hashes
 
@@ -1262,7 +1306,7 @@ class DataAnalysisAssistant:
 						'status': 'invalid_manifest',
 						'analysis_id': analysis_id,
 						'analysis_query': query,
-						'error': 'data_dir was not registered by find_chart_data_requests in this task run',
+						'error': 'data_dir was not registered by find_chart_data_requests or a ready browser download in this task run',
 					},
 					usage,
 				)
@@ -1353,15 +1397,15 @@ class DataAnalysisAssistant:
 			'sql_result': _answer_result(query_result),
 		}
 		try:
-			response = await _invoke_with_timeout(
-				self.llm.ainvoke(
+			response = await invoke_with_reconnect_retries(
+				lambda: self.llm.ainvoke(
 					[
 						SystemMessage(content=_ANSWER_SYSTEM_PROMPT),
 						UserMessage(content=json.dumps(answer_prompt, ensure_ascii=False, separators=(',', ':'), default=str)),
 					],
 					output_format=AnalysisAnswer,
 				),
-				remaining,
+				timeout_seconds=lambda: deadline - time.monotonic(),
 			)
 			_merge_usage(usage, _usage_dict(getattr(response, 'usage', None)))
 			answer = getattr(response, 'completion', None)

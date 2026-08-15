@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+
+import pytest
 
 from browser_use.webretriever.connection import BrowserDriver
 from browser_use.webretriever.experiment import (
 	PATCHRIGHT_EXPERIMENT_ENDPOINT_LABELS,
 	PATCHRIGHT_EXPERIMENT_TASK_INDICES,
+	REBROWSER_EXPERIMENT_ENDPOINT_LABELS,
+	REBROWSER_EXPERIMENT_TASK_INDICES,
 	ExperimentRecord,
 	patchright_qualification_report_passes,
+	rebrowser_qualification_report_passes,
 	summarize_experiment,
 	write_experiment_summary,
 )
+from browser_use.webretriever.runner import RunnerConfig
 
 
 def _record(
@@ -44,6 +51,29 @@ def _qualified_matrix_records() -> list[ExperimentRecord]:
 				records.append(
 					ExperimentRecord(BrowserDriver.PATCHRIGHT, endpoint, task_idx, f'task-{task_idx}', repeat, 0, 'SUCCESS', '42')
 				)
+	return records
+
+
+def _qualified_rebrowser_records() -> list[ExperimentRecord]:
+	records: list[ExperimentRecord] = []
+	for endpoint in REBROWSER_EXPERIMENT_ENDPOINT_LABELS:
+		for task_idx in REBROWSER_EXPERIMENT_TASK_INDICES:
+			records.append(
+				ExperimentRecord(BrowserDriver.PLAYWRIGHT, endpoint, task_idx, f'task-{task_idx}', 0, 1, 'SUCCESS', '42')
+			)
+			records.append(
+				ExperimentRecord(
+					BrowserDriver.REBROWSER,
+					endpoint,
+					task_idx,
+					f'task-{task_idx}',
+					0,
+					0,
+					'SUCCESS',
+					'42',
+					runtime_fix_mode='addBinding',
+				)
+			)
 	return records
 
 
@@ -128,3 +158,40 @@ def test_persisted_qualification_report_rejects_missing_verification_evidence(tm
 	write_experiment_summary(report_path, records)
 
 	assert patchright_qualification_report_passes(report_path) is False
+
+
+def test_rebrowser_summary_requires_the_agreed_single_endpoint_single_round_pair(tmp_path) -> None:
+	records = _qualified_rebrowser_records()
+	summary = summarize_experiment(records, candidate_driver=BrowserDriver.REBROWSER)
+
+	assert summary.complete is True
+	assert summary.qualifies_rebrowser is True
+	assert summary.qualifies_patchright is False
+	assert summary.challenge_episodes == {'playwright': 6, 'rebrowser': 0}
+
+	report_path = tmp_path / 'rebrowser.json'
+	write_experiment_summary(report_path, records, candidate_driver=BrowserDriver.REBROWSER)
+	assert rebrowser_qualification_report_passes(report_path) is True
+
+	incomplete_path = tmp_path / 'incomplete-rebrowser.json'
+	write_experiment_summary(incomplete_path, records[:-1], candidate_driver=BrowserDriver.REBROWSER)
+	assert rebrowser_qualification_report_passes(incomplete_path) is False
+
+
+def test_formal_rebrowser_run_requires_a_passing_single_endpoint_report(tmp_path) -> None:
+	config = RunnerConfig(
+		input_path=Path('data/data/protocol3.json'),
+		output_dir=tmp_path / 'output',
+		model='gpt-4.1',
+		api_key='test-key',
+		api_base=None,
+		cdp_urls=['ws://127.0.0.1:9222/devtools/browser/test'],
+		browser_driver=BrowserDriver.REBROWSER,
+	)
+	with pytest.raises(ValueError, match='rebrowser-qualification-report'):
+		config.validate()
+
+	report_path = tmp_path / 'rebrowser.json'
+	write_experiment_summary(report_path, _qualified_rebrowser_records(), candidate_driver=BrowserDriver.REBROWSER)
+	config.rebrowser_qualification_report = report_path
+	config.validate()

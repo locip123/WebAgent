@@ -93,7 +93,7 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 		optional=frozenset({'chart_cursor'}), description='normalize current chart traffic or continue its saved packet'
 	),
 	'call_data_analysis_assistant': ActionParameterContract(
-		frozenset({'analysis_query', 'data_dir'}), description='analyze a validated task-local chart artifact'
+		frozenset({'analysis_query', 'data_dir'}), description='analyze a validated task-local data artifact'
 	),
 	'calculate': ActionParameterContract(
 		frozenset({'operation', 'text'}), description='calculate over browser-observed JSON numbers'

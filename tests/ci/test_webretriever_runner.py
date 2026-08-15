@@ -10,6 +10,7 @@ import pytest
 
 from browser_use.webretriever import cli
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
+from browser_use.webretriever.artifacts import TaskArtifactWriter
 from browser_use.webretriever.configuration import ConfigurationError, load_file_configuration
 from browser_use.webretriever.connection import BrowserDriver
 from browser_use.webretriever.models import CompetitionTask
@@ -390,14 +391,23 @@ async def test_sec_task_without_declared_user_agent_logs_warning(monkeypatch, tm
 	class FakeRuntime:
 		declared_user_agents: list[str | None] = []
 
-		def __init__(self, _context: Any, _task_dir: Path, _logger: Any, *, declared_user_agent: str | None = None) -> None:
+		def __init__(
+			self,
+			_context: Any,
+			_task_dir: Path,
+			_logger: Any,
+			*,
+			declared_user_agent: str | None = None,
+			task_identity: dict[str, Any] | None = None,
+		) -> None:
 			self.declared_user_agents.append(declared_user_agent)
+			assert task_identity is not None
 			self.visited_urls = ['https://www.sec.gov/']
 
 		async def start(self, _website: str) -> None:
 			return None
 
-		async def close(self) -> None:
+		async def close(self, *, timeout_seconds: float = 60.0) -> None:
 			return None
 
 		def capture_payload(self) -> dict[str, Any]:
@@ -436,6 +446,9 @@ async def test_sec_task_without_declared_user_agent_logs_warning(monkeypatch, tm
 	assert status == 'SUCCESS'
 	assert FakeRuntime.declared_user_agents == [None]
 	assert 'running without a declared User-Agent' in caplog.text
+	timing = json.loads((tmp_path / 'output' / task.directory_name / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['attempt_count'] == 0
+	assert timing['steps'] == []
 
 
 @pytest.mark.asyncio
@@ -563,9 +576,20 @@ def test_result_payload_records_end_to_end_task_timing():
 			'task': 'Read the result.',
 		}
 	)
+	timing_summary = {
+		'decision_step_count': 2,
+		'attempt_count': 3,
+		'successful_attempt_count': 2,
+		'failed_attempt_count': 1,
+		'timed_out_attempt_count': 0,
+		'cancelled_attempt_count': 0,
+		'model_wait_seconds': 12.5,
+		'retry_wait_seconds': 8.0,
+		'total_wait_seconds': 20.5,
+	}
 	payload = _result_payload(
 		task,
-		AgentRunOutcome(status='SUCCESS', duration_seconds=1.25),
+		AgentRunOutcome(status='SUCCESS', duration_seconds=1.25, model_call_timing_summary=timing_summary),
 		urls=['https://example.com/result'],
 		model='gpt-5.4',
 		task_started_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
@@ -578,7 +602,112 @@ def test_result_payload_records_end_to_end_task_timing():
 	assert payload['task_elapsed_seconds'] == 12.346
 	assert payload['task_timeout_seconds'] == 300
 	assert payload['thought_language'] == DEFAULT_THOUGHT_LANGUAGE
+	assert payload['model_call_timing_summary'] == timing_summary
 	assert isinstance(payload['task_completed_at'], str)
+
+
+def test_result_payload_records_cleanup_without_overriding_the_task_status():
+	task = CompetitionTask.model_validate(
+		{
+			'task_idx': 0,
+			'task_id': '0123456789abcdef0123456789abcdef',
+			'website': 'https://example.com',
+			'task': 'Read the result.',
+		}
+	)
+	payload = _result_payload(
+		task,
+		AgentRunOutcome(status='FAIL_TASK_TIMEOUT'),
+		urls=[],
+		model='gpt-5.4',
+		cleanup={'status': 'timed_out', 'grace_seconds': 60.0, 'residual_tasks': {'background': 1}},
+	)
+
+	assert payload['status'] == 'FAIL_TASK_TIMEOUT'
+	assert payload['cleanup'] == {
+		'status': 'timed_out',
+		'grace_seconds': 60.0,
+		'residual_tasks': {'background': 1},
+	}
+
+
+@pytest.mark.asyncio
+async def test_task_timeout_persists_result_when_runtime_cleanup_resists_cancellation(monkeypatch, tmp_path: Path):
+	cleanup_started = asyncio.Event()
+	cleanup_cancelled = asyncio.Event()
+	release_cleanup = asyncio.Event()
+
+	class FakeRuntime:
+		def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+			self.visited_urls = ['https://example.test/']
+
+		async def start(self, _website: str) -> None:
+			return None
+
+		async def close(self, *, timeout_seconds: float) -> dict[str, Any]:
+			cleanup_started.set()
+			try:
+				await release_cleanup.wait()
+			except asyncio.CancelledError:
+				cleanup_cancelled.set()
+				await release_cleanup.wait()
+			return {'status': 'completed', 'residual_tasks': {}}
+
+		def cleanup_diagnostics(self) -> dict[str, Any]:
+			return {'status': 'timed_out', 'residual_tasks': {'background': 1}}
+
+		def capture_payload(self) -> dict[str, Any]:
+			return {'capture_time': 'probe', 'total_requests': 0, 'all_requests': []}
+
+	class FakeAgent:
+		partial_outcome = None
+		model_call_timing_payload = None
+
+		def __init__(self, **_kwargs: Any) -> None:
+			return None
+
+		async def run(self) -> AgentRunOutcome:
+			await asyncio.sleep(10)
+			return AgentRunOutcome(status='SUCCESS')
+
+		def salvage_partial_answer(self) -> None:
+			return None
+
+	monkeypatch.setattr('browser_use.webretriever.runner.BrowserRuntime', FakeRuntime)
+	monkeypatch.setattr('browser_use.webretriever.runner.ProtocolIIIAgent', FakeAgent)
+	monkeypatch.setattr('browser_use.webretriever.runner.TASK_FINALIZATION_GRACE_SECONDS', 0.02)
+	loop = asyncio.get_running_loop()
+	loop.call_later(0.12, release_cleanup.set)
+	task = CompetitionTask.model_validate(
+		{
+			'task_idx': 0,
+			'task_id': 'timeout-cleanup-probe-task-000001',
+			'website': 'https://example.test/',
+			'task': 'Verify timeout persistence.',
+		}
+	)
+	started_at = loop.time()
+	status = await _run_task(
+		context=cast(Any, object()),
+		task=task,
+		config=_config(tmp_path, task_timeout_seconds=0.02),
+		llm=cast(Any, object()),
+		logger=__import__('logging').getLogger('test-webretriever-timeout-cleanup'),
+	)
+	elapsed = loop.time() - started_at
+
+	result = json.loads((tmp_path / 'output' / task.directory_name / 'result.json').read_text(encoding='utf-8'))
+	await asyncio.sleep(0)
+	assert status == 'FAIL_TASK_TIMEOUT'
+	assert elapsed < 0.1
+	assert cleanup_started.is_set()
+	assert cleanup_cancelled.is_set()
+	assert result['status'] == 'FAIL_TASK_TIMEOUT'
+	assert result['cleanup']['status'] == 'timed_out'
+	assert result['cleanup']['residual_tasks'] == {'background': 1}
+	writer = TaskArtifactWriter(tmp_path / 'output', task)
+	assert writer.acquire_lock(blocking=False)
+	writer.release_lock()
 
 
 def test_missing_experiment_result_is_not_treated_as_zero_verification_episodes(tmp_path: Path):

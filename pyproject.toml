@@ -123,6 +123,7 @@ browser = "browser_use.cli:main"  # Alias for browser-use
 browser-use-tui = "browser_use.cli:browser_use_tui_main"  # Deprecated alias for browser-use
 webretriever-agent = "browser_use.webretriever.cli:main"
 webretriever-patchright-smoke = "browser_use.webretriever.patchright_smoke:main"
+webretriever-rebrowser-smoke = "browser_use.webretriever.rebrowser_smoke:main"
 
 [build-system]
 requires = ["hatchling"]

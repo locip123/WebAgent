@@ -1,287 +1,315 @@
 # WebRetriever Protocol III 比赛 Agent
 
-本仓库新增了独立的 `webretriever-agent` 入口。它不会调用 Browser-Use 原有的默认搜索工具，而是用一个只通过 Playwright 操作浏览器的比赛运行时，完成“导航到正确页面 + 提取最终答案”两部分任务。
+`webretriever` 是本仓库面向 WebRetriever Challenge Protocol III 的独立浏览器 Agent。它只通过 Playwright 操作浏览器：从题目给出的起始网站出发，完成站内导航、信息提取和可追溯取证，并按比赛目录格式输出结果。
 
-比赛主页：[WebRetriever Challenge](https://mininglamp-ai.github.io/WebRetriever_Challenge/)；规则与提交格式以[官方 Guide](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/)为准。官方模板尚未发布时，本入口同时兼容开源参考实现的 `--input --output --cdp_url` 参数。
+- 比赛主页：[WebRetriever Challenge](https://mininglamp-ai.github.io/WebRetriever_Challenge/)
+- 官方规则与提交格式：[Challenge Guide](https://mininglamp-ai.github.io/WebRetriever_Challenge/guide/)
+- 任务数据：`data/data/protocol3.json`
+- 唯一运行入口：`python run_webretriever.py`
 
-## 已落实的比赛约束
+> 以官方 Guide 和正式评测提供的入口约定为最终准则。本文件说明当前仓库中的实现与本地开发流程。
 
-| 规则 | 实现 |
-|---|---|
-| 浏览器交互只能使用 Playwright | `browser_use/webretriever/browser.py` 是独立 Playwright runtime；不复用项目原有的 CDP 操作链 |
-| 禁止外部搜索引擎 | prompt 与运行时双重拦截常见搜索/答案引擎；目标站自己的搜索允许使用 |
-| 每题最多 100 步 | CLI 和 runner 均硬限制为 `1..100` |
-| 单次模型请求最多 180 秒 | OpenAI-compatible client 与外层 `asyncio.wait_for` 双重限制 |
-| 最多 8 路并发 | CDP URL、worker 和 CLI 配置均限制为最多 8 |
-| 不得重试任务 | 正式 CDP 模式拒绝 `--rerun-failed`；一个任务只从队列领取一次 |
-| Protocol III 最终答案 | `result.json` 写入 `agent_answer`，并要求非空浏览器证据后才可 `SUCCESS` |
-| 原始/可视化轨迹 | 每步分别写入 `trajectory/` 与 `trajectory_visual/` |
-| XHR/Fetch 记录 | 请求、响应状态及有界响应正文写入 `capture.json` |
-| 标准答案隔离 | 输入 loader 只保留 `task_idx/task_id/website/task`；公开数据里的 `answer` 永远不会进入模型 prompt 或任务序列化 |
-| 崩溃与断点安全 | JSON 原子落盘、每题 advisory lock、成功/失败结果默认均不自动重跑 |
+## 1. 比赛约束与实现保证
 
-模型提示还覆盖多条件筛选复核、分页与 top-N、跨页聚合、PDF/Excel 表头及单位、图表 tooltip、XHR 参数对应关系和网页 prompt injection。
+| 比赛要求 | 当前实现 |
+| --- | --- |
+| 浏览器交互必须使用 Playwright + CDP | 独立的 Playwright 运行时；正式评测连接主办方提供的 CDP 浏览器 |
+| 不得使用外部通用搜索引擎 | Prompt 与运行时均拦截常见外部搜索/答案引擎；起始站自身搜索可用 |
+| 每题最多 100 步 | CLI 与 runner 均限制为 1–100 步 |
+| 单次模型调用最多 180 秒 | 客户端与外层超时共同约束 |
+| 最多 8 路并发 | worker、CDP URL 和 VLM 端口均限制为最多 8 个 |
+| 正式任务失败不得自动重跑 | CDP 模式拒绝 `--rerun-failed`，每题只从队列领取一次 |
+| 输出最终答案和轨迹 | `result.json`、`capture.json`、原始与可视化双轨截图均按任务保存 |
+| `SUCCESS` 的判定 | 必须同时存在非空 `agent_answer` 和至少一条浏览器来源证据 |
+| 公开答案不得泄漏给 Agent | loader 仅保留任务元数据；`answer` 不会进入 prompt 或任务序列化 |
 
-比赛任务基于真实网站构建，网站出现的反爬/风控机制（需要人工点击验证）属于真实 Web 环境的一部分，没法完全避免，需要用户设计agent去解决这个验证。处理反爬/风控机制是本次挑战赛的核心考点之一。
+真实网站可能出现反爬、风控或需要人工点击验证。这是比赛 Web 环境的一部分，Agent 应在合规的浏览器交互范围内识别和处理；不能依赖外部搜索引擎绕过任务。
 
-📖 备赛导读 #3｜模型和环境——哪些你自备、哪些官方给
-
-一、一句话总结
-
-· 你出：模型推理资源（API 或自部署）
-· 官方出：云端浏览器沙箱 + 评测任务 + 评分系统
-
-你的 Agent 通过 OpenAI 兼容 API 调用模型，浏览器操作走 CDP。两条线互不干扰。
-
-二、模型资源（你自己管）
-
-Agent 必须通过 OpenAI 兼容格式的 API 调用模型。两种选择：
-
-选项 A：商业闭源 API
-各厂商允许使用的最高版本：
-· OpenAI — GPT-5.4
-· Anthropic — Claude 4.6
-· Google — Gemini 3.1
-· xAI — Grok 4.3
-· 智谱 AI — GLM-5V-Turbo
-· Moonshot — Kimi-K2.6
-· 阿里云 — Qwen3.7（新增）
-⚠️ 超出上述版本禁止使用。未列出的厂商不限版本。
-
-选项 B：自研/自部署模型
-允许，赛后需提交模型权重供组委会校验。
-
-⚠️ 组委会会审查模型调用情况，严查套壳和中转绕版本限制，违规成绩无效。
-
-三、浏览器环境（备赛 vs 正式）
-
-· 备赛（现在）：你自己起 Chrome + CDP（上期已教）
-· 正式评测：官方提供云端沙箱，CDP URL 通过命令行参数自动传入你的脚本
-
-你的代码只需要能接收 CDP URL 就行，备赛和正式的逻辑不用改。
-
-四、run_agent.sh 怎么配
-
-这是你 Agent 的入口脚本。正式评测时，系统通过命令行参数传入三样东西：
-· 任务文件路径
-· 输出目录路径
-· CDP URL（云端浏览器地址）
-
-备赛时你手动填这些值，比如：
-CDP_URLS=("http://localhost:9222") ← 本地 Chrome 地址
-模型配置填你自己的 API endpoint 和 key。
-
-正式评测时这些由系统传入，你不需要硬编码。
-
-五、关键限制
-
-· 最多 8 个任务并发
-· 单次模型请求超时 3 分钟
-· 每个任务最多 100 步
-· 失败不重试，该任务计 0 分，但不影响其他任务得分
-· 禁止使用搜索引擎（赛后验证操作轨迹）
-
-六、第三方框架可以用吗？
-
-可以。Browser Use、Playwright 原生、或任何你自己的框架都行。只要满足：
-· 接受 CDP URL 作为输入
-· 按规定格式输出结果到指定目录
-框架不限，模型不限（在版本规则内）。
-
-🚀 现在可以做：
-① 确定你要用什么模型（商业 API 还是自部署），拿到 API key / endpoint
-② 在 run_agent.sh 里配好模型地址 + 本地 CDP URL
-③ 跑一次开源项目示例，确认模型调用 + 浏览器控制都通
-
- 备赛导读 #2｜Playwright 与 CDP——动手前必须搞定的前提环境
-
-一、为什么这是硬前提
-
-评测指南原文：
-⚠️ 评测环境通过 CDP 提供云端浏览器，Agent 必须基于 Playwright 进行所有浏览器交互操作。
-
-不管你用什么模型、什么框架，操作浏览器只能走 Playwright + CDP 这条路。正式评测时官方给你一个云端浏览器的 CDP 地址，你的代码连上去就能操作。
-
-备赛第一步不是调模型，是先把 Playwright 连 CDP 跑通。这个没通，后面一切跑不起来。
-
-二、两个概念
-
-· CDP（Chrome DevTools Protocol）— Chrome 的远程控制接口。给 Chrome 加一个启动参数，它就在某个端口监听，允许外部程序控制（点击、输入、截图等）。
-· Playwright — 浏览器自动化库（Python），通过 CDP 连接 Chrome 并用代码控制。开源项目 src/agent/web_controller.py 就是基于它实现的。
-
-关系：CDP 是通道，Playwright 是工具。
-
-三、本地怎么搞（备赛调试用）
-
-起一个带调试端口的 Chrome：
-
-macOS
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/tmp/chrome-debug-profile"
-
-Linux
-google-chrome --remote-debugging-port=9222 --user-data-dir="/tmp/chrome-debug-profile" --no-first-run --no-sandbox
-
-Windows（CMD）
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\temp\chrome-debug-profile"
-（Chrome 已加入 PATH 的话，直接 chrome --remote-debugging-port=9222 --user-data-dir="C:\temp\chrome-debug-profile"）
-
-✅ 验证（三个系统通用）
-curl http://localhost:9222/json/version
-返回一段 JSON（含 webSocketDebuggerUrl 字段）= CDP 通道就绪
-
-⚙️ 配置
-在 scripts/run_agent.sh 里填：
-CDP_URLS=("http://localhost:9222")
-
-四、备赛 vs 正式评测
-
-· 备赛：你自己本地起 Chrome + CDP，自己配地址
-· 正式：官方提供云端沙箱，CDP 地址自动传入，代码逻辑不用改
-
-🚀 现在可以做：
-① 按你的系统（macOS/Linux/Windows）起带 --remote-debugging-port=9222 的 Chrome
-② curl http://localhost:9222/json/version 验证连通
-③ 没装 Playwright：pip install playwright && playwright install chromium
-
-搞定后就具备跑通开源项目示例的前提条件。卡在哪一步群里问。
-
-📢 后续还有更多备赛导读，持续更新中。
-
-## 环境安装
+## 2. 环境安装
 
 ```bash
 conda activate Browser-Use
 cd /workspace/code/browser-use
-uv pip install --python "$CONDA_PREFIX/bin/python" -e .
 ```
 
-正式评测连接主办方提供的 CDP 浏览器，不需要在本机安装 Chromium。仅在本地调试时执行：
+当前环境使用 Python 3.12。新机器可按以下方式安装：
+
+```bash
+conda create -n Browser-Use python=3.12 -y
+conda activate Browser-Use
+uv pip install --python "$CONDA_PREFIX/bin/python" -e '.[core]' litellm 'httpx[socks]'
+uvx playwright install chromium --with-deps
+```
+
+正式评测连接主办方提供的云端浏览器，通常不需要本机安装 Chromium；仅本地浏览器调试时才需安装：
 
 ```bash
 python -m playwright install chromium
 ```
 
-## 模型配置
+## 3. 模型与敏感配置
 
-支持 OpenAI-compatible Responses API 或 Chat Completions。当前项目的 LiteLLM Responses API 可使用：
+程序会自动加载根目录的 `.env`。推荐配置 OpenAI-compatible Responses API：
 
 ```dotenv
-LITELLM_MODEL=gpt-5.4
-LITELLM_BASE_URL=http://127.0.0.1:4000/v1
-LITELLM_MASTER_KEY=your-key
+WEBRETRIEVER_API_KEY=your-api-key
+WEBRETRIEVER_API_BASE=http://127.0.0.1:8317/v1
+WEBRETRIEVER_MODEL=gpt-5.6-luna
 WEBRETRIEVER_API_MODE=responses
+WEBRETRIEVER_REASONING_EFFORT=low
 ```
 
-也可以使用 `WEBRETRIEVER_MODEL`、`WEBRETRIEVER_API_BASE`、`WEBRETRIEVER_API_KEY`。环境变量比把密钥写进命令历史更安全；runner 不会在日志中输出 API key，并会遮盖 CDP URL 中的 `access_token`。
+也兼容 LiteLLM / OpenAI 常见变量：`LITELLM_MODEL`、`LITELLM_BASE_URL`、`LITELLM_MASTER_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 与 `OPENAI_API_KEY`。命令行的 `--api-key`、`--api-base`、`--model`、`--api-mode`、`--reasoning-effort` 优先级更高。
 
-模型的 `thought` 字段默认使用中文（最终 `answer` 仍按任务语言输出）。如需覆盖，可传 `--thought-language English`，或设置 `WEBRETRIEVER_THOUGHT_LANGUAGE=English`；命令行优先。每个 `result.json` 也会记录实际使用的 `thought_language`，便于复现。
+当前本机代理可用 `gpt-5.6-luna`（默认）或 `gpt-5.4`，例如：
 
-请遵守 Guide 公布的闭源模型版本上限。runner 会拒绝能够明确识别为高于上限的模型名，但最终合规责任仍在参赛队伍。
+```bash
+python run_webretriever.py --config webretriever.toml --model gpt-5.4
+```
 
-## 先验证任务文件
+模型版本是否合规则以 Guide 为准。请勿提交 `.env`，也不要在日志、终端截图或对话中暴露 API key、CDP URL 中的 `access_token` 或真实联系方式。
 
-这一步不启动浏览器、不调用模型，也不会显示公开数据中的标准答案：
+### SEC EDGAR 任务
+
+访问 SEC 域名的任务应提供真实的组织名和联系邮箱：
+
+```bash
+export WEBRETRIEVER_SEC_USER_AGENT='Your Organization sec-admin@your-domain.example'
+```
+
+该请求头仅用于 SEC 及其子域，并会在产物记录中脱敏。未设置时程序会警告但继续运行；SEC 可能拒绝匿名自动化流量。多个 SEC 任务会自动串行，以降低共享 IP 的速率限制风险。
+
+## 4. 浏览器与 CDP
+
+CDP（Chrome DevTools Protocol）是 Chrome 的远程控制通道；Playwright 通过它完成点击、输入、截图和页面读取。正式评测时主办方会将 CDP URL 传给运行脚本，本地开发可自行启动 Chrome。
+
+Linux 示例：
+
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="/workspace/code/browser-use/tmp/chrome-debug-profile" \
+  --no-first-run \
+  --no-sandbox
+```
+
+验证本地 CDP 是否可用：
+
+```bash
+curl http://127.0.0.1:9222/json/version
+```
+
+返回含 `webSocketDebuggerUrl` 的 JSON 即表示通道就绪。项目也提供了用于本机三浏览器开发环境的服务脚本：
+
+```bash
+./start_webretriever_services.sh
+```
+
+该脚本会管理本机代理、辅助服务及端口 `9222`、`9223`、`9224` 的 Chrome 实例；保持前台运行，按 `Ctrl+C` 停止它启动的服务。
+
+### 4.1 虚拟显示中的有头 Chrome：风控验证对照测试
+
+```bash
+conda activate Browser-Use
+cd /workspace/code/browser-use
+
+PROFILE_DIR="$(mktemp -d "$PWD/tmp/webretriever-headed-profile.XXXXXX")"
+Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >tmp/xvfb-webretriever.log 2>&1 &
+export DISPLAY=:99
+
+google-chrome \
+  --no-sandbox \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9233 \
+  --user-data-dir="$PROFILE_DIR" \
+  --no-first-run \
+  --no-default-browser-check \
+  about:blank >tmp/chrome-headed-9233.log 2>&1 &
+curl -fsS http://127.0.0.1:9233/json/version \
+  | jq '{Browser, user_agent: .["User-Agent"]}'
+```
+
+```bash
+python run_webretriever.py \
+  --config webretriever.toml \
+  --input data/data/protocol3.json \
+  --output outputs/rebrowser_1x1_headed_retry \
+  --cdp-url http://127.0.0.1:9233 \
+  --task-index 55,57,69,76,84,96 \
+  --max-concurrency 1 \
+  --rebrowser-experiment
+```
+
+```bash
+jq . outputs/rebrowser_1x1_headed_retry/experiment_summary.json
+```
+
+## 5. 集中运行配置
+
+根目录的 [`webretriever.toml`](webretriever.toml) 集中管理任务文件、产物目录、模型接口、浏览器、并发、步骤数、超时、筛题和 Prompt 日志。默认配置面向安全的本地前三题开发：
+
+```bash
+python run_webretriever.py --config webretriever.toml
+```
+
+命令行参数可以临时覆盖配置，例如：
+
+```bash
+python run_webretriever.py --config webretriever.toml --task-index 9
+```
+
+布尔配置也可反向覆盖，如 `--no-local-browser`、`--no-headed`、`--no-structured-prompt-log`。配置文件会严格校验未知字段和错误类型。
+
+正式评测时，设置 `local_browser = false`，提供 `cdp_urls`（或不配置它以读取 `WEBRETRIEVER_CDP_URLS`、`WEBRETRIEVER_CDP_URL`、`CDP_URL`），并将 `task_indices` 设为 `[]` 以运行全部任务。真实 API key 与 SEC 联系方式应只保留在 `.env` 或环境变量中。
+
+## 6. 运行流程
+
+### 6.1 先校验任务文件
+
+此操作不启动浏览器、不调用模型，也不会将公开答案发给 Agent：
+
+```bash
+python run_webretriever.py \
+  --input data/data/protocol3.json \
+  --output outputs/validate \
+  --validate-only
+```
+
+当前 `protocol3.json` 应加载 100 个任务，并显示：
+
+```json
+"ground_truth_exposed_to_agent": false
+```
+
+### 6.2 本地冒烟测试
+
+通过 Playwright 启动本地 Chromium，测试前三题：
+
+```bash
+python run_webretriever.py \
+  --input data/data/protocol3.json \
+  --output outputs/protocol3_first3_local \
+  --local-browser \
+  --task-index 0-2 \
+  --api-mode responses \
+  --reasoning-effort low \
+  --max-steps 100 \
+  --model-timeout 180 \
+  --task-timeout 300
+```
+
+`--task-index` 支持单值、逗号和闭区间，例如 `3` 或 `1,4-6`。开发时可加 `--headed` 观察页面，并且只有 `--local-browser` 模式允许 `--rerun-failed` 覆盖失败任务。
+
+`SUCCESS` 仅代表 Agent 得到了非空答案和浏览器证据，并不代表已与公开参考答案完成离线比对。
+
+### 6.3 正式 CDP 运行
+
+评测方提供 URL 后，在当前终端配置：
+
+```bash
+export CDP_URL='evaluator-provided-cdp-url'
+```
+
+运行全部任务：
 
 ```bash
 python run_webretriever.py \
   --input data/data/protocol3.json \
   --output outputs/protocol3 \
-  --validate-only
+  --cdp_url "$CDP_URL" \
+  --api-mode responses \
+  --max-steps 100 \
+  --model-timeout 180
 ```
 
-预期显示 100 个合法任务及 `ground_truth_exposed_to_agent: false`。
-
-## 本地单题冒烟测试
+调试指定题目时才加筛选，例如 `--task-index 4-6`。多个 CDP 地址可提升并行度，实际 worker 数受 CDP URL 数量和 `--max-concurrency`（1–8）共同限制：
 
 ```bash
 python run_webretriever.py \
   --input data/data/protocol3.json \
-  --output outputs/local-smoke \
+  --output outputs/protocol3 \
+  --cdp_url http://127.0.0.1:9222 http://127.0.0.1:9223 http://127.0.0.1:9224 \
+  --max-concurrency 3 \
+  --api-mode responses
+```
+
+也可用空格或逗号分隔的 `WEBRETRIEVER_CDP_URLS` 提供多个地址。正式 CDP 模式禁止 `--rerun-failed`；已有终态 `result.json` 的任务会跳过，保留为 `PENDING` 的任务可用相同命令继续执行。
+
+### 6.4 自部署 OpenAI-compatible VLM
+
+可配置最多 8 个本地端口，按 worker 轮询；使用端口时不能同时指定 `api_base`：
+
+```bash
+python run_webretriever.py \
+  --input data/data/protocol3.json \
+  --output outputs/protocol3_vllm \
   --local-browser \
-  --task-index 0 \
-  --max-steps 20 \
-  --api-mode responses
+  --vlm_ports 8000 8001 \
+  --model your-model \
+  --api-mode chat-completions \
+  --task-timeout 1200
 ```
 
-`--task-index 3,6-8` 支持逗号和闭区间。`--limit`、`--headed`、`--rerun-failed` 都只用于本地开发；其中失败任务重跑在正式比赛中不允许。
+自部署模型的权重提交与复现责任以 Guide 为准；runner 只处理接口连接与运行限制。
 
-## 正式 CDP 运行
+## 7. 输出、图表数据与恢复
 
-单浏览器：
-
-```bash
-python run_webretriever.py \
-  --input "$TASK_FILE" \
-  --output "$OUTPUT_DIR" \
-  --cdp_url "$CDP_URL" \
-  --model "$WEBRETRIEVER_MODEL" \
-  --api-mode responses
-```
-
-最多 8 个浏览器并发：
-
-```bash
-python run_webretriever.py \
-  --input "$TASK_FILE" \
-  --output "$OUTPUT_DIR" \
-  --cdp_url "$CDP_URL_1" "$CDP_URL_2" "$CDP_URL_3"
-```
-
-自部署的 OpenAI-compatible vLLM 也兼容参考实现的端口参数；多个端口按 worker 轮询分配，默认使用 Chat Completions：
-
-```bash
-python run_webretriever.py \
-  --input "$TASK_FILE" \
-  --output "$OUTPUT_DIR" \
-  --cdp_url "$CDP_URL_1" "$CDP_URL_2" \
-  --model your-served-model-name \
-  --vlm_ports 8000 8001
-```
-
-按 Guide 要求，自部署模型需要提交可复现的模型权重；runner 只负责连接与限额校验。
-
-也可以使用安装后的命令：
-
-```bash
-webretriever-agent --input "$TASK_FILE" --output "$OUTPUT_DIR" --cdp_url "$CDP_URL"
-```
-
-不要在终端输出、提交记录或问题截图中暴露带 `access_token` 的 CDP URL。主办方发布最终模板后，应再次对照其入口文件名和新增参数；当前入口已经保留参考实现的标准参数名。
-
-## 输出目录
+每个任务使用 `{task_idx}_{task_id}` 目录：
 
 ```text
 OUTPUT_DIR/
 ├── 0_<task_id>/
-│   ├── trajectory/          # 原始逐步截图
-│   ├── trajectory_visual/   # 带元素编号和动作标注的截图
-│   ├── downloads/           # 浏览器轨迹中下载的文档
-│   ├── result.json          # 状态、动作、URL、agent_answer、evidence
-│   ├── capture.json         # XHR/Fetch 轨迹
-│   └── model_prompts.json   # 可复现的结构化模型输入调试轨迹
-├── locks/                   # 每题 advisory lock 标记
+│   ├── result.json              # 状态、动作、答案、证据、耗时、token 使用量
+│   ├── capture.json             # Playwright 捕获的 XHR/Fetch 请求与有界响应体
+│   ├── model_prompts.json       # 可复现的模型输入轨迹
+│   ├── trajectory/              # 未标注的原始逐步截图
+│   ├── trajectory_visual/       # 带元素编号和动作标签的截图
+│   ├── downloads/               # 浏览器下载的文档
+│   └── chart_data/<scan_id>/    # 图表网络包、规范化数据和分析产物
+├── locks/                       # 每题 advisory lock
 └── logs/
-    ├── worker_*.log
-    └── summary.json
+    ├── summary.json             # 本次选中任务的状态汇总
+    └── worker_<id>_<date>.log
 ```
 
-`SUCCESS` 必须同时有最终答案和至少一条带来源上下文的证据。模型超时、浏览器异常、连续动作失败或耗尽步数都会保留可诊断的失败状态和已有轨迹。
+`result.json` 的 `duration_seconds` 记录 Agent 循环耗时；`task_started_at`、`task_completed_at`、`task_elapsed_seconds` 记录端到端耗时。超出 `task_timeout_seconds` 会写入 `FAIL_TASK_TIMEOUT`。常见状态还有 `PENDING`、`SUCCESS`、`FAIL`、`FAIL_MODEL`、`FAIL_MODEL_TIMEOUT`、`FAIL_BROWSER`、`FAIL_MAX_STEPS` 和 `FAIL_RUNTIME`。
 
-默认的 `model_prompts.json` 使用 `webretriever-model-prompts/v2-lines`：`system_prompt` 与每步 `prompt` 都是逐行字符串数组，因此原始 prompt 中的每一个换行都会在 JSON 中显示为一行，避免把整段内容压成带大量 `\n` 的单一字符串。用 `"\n".join(prompt)` 可精确还原实际发送的文本。若需要详细调试 schema（任务、执行状态、浏览器观测、信任级别、字符/token 统计、启用的 playbook、裁剪原因，以及模型调用耗时/usage/error），显式添加 `--structured-prompt-log`；它会输出 `webretriever-model-prompts/v2-structured`。
+下载内容支持提取 PDF、TXT、CSV、JSON、DOCX、XLS/XLSX 和 ZIP 内的文本/CSV。图表任务会先用 `find_chart_data_requests` 保存数据请求，再以该任务返回的绝对 `data_dir` 调用 `call_data_analysis_assistant`。分析助手只读取 manifest 中列出的 CSV，并校验任务身份、路径、符号链接和 SHA-256；受限 SQL 在禁用外部访问的隔离 DuckDB 子进程中执行。无法可靠还原表格时会标记为 `saved_raw_only`，再回退到 cursor、DOM 表格或 tooltip。
 
-## 测试
+默认 `model_prompts.json` 是 `webretriever-model-prompts/v2-lines`：系统提示和每步 prompt 按真实换行写为字符串数组，可用 `"\\n".join(prompt)` 精确还原。添加 `--structured-prompt-log` 后切换为 `v2-structured`，额外记录字符/token 统计、启用 playbook、裁剪原因及每次模型调用的耗时、usage 与错误。
+
+前台运行时按 `Ctrl+C` 可中止。已完成任务产物会保留，当前任务通常保持为 `PENDING`；使用相同输入、输出目录和命令可恢复。正式比赛不要删除已有产物后重跑。
+
+快速检查结果：
+
+```bash
+jq . outputs/protocol3/logs/summary.json
+find outputs/protocol3 -path '*/result.json' -exec jq -r '[.task_idx,.status,.agent_answer] | @tsv' {} \;
+```
+
+## 8. 测试与代码检查
 
 ```bash
 python -m pytest -q \
   tests/ci/test_webretriever_models.py \
   tests/ci/test_webretriever_browser.py \
   tests/ci/test_webretriever_agent.py \
-  tests/ci/test_webretriever_runner.py
+  tests/ci/test_webretriever_network.py \
+  tests/ci/test_webretriever_chart_data.py \
+  tests/ci/test_webretriever_data_analysis.py \
+  tests/ci/test_webretriever_runner.py \
+  tests/ci/models/test_openai_responses_api.py
 
-python -m ruff check browser_use/webretriever tests/ci/test_webretriever_*.py run_webretriever.py
-python -m pyright browser_use/webretriever run_webretriever.py
+python -m ruff check browser_use/webretriever browser_use/llm/openai/chat.py
+python -m pyright browser_use/webretriever browser_use/llm/openai/chat.py
 ```
 
-测试不需要真实模型，也不会访问比赛站点。若只想验证公开 Protocol III 数据是否能安全加载，运行上面的 `--validate-only` 即可。
+这些测试不需要真实模型，也不会访问比赛站点。若只验证任务文件是否可安全加载，使用第 6.1 节的 `--validate-only`。
 
+## 9. 提交前检查
 
+- 对照最新官方 Guide，确认模型版本、自部署模型要求、入口名和提交格式。
+- 正式运行使用评测方 CDP 地址，保留 `--max-steps 100`，并确保没有 `--rerun-failed`。
+- 不使用外部通用搜索引擎；所有浏览器证据均来自任务允许的站内浏览。
+- 检查 `logs/summary.json` 和每题 `result.json`，确认成功任务同时包含答案与证据。
+- 不提交 `.env`、真实 API key、带令牌的 CDP URL 或个人联系信息。

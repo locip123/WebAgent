@@ -97,6 +97,82 @@ def test_legacy_system_description_accepts_headings_with_commas() -> None:
 	assert [section['title'] for section in sections] == ['ROLE, SCOPE', 'NEXT ACTION']
 
 
+def test_step_prompt_renders_runtime_artifact_and_download_recovery_notices() -> None:
+	task = _task()
+	composer = PromptComposer(task, PromptTarget(model_id='gpt-5.4'), max_steps=100, thought_language='简体中文')
+	document = composer.compose_step(
+		StepContext(
+			step_index=0,
+			observation=_observation(),
+			history=(),
+			memory='',
+			last_outcome='',
+			data_artifact_notice='A ready data artifact is available at /task/data_artifacts/download-1.',
+			download_recovery_notice='A timed-out download did not end the task; choose another first-party route.',
+		)
+	)
+
+	assert '===== ONE-TIME DATA ARTIFACT NOTICE =====' in document.text
+	assert 'call_data_analysis_assistant' not in document.text.split('===== ONE-TIME DATA ARTIFACT NOTICE =====')[1].split(
+		'===== END ONE-TIME DATA ARTIFACT NOTICE ====='
+	)[0]
+	assert '===== DOWNLOAD RECOVERY NOTICE =====' in document.text
+	assert 'did not end the task' in document.text
+	execution = next(section for section in document.sections if section['id'] == 'execution_state')
+	assert execution['fields']['data_artifact_notice'].startswith('A ready data artifact')
+	assert execution['fields']['download_recovery_notice'].startswith('A timed-out download')
+
+
+def test_step_prompt_preserves_download_metadata_and_head_tail_content_preview() -> None:
+	observation = _observation(
+		downloads=[
+			{
+				'filename': 'bid-summary.pdf',
+				'url': 'https://example.com/bid-summary.pdf',
+				'source': 'browser_download',
+				'status': 'ready',
+				'size_bytes': 4096,
+				'mime_type': 'application/pdf',
+				'text': 'PROMPT-HEAD ' + ('middle ' * 500) + ' PROMPT-TAIL',
+			}
+		]
+	)
+	_, document = _compose(_task(task='Read the PDF download.'), observation)
+
+	assert 'bid-summary.pdf' in document.text
+	assert 'https://example.com/bid-summary.pdf' in document.text
+	assert 'browser_download' in document.text
+	assert 'application/pdf' in document.text
+	assert 'PROMPT-HEAD' in document.text
+	assert 'PROMPT-TAIL' in document.text
+	assert 'content_preview_truncated' in document.text
+	assert 'content_characters' in document.text
+	assert '"text"' not in document.text
+	assert document.metrics['sources']['observation_downloads']['retained_tokens'] <= 8_000
+
+
+def test_step_prompt_compresses_download_previews_without_dropping_file_metadata() -> None:
+	downloads = [
+		{
+			'filename': f'official-{index}.csv',
+			'url': f'https://example.com/official-{index}.csv',
+			'source': 'browser_download',
+			'status': 'ready',
+			'size_bytes': index + 100,
+			'text': f'HEAD-{index} ' + ('middle ' * 2_000) + f' TAIL-{index}',
+		}
+		for index in range(100)
+	]
+	observation = _observation(page_text='page evidence ' * 30_000, downloads=downloads)
+	_, document = _compose(_task(task='Read the downloaded files.'), observation)
+
+	for index in range(100):
+		assert f'official-{index}.csv' in document.text
+		assert f'https://example.com/official-{index}.csv' in document.text
+	assert document.metrics['sources']['observation_downloads']['retained_tokens'] <= 8_000
+	assert 'content_preview_head' in document.text
+
+
 @pytest.mark.parametrize(
 	'task_text,observation_updates,expected,absent',
 	[

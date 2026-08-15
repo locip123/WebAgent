@@ -24,6 +24,7 @@ from browser_use.webretriever.chart_data import (
 	sanitize_packet_metadata,
 	sanitize_url,
 )
+from browser_use.webretriever.model_retry import invoke_with_reconnect_retries
 
 _FILTERED_RESOURCE_TYPES = frozenset({'image', 'font', 'stylesheet', 'media', 'manifest'})
 _FILTERED_METHODS = frozenset({'OPTIONS', 'HEAD'})
@@ -739,12 +740,12 @@ class ChartNetworkInspector:
 				'===== END AUTHORITATIVE CONTEXT =====\n\n'
 				f'{packet_text}'
 			)
-			response = await _await_with_hard_timeout(
-				self.llm.ainvoke(
+			response = await invoke_with_reconnect_retries(
+				lambda: self.llm.ainvoke(
 					[SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT), UserMessage(content=prompt)],
 					output_format=ChartRequestBatchDecision,
 				),
-				self.model_timeout_seconds,
+				timeout_seconds=self.model_timeout_seconds,
 			)
 			_merge_usage(usage, _usage_dict(response.usage))
 			for decision in response.completion.decisions:

@@ -16,6 +16,7 @@ from browser_use.webretriever.data_analysis import (
 	GeneratedAnalysisCode,
 	QueryResult,
 )
+from browser_use.webretriever.download_artifacts import DownloadArtifactError, prepare_download_artifact
 
 TASK_IDENTITY = {
 	'task_idx': 4,
@@ -202,6 +203,65 @@ async def test_analysis_validates_manifest_executes_safe_sql_and_saves_result(tm
 	saved = data_dir / 'analysis' / f'{payload["analysis_id"]}.json'
 	assert saved.is_file()
 	assert json.loads(saved.read_text(encoding='utf-8')) == payload
+
+
+@pytest.mark.asyncio
+async def test_analysis_accepts_normalized_browser_download_with_source_provenance(tmp_path: Path):
+	download_dir = tmp_path / 'downloads'
+	download_dir.mkdir()
+	source = download_dir / 'results.json'
+	source.write_text(
+		json.dumps({'studies': [{'nct_id': 'NCT001', 'enrollment': 12}, {'nct_id': 'NCT002', 'enrollment': 24}]}),
+		encoding='utf-8',
+	)
+	artifact = prepare_download_artifact(
+		task_dir=tmp_path,
+		task_identity=TASK_IDENTITY,
+		source_path=source,
+		source_url='https://example.com/api/v2/studies?query=demo',
+		content_type='application/json',
+	)
+	data_dir = Path(artifact['data_dir'])
+	backend = FakeCodeBackend(
+		['result = execute_sql_query("SELECT nct_id, enrollment FROM results_json_root_studies ORDER BY enrollment DESC LIMIT 1")']
+	)
+	executor = FakeExecutor(QueryResult(columns=['nct_id', 'enrollment'], rows=[['NCT002', 24]]))
+	llm = FakeAnswerLLM(AnalysisAnswer(answer='NCT002，入组人数为 24。', evidence_row_indices=[0]))
+	assistant = DataAnalysisAssistant(
+		llm,
+		task_dir=tmp_path,
+		task_identity=TASK_IDENTITY,
+		code_backend=backend,
+		query_executor=executor,
+		trusted_manifest_hashes={str(data_dir.resolve()): str(artifact['manifest_sha256'])},
+	)
+
+	payload = json.loads((await assistant.execute(analysis_query='哪项研究入组人数最多？', data_dir=str(data_dir))).output)
+
+	assert payload['status'] == 'ok'
+	assert payload['evidence_rows'] == [{'row_index': 0, 'values': {'nct_id': 'NCT002', 'enrollment': 24}}]
+	assert payload['provenance'][0]['source_urls'] == ['https://example.com/api/v2/studies?query=demo']
+	assert payload['provenance'][0]['source_artifact_id'] == artifact['artifact_id']
+	assert len(payload['provenance'][0]['source_sha256']) == 64
+	assert payload['provenance'][0]['source_location'] == 'results.json:$.studies'
+
+
+def test_failed_download_normalization_preserves_no_partial_analysis_directory(tmp_path: Path):
+	download_dir = tmp_path / 'downloads'
+	download_dir.mkdir()
+	source = download_dir / 'broken.json'
+	source.write_text('{not json', encoding='utf-8')
+
+	with pytest.raises(DownloadArtifactError, match='not valid JSON'):
+		prepare_download_artifact(
+			task_dir=tmp_path,
+			task_identity=TASK_IDENTITY,
+			source_path=source,
+			source_url='https://example.com/broken.json',
+		)
+
+	artifact_root = tmp_path / 'data_artifacts'
+	assert not artifact_root.exists() or not list(artifact_root.iterdir())
 
 
 @pytest.mark.asyncio

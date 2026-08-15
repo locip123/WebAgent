@@ -351,6 +351,37 @@ async def test_start_uses_exact_url_and_close_cleans_listeners_and_page(tmp_path
 	assert all(not handlers for handlers in context.handlers.values())
 
 
+async def test_close_cancels_resistant_background_task_within_its_cleanup_budget(tmp_path: Path) -> None:
+	started = asyncio.Event()
+	cancelled = asyncio.Event()
+	release = asyncio.Event()
+
+	async def resistant_background_task() -> None:
+		started.set()
+		try:
+			await release.wait()
+		except asyncio.CancelledError:
+			cancelled.set()
+			await release.wait()
+
+	runtime = make_started_runtime(tmp_path, FakePage('https://example.test/'))
+	worker = asyncio.create_task(resistant_background_task())
+	runtime._background_tasks.add(worker)
+	await started.wait()
+	started_at = asyncio.get_running_loop().time()
+	try:
+		report = await runtime.close(timeout_seconds=0.02)
+	finally:
+		release.set()
+		await asyncio.sleep(0)
+
+	elapsed = asyncio.get_running_loop().time() - started_at
+	assert elapsed < 0.2
+	assert cancelled.is_set()
+	assert report['status'] == 'timed_out'
+	assert report['residual_tasks']['background'] == 1
+
+
 async def test_sec_start_declares_user_agent_before_first_navigation(tmp_path: Path) -> None:
 	page = FakePage()
 	context = FakeContext([page])
@@ -568,6 +599,85 @@ async def test_observe_download_placeholder_fails_fast_without_safe_page(tmp_pat
 	assert placeholder.closed
 	assert runtime.page is None
 	assert placeholder.screenshot_paths == []
+
+
+async def test_execute_recovers_when_download_placeholder_closes_during_settle(tmp_path: Path) -> None:
+	class ClosingDownloadPlaceholderPage(FakeDownloadPlaceholderPage):
+		async def wait_for_timeout(self, milliseconds: float) -> None:
+			self.closed = True
+			raise PlaywrightError('Target page, context or browser has been closed')
+
+	opener = FakePage('https://example.test/report')
+	placeholder = ClosingDownloadPlaceholderPage(opener)
+	runtime = make_started_runtime(tmp_path, opener)
+	runtime._owned_pages.append(placeholder)  # type: ignore[arg-type]
+
+	async def click_that_opens_download_placeholder(action: str, params: dict[str, Any]) -> str:
+		runtime.page = placeholder  # type: ignore[assignment]
+		return 'clicked element 4'
+
+	runtime._perform_action = click_that_opens_download_placeholder  # type: ignore[method-assign]
+
+	assert await runtime.execute({'action': 'click', 'element_id': 4}) == 'clicked element 4'
+	assert runtime.page is opener
+	assert placeholder.closed
+
+
+async def test_observe_recovers_screenshot_failure_to_live_opener(tmp_path: Path) -> None:
+	class ScreenshotTimeoutPopupPage(FakePage):
+		def __init__(self, opener: FakePage) -> None:
+			super().__init__('https://popup.example/share')
+			self._opener = opener
+
+		async def opener(self) -> FakePage:
+			return self._opener
+
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			raise PlaywrightTimeoutError('popup renderer did not respond')
+
+	opener = FakePage('https://example.test/report')
+	popup = ScreenshotTimeoutPopupPage(opener)
+	runtime = make_started_runtime(
+		tmp_path,
+		popup,
+		context=FakeContext([]),
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+	runtime._owned_pages = [opener, popup]  # type: ignore[list-item]
+
+	observation = await runtime.observe(0)
+
+	assert observation.url == opener.url
+	assert runtime.page is opener
+	assert len(popup.screenshot_paths) == 1
+	assert len(opener.screenshot_paths) == 2
+
+
+async def test_observe_recovers_screenshot_failure_to_recent_live_page(tmp_path: Path) -> None:
+	class ScreenshotTimeoutPage(FakePage):
+		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
+			self.screenshot_paths.append(path)
+			raise PlaywrightTimeoutError('renderer did not respond')
+
+	backup = FakePage('https://example.test/backup')
+	failed = ScreenshotTimeoutPage('https://example.test/stuck')
+	runtime = make_started_runtime(
+		tmp_path,
+		failed,
+		context=FakeContext([]),
+		screenshot_timeout_ms=25,
+		cdp_screenshot_timeout_ms=25,
+	)
+	runtime._owned_pages = [backup, failed]  # type: ignore[list-item]
+
+	observation = await runtime.observe(0)
+
+	assert observation.url == backup.url
+	assert runtime.page is backup
+	assert len(failed.screenshot_paths) == 1
+	assert len(backup.screenshot_paths) == 2
 
 
 async def test_observe_recovers_raw_screenshot_timeout_with_current_cdp_png(tmp_path: Path) -> None:
@@ -912,7 +1022,7 @@ async def test_observe_keeps_raw_screenshot_when_annotated_capture_has_non_timeo
 	assert not (tmp_path / 'trajectory_visual' / '0.png').exists()
 
 
-async def test_observe_propagates_annotated_cdp_recovery_failure(tmp_path: Path) -> None:
+async def test_observe_keeps_raw_screenshot_when_annotated_cdp_recovery_fails(tmp_path: Path) -> None:
 	class AnnotatedScreenshotTimeoutPage(FakePage):
 		async def screenshot(self, *, path: str, **kwargs: Any) -> bytes:
 			self.screenshot_paths.append(path)
@@ -942,11 +1052,11 @@ async def test_observe_propagates_annotated_cdp_recovery_failure(tmp_path: Path)
 		cdp_screenshot_timeout_ms=25,
 	)
 
-	with pytest.raises(RuntimeError) as error:
-		await runtime.observe(0)
+	observation = await runtime.observe(0)
 
-	assert 'annotated screenshot deadline expired' in str(error.value)
-	assert 'annotated CDP capture failed' in str(error.value)
+	assert observation.screenshot == _VALID_PNG
+	assert (tmp_path / 'trajectory' / '0.png').read_bytes() == _VALID_PNG
+	assert not (tmp_path / 'trajectory_visual' / '0.png').exists()
 
 
 async def test_model_actions_double_click_hover_xy_drag_and_page_scroll(tmp_path: Path) -> None:
@@ -1006,6 +1116,32 @@ async def test_find_text_searches_full_download_text(tmp_path: Path) -> None:
 
 	assert 'download report.pdf:' in result
 	assert 'needle answer 42' in result
+
+
+async def test_find_text_uses_task_local_lunr_index_and_keeps_numeric_literals_distinct(tmp_path: Path) -> None:
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page)
+	runtime.downloads.append(
+		{
+			'filename': 'bid-summary.pdf',
+			'url': 'https://example.test/bid-summary.pdf',
+			'source': 'browser_download',
+			'status': 'ready',
+			'text': ('prefix ' * 600) + 'Item 0012 PREPARE WATER POLLUTION CONTROL PROGRAM 525.00' + (' suffix' * 600),
+		}
+	)
+
+	result = json.loads(await runtime.execute(AgentDecision(action='find_text', text='0012')))
+
+	assert result['search_mode'] == 'lunr'
+	assert result['exact_match_count'] == 1
+	assert result['results'][0]['filename'] == 'bid-summary.pdf'
+	assert result['results'][0]['field'] == 'download.text'
+	assert result['results'][0]['start'] > 2_000
+	assert 'download bid-summary.pdf:' in result['matches'][0]
+
+	assert await runtime.execute(AgentDecision(action='find_text', text='12')) == "No visible text matching '12'"
+	assert await runtime.execute(AgentDecision(action='find_text', text='Item 12')) == "No visible text matching 'Item 12'"
 
 
 async def test_find_text_reopens_truncated_csv_to_search_late_rows(tmp_path: Path) -> None:
@@ -1077,6 +1213,46 @@ def test_observation_render_keeps_network_and_download_evidence_after_long_page_
 	assert 'api/important' in rendered
 	assert 'download evidence' in rendered
 	assert len(rendered) <= 100_000
+
+
+def test_observation_render_includes_complete_download_metadata_and_head_tail_preview() -> None:
+	content = 'HEAD-EVIDENCE ' + ('middle ' * 300) + 'TAIL-EVIDENCE'
+	item = {
+		'filename': 'official.pdf',
+		'suggested_filename': 'official.pdf',
+		'url': 'https://example.test/official.pdf',
+		'source': 'document_response',
+		'status': 'ready',
+		'mime_type': 'application/pdf',
+		'path': '/task/downloads/official.pdf',
+		'size_bytes': 1234,
+		'timestamp': 42.0,
+		'text_truncated': False,
+		'extraction_status': 'complete',
+		'text': content,
+	}
+	observation = BrowserObservation(
+		screenshot=b'',
+		url='https://example.test/',
+		title='title',
+		tabs=[],
+		viewport_width=1280,
+		viewport_height=720,
+		elements=[],
+		page_text='',
+		recent_network=[],
+		downloads=[item],
+	)
+
+	rendered = observation.render_text()
+
+	for value in ('official.pdf', 'https://example.test/official.pdf', 'document_response', 'application/pdf', '1234'):
+		assert value in rendered
+	assert 'content_preview_head' in rendered
+	assert 'HEAD-EVIDENCE' in rendered
+	assert 'TAIL-EVIDENCE' in rendered
+	assert 'content_characters' in rendered
+	assert '"text"' not in rendered
 
 
 def test_observation_render_is_bounded_with_pathological_tabs_and_elements() -> None:
@@ -1943,6 +2119,156 @@ def test_document_response_uses_observed_spreadsheet_extension() -> None:
 		}
 
 	assert BrowserRuntime._document_response_extension(SpreadsheetResponse()) == '.xlsx'  # type: ignore[arg-type]
+
+
+def test_document_response_ignores_non_success_statuses() -> None:
+	class DocumentRequest:
+		resource_type = 'document'
+
+	class NotFoundJSONResponse:
+		request = DocumentRequest()
+		url = 'https://example.test/missing.json'
+		status = 404
+		headers = {'content-type': 'application/json'}
+
+	assert BrowserRuntime._document_response_extension(NotFoundJSONResponse()) is None  # type: ignore[arg-type]
+
+
+def test_document_response_captures_any_successful_non_html_document() -> None:
+	class DocumentRequest:
+		resource_type = 'document'
+
+	class BinaryResponse:
+		request = DocumentRequest()
+		url = 'https://example.test/export'
+		status = 200
+		headers = {'content-type': 'application/octet-stream'}
+
+	assert BrowserRuntime._document_response_extension(BinaryResponse()) == '.bin'  # type: ignore[arg-type]
+
+
+async def test_top_level_json_response_becomes_a_ready_data_artifact(tmp_path: Path) -> None:
+	class DocumentRequest:
+		resource_type = 'document'
+
+	class JSONResponse:
+		request = DocumentRequest()
+		url = 'https://example.test/api/results.json?year=2024'
+		status = 200
+		headers = {'content-type': 'application/json'}
+
+		async def body(self) -> bytes:
+			return b'{"records":[{"name":"alpha","value":42}]}'
+
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(
+		tmp_path,
+		page,
+		task_identity={'task_idx': 1, 'task_id': 'task', 'website': 'https://example.test/', 'task': 'Find the value'},
+	)
+	try:
+		await runtime._save_document_response(JSONResponse(), '.json')  # type: ignore[arg-type]
+		item = runtime.downloads[0]
+		artifact = item['data_artifact']
+		manifest = json.loads((Path(artifact['data_dir']) / 'manifest.json').read_text(encoding='utf-8'))
+
+		assert item['status'] == 'ready'
+		assert item['source'] == 'document_response'
+		assert artifact['status'] == 'ready'
+		assert artifact['table_count'] == 1
+		assert manifest['source']['url'] == JSONResponse.url
+		assert manifest['datasets'][0]['tables'][0]['source_location'] == 'results.json:$.records'
+	finally:
+		await runtime.close()
+
+
+async def test_download_timeout_marks_terminal_state_without_releasing_the_agent(tmp_path: Path) -> None:
+	class DocumentRequest:
+		resource_type = 'document'
+
+	started = asyncio.Event()
+	cancelled = asyncio.Event()
+	release = asyncio.Event()
+
+	class HangingJSONResponse:
+		request = DocumentRequest()
+		url = 'https://example.test/api/slow.json'
+		status = 200
+		headers = {'content-type': 'application/json'}
+
+		async def body(self) -> bytes:
+			started.set()
+			try:
+				await release.wait()
+			except asyncio.CancelledError:
+				cancelled.set()
+				await release.wait()
+			return b'{"records":[{"value":42}]}'
+
+	page = FakePage('https://example.test/')
+	runtime = make_started_runtime(tmp_path, page, download_timeout_ms=1)
+	try:
+		await runtime._save_document_response(HangingJSONResponse(), '.json')  # type: ignore[arg-type]
+		item = runtime.downloads[0]
+		await asyncio.sleep(0)
+
+		assert started.is_set()
+		assert cancelled.is_set()
+		assert item['status'] == 'timed_out'
+		assert 'hard deadline' in item['failure']
+		assert not Path(item['path']).exists()
+
+		release.set()
+		await asyncio.sleep(0)
+		await asyncio.sleep(0)
+		assert item['status'] == 'timed_out'
+	finally:
+		release.set()
+		await runtime.close()
+
+
+async def test_slow_html_navigation_exposes_first_observation_then_stops_at_hard_deadline(tmp_path: Path) -> None:
+	class HangingPage(FakePage):
+		def __init__(self) -> None:
+			super().__init__()
+			self.gate = asyncio.Event()
+			self.stop_calls = 0
+
+		async def goto(self, url: str, **kwargs: Any) -> None:
+			self.goto_urls.append(url)
+			self.url = url
+			self.main_frame.url = url
+			await self.gate.wait()
+
+		async def evaluate(self, expression: str) -> Any:
+			if expression == 'window.stop()':
+				self.stop_calls += 1
+				return None
+			return await super().evaluate(expression)
+
+	page = HangingPage()
+	context = FakeContext([page])
+	runtime = BrowserRuntime(
+		context,  # type: ignore[arg-type]
+		tmp_path,
+		logging.getLogger('test-webretriever'),
+		navigation_first_observation_timeout_ms=1,
+		navigation_timeout_ms=1_000,
+	)
+	try:
+		await runtime.start('https://example.test/slow')
+		first = await runtime.observe(0)
+		assert 'first_observation_ready' in first.page_text
+
+		pending = runtime._pending_navigations[id(page)]
+		pending.started_at -= 2
+		timed_out = await runtime.observe(1)
+		assert 'navigation_timed_out' in timed_out.page_text
+		assert page.stop_calls == 1
+		assert not runtime._pending_navigations
+	finally:
+		page.gate.set()
+		await runtime.close()
 
 
 def test_text_and_xlsx_download_extraction(tmp_path: Path) -> None:

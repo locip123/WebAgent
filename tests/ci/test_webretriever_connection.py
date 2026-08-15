@@ -55,9 +55,7 @@ async def test_standard_connector_connects_over_cdp_and_closes_its_client() -> N
 
 	assert connection.driver is BrowserDriver.PLAYWRIGHT
 	assert connection.fallback_reason is None
-	assert manager.client.chromium.calls == [
-		('http://127.0.0.1:9222', {'headers': {'X-Test': 'yes'}, 'timeout': 60_000})
-	]
+	assert manager.client.chromium.calls == [('http://127.0.0.1:9222', {'headers': {'X-Test': 'yes'}, 'timeout': 60_000})]
 	await connection.close()
 	assert manager.client.chromium.browser.closed is True
 	assert manager.exited is True
@@ -79,3 +77,45 @@ async def test_patchright_connection_falls_back_before_any_task_starts() -> None
 	assert patchright_manager.exited is True
 	assert playwright_manager.client.chromium.calls == [('http://127.0.0.1:9223', {'headers': None, 'timeout': 60_000})]
 	await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebrowser_connection_uses_playwright_and_restores_its_driver_patch() -> None:
+	manager = _FakeManager(_FakeClient(_FakeChromium()))
+	releases = 0
+
+	def acquire():
+		def release() -> None:
+			nonlocal releases
+			releases += 1
+
+		return release
+
+	connector = BrowserConnector(playwright_factory=lambda: manager, rebrowser_acquire=acquire)
+	connection = await connector.connect(BrowserDriver.REBROWSER, 'http://127.0.0.1:9224')
+
+	assert connection.driver is BrowserDriver.REBROWSER
+	assert manager.client.chromium.calls == [('http://127.0.0.1:9224', {'headers': None, 'timeout': 60_000})]
+	await connection.close()
+	await connection.close()
+	assert releases == 1
+
+
+@pytest.mark.asyncio
+async def test_rebrowser_connection_restores_patch_when_attach_fails() -> None:
+	manager = _FakeManager(_FakeClient(_FakeChromium(error=RuntimeError('CDP mismatch'))))
+	releases = 0
+
+	def acquire():
+		def release() -> None:
+			nonlocal releases
+			releases += 1
+
+		return release
+
+	connector = BrowserConnector(playwright_factory=lambda: manager, rebrowser_acquire=acquire)
+	with pytest.raises(RuntimeError, match='CDP mismatch'):
+		await connector.connect(BrowserDriver.REBROWSER, 'http://127.0.0.1:9225')
+
+	assert manager.exited is True
+	assert releases == 1

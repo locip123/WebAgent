@@ -20,6 +20,8 @@ MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-lines'
 STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-structured'
 STRATEGY_REVIEW_PROMPT_LOG_FILENAME = 'strategy_review_prompts.json'
 STRATEGY_REVIEW_PROMPT_LOG_FORMAT = 'webretriever-strategy-review-prompts/v1-lines'
+MODEL_CALL_TIMING_FILENAME = 'model_call_timing.json'
+MODEL_CALL_TIMING_FORMAT = 'webretriever-model-call-timing/v1'
 
 
 def model_prompt_log_metadata() -> dict[str, Any]:
@@ -40,6 +42,26 @@ def prompt_text_lines(text: str) -> list[str]:
 	"""
 
 	return text.split('\n')
+
+
+def empty_model_call_timing_payload() -> dict[str, Any]:
+	"""Return the durable empty timing table for one browser task."""
+
+	return {
+		'format': MODEL_CALL_TIMING_FORMAT,
+		'summary': {
+			'decision_step_count': 0,
+			'attempt_count': 0,
+			'successful_attempt_count': 0,
+			'failed_attempt_count': 0,
+			'timed_out_attempt_count': 0,
+			'cancelled_attempt_count': 0,
+			'model_wait_seconds': 0.0,
+			'retry_wait_seconds': 0.0,
+			'total_wait_seconds': 0.0,
+		},
+		'steps': [],
+	}
 
 try:
 	import fcntl
@@ -201,6 +223,7 @@ class TaskArtifactWriter:
 		self.capture_path = self.task_dir / 'capture.json'
 		self.model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self.strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
+		self.model_call_timing_path = self.task_dir / MODEL_CALL_TIMING_FILENAME
 		self.logs_dir = self.output_dir / 'logs'
 		self.lock_path = self.output_dir / 'locks' / f'{task.directory_name}.lock'
 		self.lock = TaskLock(self.lock_path)
@@ -263,6 +286,8 @@ class TaskArtifactWriter:
 				atomic_write_json(self.model_prompt_log_path, self._empty_model_prompt_log())
 			if not self.strategy_review_prompt_log_path.exists():
 				atomic_write_json(self.strategy_review_prompt_log_path, self._empty_strategy_review_prompt_log())
+			if not self.model_call_timing_path.exists():
+				atomic_write_json(self.model_call_timing_path, empty_model_call_timing_payload())
 		finally:
 			if not already_acquired:
 				self.lock.release()
@@ -334,6 +359,12 @@ class TaskArtifactWriter:
 			}
 		return atomic_write_json(self.capture_path, capture)
 
+	def write_model_call_timing(self, payload: Mapping[str, Any] | None = None) -> Path:
+		"""Atomically save Agent decision-model timing for this task."""
+
+		self.prepare()
+		return atomic_write_json(self.model_call_timing_path, payload or empty_model_call_timing_payload())
+
 
 def prepare_task_directory(output_dir: Path | str, task: CompetitionTask) -> Path:
 	"""Create the official per-task output structure and return its directory."""
@@ -344,12 +375,15 @@ def prepare_task_directory(output_dir: Path | str, task: CompetitionTask) -> Pat
 __all__ = [
 	'MODEL_PROMPT_LOG_FILENAME',
 	'MODEL_PROMPT_LOG_FORMAT',
+	'MODEL_CALL_TIMING_FILENAME',
+	'MODEL_CALL_TIMING_FORMAT',
 	'STRATEGY_REVIEW_PROMPT_LOG_FILENAME',
 	'STRATEGY_REVIEW_PROMPT_LOG_FORMAT',
 	'STRUCTURED_MODEL_PROMPT_LOG_FORMAT',
 	'TaskArtifactWriter',
 	'TaskLock',
 	'atomic_write_json',
+	'empty_model_call_timing_payload',
 	'model_prompt_log_metadata',
 	'prepare_task_directory',
 	'prompt_text_lines',

@@ -10,6 +10,8 @@ from typing import Any
 
 from playwright.async_api import async_playwright
 
+from browser_use.webretriever.rebrowser import activate_rebrowser_driver, rebrowser_runtime_fix_mode
+
 __all__ = ['BrowserConnector', 'BrowserDriver', 'CdpConnection']
 
 
@@ -18,6 +20,7 @@ class BrowserDriver(str, Enum):
 
 	PLAYWRIGHT = 'playwright'
 	PATCHRIGHT = 'patchright'
+	REBROWSER = 'rebrowser'
 
 
 @dataclass(slots=True)
@@ -28,6 +31,8 @@ class CdpConnection:
 	driver: BrowserDriver
 	client_manager: Any
 	fallback_reason: str | None = None
+	rebrowser_runtime_fix_mode: str | None = None
+	on_close: Callable[[], None] | None = None
 
 	async def close(self) -> None:
 		"""Close the browser connection and then its client process."""
@@ -35,7 +40,12 @@ class CdpConnection:
 		try:
 			await self.browser.close()
 		finally:
-			await self.client_manager.__aexit__(None, None, None)
+			try:
+				await self.client_manager.__aexit__(None, None, None)
+			finally:
+				on_close, self.on_close = self.on_close, None
+				if on_close is not None:
+					on_close()
 
 
 class BrowserConnector:
@@ -43,8 +53,10 @@ class BrowserConnector:
 
 	Patchright is optional and imported only when selected.  If it cannot attach
 	before a worker starts its first task, the connector opens a standard
-	Playwright client instead.  No mid-task driver switch is possible because the
-	returned :class:`CdpConnection` owns one browser session.
+	Playwright client instead.  Rebrowser instead applies a version-locked,
+	reversible forward port to the bundled Playwright Node driver and never falls
+	back.  No mid-task driver switch is possible because the returned
+	:class:`CdpConnection` owns one browser session.
 	"""
 
 	def __init__(
@@ -52,10 +64,12 @@ class BrowserConnector:
 		*,
 		playwright_factory: Callable[[], Any] = async_playwright,
 		patchright_factory: Callable[[], Any] | None = None,
+		rebrowser_acquire: Callable[[], Callable[[], None]] = activate_rebrowser_driver,
 		connect_timeout_ms: float = 60_000,
 	) -> None:
 		self.playwright_factory = playwright_factory
 		self.patchright_factory = patchright_factory
+		self.rebrowser_acquire = rebrowser_acquire
 		self.connect_timeout_ms = connect_timeout_ms
 
 	async def connect(
@@ -67,6 +81,20 @@ class BrowserConnector:
 	) -> CdpConnection:
 		"""Connect using ``driver`` and fall back only from Patchright startup."""
 
+		if driver is BrowserDriver.REBROWSER:
+			runtime_fix_mode = rebrowser_runtime_fix_mode()
+			release = self.rebrowser_acquire()
+			try:
+				return await self._connect(
+					driver,
+					cdp_url,
+					headers=headers,
+					on_close=release,
+					rebrowser_runtime_fix_mode=runtime_fix_mode,
+				)
+			except BaseException:
+				release()
+				raise
 		try:
 			return await self._connect(driver, cdp_url, headers=headers)
 		except Exception as exc:
@@ -87,6 +115,8 @@ class BrowserConnector:
 		*,
 		headers: Mapping[str, str] | None,
 		fallback_reason: str | None = None,
+		rebrowser_runtime_fix_mode: str | None = None,
+		on_close: Callable[[], None] | None = None,
 	) -> CdpConnection:
 		manager = self._factory_for(driver)()
 		client = await manager.__aenter__()
@@ -104,10 +134,12 @@ class BrowserConnector:
 			driver=driver,
 			client_manager=manager,
 			fallback_reason=fallback_reason,
+			rebrowser_runtime_fix_mode=rebrowser_runtime_fix_mode,
+			on_close=on_close,
 		)
 
 	def _factory_for(self, driver: BrowserDriver) -> Callable[[], Any]:
-		if driver is BrowserDriver.PLAYWRIGHT:
+		if driver in {BrowserDriver.PLAYWRIGHT, BrowserDriver.REBROWSER}:
 			return self.playwright_factory
 		if self.patchright_factory is not None:
 			return self.patchright_factory

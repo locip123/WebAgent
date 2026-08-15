@@ -49,9 +49,10 @@ BrowserContext、cookie 和标签页继续任务。只有 DOM 无法定位控件
 
 ### 不适用方案
 
-- Patchright、rebrowser、Camoufox、Scrapling 的 stealth/fetcher 路径通常依赖修改版驱动、
-  自己启动浏览器、启动参数、扩展、代理或指纹配置；它们无法可靠改变官方已经启动、只
-  通过 CDP 交付的浏览器，也增加 Playwright-only 规则风险。
+- Patchright 与 Rebrowser 的 driver/CDP 修补只能降低客户端可观察信号，无法改变官方已经
+  启动、只通过 CDP 交付的浏览器二进制、出口 IP 或启动参数；两者均应仅在同一 CDP 端点的
+  可审计对照实验中使用。Camoufox、Scrapling 等路径通常还会自行启动浏览器或接管代理，
+  不适合作为该评测的正式后端。
 - Browser Use Cloud、Skyvern Cloud、Browserbase 等托管 CAPTCHA/stealth 能力绑定它们
   自己的浏览器和代理，不能安装到主办方的 CDP 沙箱中。
 - 外部 CAPTCHA 代解服务、token 注入和人工打码平台会把验证移出可审计的 Playwright
@@ -102,4 +103,3 @@ NONE
 1. 首选 UGround，作为只返回坐标的独立 fallback；
 2. 若还需要通用图标/区域解析，再评估 OmniParser；
 3. Midscene 和 Browser Use watchdog 主要作为架构参考，不引入第二套浏览器控制器。
-

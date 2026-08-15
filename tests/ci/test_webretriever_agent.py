@@ -28,6 +28,8 @@ def _png_bytes() -> bytes:
 @dataclass(slots=True)
 class FakeObservation:
 	url: str = 'https://example.com/result'
+	title: str = 'Example result'
+	page_text: str = 'Independently verified result is 42.'
 	screenshot: bytes = field(default_factory=_png_bytes)
 	elements: list[Any] = field(default_factory=list)
 
@@ -152,7 +154,11 @@ class FakeDataAnalysisAssistant:
 
 
 class HangingLLM:
+	def __init__(self) -> None:
+		self.calls = 0
+
 	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
+		self.calls += 1
 		await asyncio.Event().wait()
 		raise AssertionError('unreachable')
 
@@ -195,6 +201,28 @@ class InvalidOnceLLM(FakeLLM):
 			self.invalid_returned = True
 			raise ModelProviderError('1 validation error for AgentDecision\naction\n  Field required')
 		return SimpleNamespace(completion=self._next_completion(messages), usage=None)
+
+
+class TransientFailureOnceLLM(FakeLLM):
+	def __init__(self, decisions: list[AgentDecision]) -> None:
+		super().__init__(decisions)
+		self.failure_returned = False
+
+	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
+		self.calls.append((messages, output_format))
+		if not self.failure_returned:
+			self.failure_returned = True
+			raise ModelProviderError('upstream temporarily unavailable', status_code=503)
+		return SimpleNamespace(completion=self._next_completion(messages), usage=None)
+
+
+class AuthenticationFailureLLM:
+	def __init__(self) -> None:
+		self.calls = 0
+
+	async def ainvoke(self, messages: list[Any], output_format: Any = None) -> Any:
+		self.calls += 1
+		raise ModelProviderError('invalid API key', status_code=401)
 
 
 class FirstActionThenHangingLLM:
@@ -429,7 +457,8 @@ async def test_agent_uses_configured_language_for_thoughts(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_agent_stops_on_model_timeout_without_browser_action(tmp_path: Path):
+async def test_agent_retries_timeout_five_times_and_writes_timing_table(tmp_path: Path, monkeypatch):
+	monkeypatch.setattr('browser_use.webretriever.model_retry.MODEL_RETRY_DELAY_SECONDS', 0.001)
 	runtime = FakeRuntime()
 	agent = ProtocolIIIAgent(
 		task=_task_with_ground_truth(),
@@ -437,7 +466,6 @@ async def test_agent_stops_on_model_timeout_without_browser_action(tmp_path: Pat
 		runtime=runtime,
 		task_dir=tmp_path,
 		model_timeout_seconds=0.01,
-		max_consecutive_model_timeouts=1,
 		structured_prompt_log=True,
 	)
 
@@ -446,13 +474,20 @@ async def test_agent_stops_on_model_timeout_without_browser_action(tmp_path: Pat
 	assert outcome.status == 'FAIL_MODEL_TIMEOUT'
 	assert outcome.error is not None and '0.01 seconds' in outcome.error
 	assert runtime.executed == []
+	assert agent.llm.calls == 5
 	assert (tmp_path / 'trajectory_visual' / '0.png').is_file()
 	prompt_log = json.loads((tmp_path / 'model_prompts.json').read_text(encoding='utf-8'))
 	assert 'exceeded 0.01 seconds' in prompt_log['steps'][0]['model_call']['error']
+	timing = json.loads((tmp_path / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['attempt_count'] == 5
+	assert timing['summary']['timed_out_attempt_count'] == 5
+	assert timing['summary']['retry_wait_seconds'] >= 0.004
+	assert [attempt['status'] for attempt in timing['steps'][0]['attempts']] == ['timed_out'] * 5
 
 
 @pytest.mark.asyncio
-async def test_agent_timeout_is_hard_when_model_resists_cancellation(tmp_path: Path):
+async def test_agent_timeout_is_hard_when_model_resists_cancellation(tmp_path: Path, monkeypatch):
+	monkeypatch.setattr('browser_use.webretriever.model_retry.MODEL_RETRY_DELAY_SECONDS', 0.001)
 	llm = CancellationResistantLLM()
 	agent = ProtocolIIIAgent(
 		task=_task_with_ground_truth(),
@@ -460,7 +495,6 @@ async def test_agent_timeout_is_hard_when_model_resists_cancellation(tmp_path: P
 		runtime=FakeRuntime(),
 		task_dir=tmp_path,
 		model_timeout_seconds=0.01,
-		max_consecutive_model_timeouts=1,
 	)
 
 	started = asyncio.get_running_loop().time()
@@ -524,7 +558,8 @@ async def test_agent_retains_in_progress_step_when_browser_action_is_cancelled(t
 
 
 @pytest.mark.asyncio
-async def test_agent_recovers_from_one_model_timeout_within_step_budget(tmp_path: Path):
+async def test_agent_reconnects_after_timeout_within_the_same_step(tmp_path: Path, monkeypatch):
+	monkeypatch.setattr('browser_use.webretriever.model_retry.MODEL_RETRY_DELAY_SECONDS', 0.001)
 	llm = TimeoutOnceLLM(
 		[
 			AgentDecision(
@@ -547,14 +582,42 @@ async def test_agent_recovers_from_one_model_timeout_within_step_budget(tmp_path
 	outcome = await agent.run()
 
 	assert outcome.status == 'SUCCESS'
-	assert runtime.observed_steps == [0, 1]
+	assert runtime.observed_steps == [0]
 	assert len(llm.calls) == 2
-	assert outcome.steps[0]['action'] == {}
-	assert 'exceeded 0.01 seconds' in outcome.steps[0]['outcome']
+	timing = json.loads((tmp_path / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['attempt_count'] == 2
+	assert timing['summary']['timed_out_attempt_count'] == 1
+	assert timing['summary']['successful_attempt_count'] == 1
+	assert timing['steps'][0]['attempts'][0]['retry_wait_seconds'] >= 0.001
 
 
 @pytest.mark.asyncio
-async def test_agent_recovers_from_invalid_structured_output_within_step_budget(tmp_path: Path):
+async def test_agent_reconnects_after_transient_provider_failure_within_same_step(tmp_path: Path, monkeypatch):
+	monkeypatch.setattr('browser_use.webretriever.model_retry.MODEL_RETRY_DELAY_SECONDS', 0.001)
+	llm = TransientFailureOnceLLM(
+		[
+			AgentDecision(
+				action='finish',
+				answer='42',
+				evidence=['The current page states 42.'],
+				success=True,
+			)
+		]
+	)
+	agent = ProtocolIIIAgent(task=_task_with_ground_truth(), llm=llm, runtime=FakeRuntime(), task_dir=tmp_path)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'SUCCESS'
+	assert len(llm.calls) == 2
+	timing = json.loads((tmp_path / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['failed_attempt_count'] == 1
+	assert timing['summary']['successful_attempt_count'] == 1
+	assert timing['steps'][0]['attempts'][0]['retry_wait_seconds'] >= 0.001
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_retry_invalid_structured_output(tmp_path: Path):
 	llm = InvalidOnceLLM(
 		[
 			AgentDecision(
@@ -570,12 +633,28 @@ async def test_agent_recovers_from_invalid_structured_output_within_step_budget(
 
 	outcome = await agent.run()
 
-	assert outcome.status == 'SUCCESS'
-	assert runtime.observed_steps == [0, 1]
-	assert len(llm.calls) == 2
-	assert len(outcome.actions) == 1
-	assert outcome.steps[0]['action'] == {}
-	assert 'not a valid AgentDecision' in outcome.steps[0]['outcome']
+	assert outcome.status == 'FAIL_MODEL'
+	assert runtime.observed_steps == [0]
+	assert len(llm.calls) == 1
+	assert outcome.actions == []
+	timing = json.loads((tmp_path / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['attempt_count'] == 1
+	assert timing['summary']['failed_attempt_count'] == 1
+	assert timing['summary']['retry_wait_seconds'] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_retry_authentication_failure(tmp_path: Path):
+	llm = AuthenticationFailureLLM()
+	agent = ProtocolIIIAgent(task=_task_with_ground_truth(), llm=llm, runtime=FakeRuntime(), task_dir=tmp_path)
+
+	outcome = await agent.run()
+
+	assert outcome.status == 'FAIL_MODEL'
+	assert llm.calls == 1
+	timing = json.loads((tmp_path / 'model_call_timing.json').read_text(encoding='utf-8'))
+	assert timing['summary']['attempt_count'] == 1
+	assert timing['summary']['retry_wait_seconds'] == 0.0
 
 
 @pytest.mark.asyncio
@@ -737,7 +816,7 @@ async def test_agent_orchestrates_find_then_data_analysis_without_runtime_execut
 			'runtime': runtime,
 			'task': 'Find the independently verified result.',
 			'page_url': 'https://example.com/result',
-			'page_title': '',
+			'page_title': 'Example result',
 			'cursor': None,
 			'task_dir': tmp_path,
 			'task_identity': _task_with_ground_truth().prompt_payload(),
@@ -750,6 +829,102 @@ async def test_agent_orchestrates_find_then_data_analysis_without_runtime_execut
 	model_text = _model_text(llm.calls)
 	assert 'call_data_analysis_assistant' in model_text
 	assert data_dir in model_text
+
+
+def test_agent_registers_ready_download_artifact_once_and_keeps_timeout_recoverable(tmp_path: Path):
+	data_dir = tmp_path / 'data_artifacts' / 'download-1'
+	data_dir.mkdir(parents=True)
+	agent = ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=FakeLLM([]),
+		runtime=FakeRuntime(),
+		task_dir=tmp_path,
+	)
+	downloads = [
+		{
+			'timestamp': 1.0,
+			'url': 'https://example.com/export.json',
+			'filename': 'export.json',
+			'path': str(tmp_path / 'downloads' / 'export.json'),
+			'status': 'ready',
+			'data_artifact': {
+				'status': 'ready',
+				'artifact_id': 'download-1',
+				'data_dir': str(data_dir.resolve()),
+				'manifest_sha256': 'd' * 64,
+				'table_count': 1,
+				'row_count': 2,
+				'source_url': 'https://example.com/export.json',
+			},
+		},
+		{
+			'timestamp': 2.0,
+			'url': 'https://example.com/slow.csv',
+			'filename': 'slow.csv',
+			'path': str(tmp_path / 'downloads' / 'slow.csv'),
+			'status': 'timed_out',
+		},
+	]
+
+	artifact_notice = agent._register_download_artifacts(downloads)
+	timeout_notice = agent._download_recovery_notice(downloads)
+
+	assert 'call_data_analysis_assistant' in artifact_notice
+	assert agent._is_ready_data_dir(str(data_dir.resolve()))
+	assert agent._register_download_artifacts(downloads) == ''
+	assert 'does not end the task' in timeout_notice
+	assert agent._download_recovery_notice(downloads) == ''
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_ready_download_notice_for_only_one_decision(tmp_path: Path):
+	data_dir = tmp_path / 'data_artifacts' / 'download-1'
+	data_dir.mkdir(parents=True)
+	downloads = [
+		{
+			'timestamp': 1.0,
+			'url': 'https://example.com/export.json',
+			'filename': 'export.json',
+			'path': str(tmp_path / 'downloads' / 'export.json'),
+			'status': 'ready',
+			'data_artifact': {
+				'status': 'ready',
+				'artifact_id': 'download-1',
+				'data_dir': str(data_dir.resolve()),
+				'manifest_sha256': 'd' * 64,
+				'table_count': 1,
+				'row_count': 2,
+				'source_url': 'https://example.com/export.json',
+			},
+		}
+	]
+
+	@dataclass(slots=True)
+	class ReadyDownloadObservation(FakeObservation):
+		downloads: list[dict[str, Any]] = field(default_factory=list)
+
+	class ReadyDownloadRuntime(FakeRuntime):
+		async def observe(self, step: int) -> ReadyDownloadObservation:
+			self.observed_steps.append(step)
+			return ReadyDownloadObservation(downloads=downloads)
+
+	llm = FakeLLM(
+		[
+			AgentDecision(action='wait', seconds=0.1, thought='The download is ready.'),
+			AgentDecision(action='finish', answer='42', evidence=['The visible result states 42.'], success=True),
+		]
+	)
+	outcome = await ProtocolIIIAgent(
+		task=_task_with_ground_truth(),
+		llm=llm,
+		runtime=ReadyDownloadRuntime(),
+		task_dir=tmp_path,
+		max_steps=2,
+	).run()
+
+	assert outcome.status == 'SUCCESS'
+	assert '===== ONE-TIME DATA ARTIFACT NOTICE =====' in llm.calls[0][0][1].text
+	assert '===== ONE-TIME DATA ARTIFACT NOTICE =====' not in llm.calls[1][0][1].text
 
 
 @pytest.mark.asyncio

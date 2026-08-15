@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-STRATEGY_CHECKPOINT_INTERVAL = 20
+STRATEGY_CHECKPOINT_INTERVAL = 10
 StrategyReviewTrigger = Literal['initial_page', 'page_entry', 'periodic']
 
 # The regular runner allows 4,096 completion tokens.  These caps leave room

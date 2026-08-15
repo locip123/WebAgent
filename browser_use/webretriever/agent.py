@@ -1,32 +1,39 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import json
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.webretriever.artifacts import (
+	MODEL_CALL_TIMING_FILENAME,
 	MODEL_PROMPT_LOG_FILENAME,
 	MODEL_PROMPT_LOG_FORMAT,
 	STRATEGY_REVIEW_PROMPT_LOG_FILENAME,
 	STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
 	STRUCTURED_MODEL_PROMPT_LOG_FORMAT,
 	atomic_write_json,
+	empty_model_call_timing_payload,
 	model_prompt_log_metadata,
 	prompt_text_lines,
+)
+from browser_use.webretriever.model_retry import (
+	MODEL_RETRY_MAX_ATTEMPTS,
+	invoke_with_reconnect_retries,
+)
+from browser_use.webretriever.model_retry import (
+	await_with_hard_timeout as _await_with_hard_timeout,
 )
 from browser_use.webretriever.models import AgentDecision, CompetitionTask
 from browser_use.webretriever.network import ChartNetworkInspector
@@ -46,7 +53,6 @@ from browser_use.webretriever.strategy import (
 )
 from browser_use.webretriever.verification import VerificationAction, VerificationController
 
-T = TypeVar('T')
 _FIND_CHART_MAX_SECONDS = 60.0
 _ANALYSIS_MAX_SECONDS = 90.0
 _FINISH_RESERVE_SECONDS = 30.0
@@ -64,6 +70,9 @@ class AgentRunOutcome:
 	duration_seconds: float = 0.0
 	usage: dict[str, int] = field(default_factory=dict)
 	verification: dict[str, object] = field(default_factory=dict)
+	model_call_timing_summary: dict[str, int | float] = field(
+		default_factory=lambda: dict(empty_model_call_timing_payload()['summary'])
+	)
 
 
 def _decision_action_payload(decision: AgentDecision) -> dict[str, Any]:
@@ -311,50 +320,6 @@ def _merge_usage(total: dict[str, int], current: dict[str, int]) -> None:
 		total[key] = total.get(key, 0) + value
 
 
-def _consume_detached_task_result(task: asyncio.Future[Any]) -> None:
-	"""Retrieve a late result so a cancellation-resistant task cannot warn."""
-	if task.cancelled():
-		return
-	try:
-		task.exception()
-	except BaseException:
-		pass
-
-
-async def _await_with_hard_timeout(awaitable: Awaitable[T], timeout: float) -> T:
-	"""Return at the deadline even when the awaited coroutine resists cancellation.
-
-	``asyncio.wait_for`` cancels a timed-out child and then waits for that child
-	to acknowledge cancellation.  Network stacks with lengthy cleanup (or a
-	buggy compatibility proxy) can therefore defeat the apparent timeout.  A
-	plain wait lets us issue cancellation without extending the caller's hard
-	deadline.
-	"""
-	task = asyncio.ensure_future(awaitable)
-	try:
-		done, _ = await asyncio.wait({task}, timeout=timeout)
-	except BaseException:
-		if not task.done():
-			task.add_done_callback(_consume_detached_task_result)
-			task.cancel()
-		raise
-
-	if task in done or task.done():
-		return task.result()
-
-	task.add_done_callback(_consume_detached_task_result)
-	task.cancel()
-	raise TimeoutError
-
-
-def _is_invalid_structured_output(exc: Exception) -> bool:
-	"""Identify provider responses that can be retried within the step budget."""
-	if not isinstance(exc, ModelProviderError):
-		return False
-	message = str(exc)
-	return 'validation error for AgentDecision' in message or 'Failed to parse structured output' in message
-
-
 def _element_box(observation: Any, element_id: int | None) -> tuple[float, float, float, float] | None:
 	if element_id is None:
 		return None
@@ -411,7 +376,6 @@ class ProtocolIIIAgent:
 		model_timeout_seconds: float = 180.0,
 		max_consecutive_action_errors: int = 5,
 		max_consecutive_model_output_errors: int = 3,
-		max_consecutive_model_timeouts: int = 2,
 		thought_language: str = DEFAULT_THOUGHT_LANGUAGE,
 		structured_prompt_log: bool = False,
 		chart_network_inspector: Any | None = None,
@@ -426,8 +390,6 @@ class ProtocolIIIAgent:
 			raise ValueError('max_consecutive_action_errors must be at least 1')
 		if max_consecutive_model_output_errors < 1:
 			raise ValueError('max_consecutive_model_output_errors must be at least 1')
-		if max_consecutive_model_timeouts < 1:
-			raise ValueError('max_consecutive_model_timeouts must be at least 1')
 		self.task = task
 		self.llm = llm
 		self.runtime = runtime
@@ -436,7 +398,6 @@ class ProtocolIIIAgent:
 		self.model_timeout_seconds = model_timeout_seconds
 		self.max_consecutive_action_errors = max_consecutive_action_errors
 		self.max_consecutive_model_output_errors = max_consecutive_model_output_errors
-		self.max_consecutive_model_timeouts = max_consecutive_model_timeouts
 		self.thought_language = normalize_thought_language(thought_language)
 		self.structured_prompt_log = structured_prompt_log
 		model_id = getattr(llm, 'model', None)
@@ -450,12 +411,16 @@ class ProtocolIIIAgent:
 		self.system_prompt = self.system_document.text
 		self._model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self._model_prompt_log: dict[str, Any] = {}
+		self._model_call_timing_path = self.task_dir / MODEL_CALL_TIMING_FILENAME
+		self._model_call_timing: dict[str, Any] = empty_model_call_timing_payload()
 		self._strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
 		self._strategy_review_prompt_log: dict[str, Any] = {}
 		self.task_deadline_monotonic = task_deadline_monotonic
-		self._trusted_chart_manifests: dict[str, str] = {}
-		self._ready_chart_data_dirs: set[str] = set()
-		self._chart_artifact_filters: dict[str, dict[str, Any]] = {}
+		self._trusted_data_manifests: dict[str, str] = {}
+		self._ready_data_dirs: set[str] = set()
+		self._data_artifact_filters: dict[str, dict[str, Any]] = {}
+		self._announced_data_artifact_ids: set[str] = set()
+		self._announced_download_timeout_keys: set[str] = set()
 		self.chart_network_inspector = chart_network_inspector or ChartNetworkInspector(
 			llm,
 			# Leave room inside the 300-second task watchdog for normalization,
@@ -490,7 +455,7 @@ class ProtocolIIIAgent:
 				task_identity=self.task.prompt_payload(),
 				model_timeout_seconds=min(90.0, self.model_timeout_seconds),
 				max_output_chars=32_000,
-				trusted_manifest_hashes=self._trusted_chart_manifests,
+				trusted_manifest_hashes=self._trusted_data_manifests,
 			)
 		return self.data_analysis_assistant
 
@@ -555,8 +520,8 @@ class ProtocolIIIAgent:
 		if resolved == chart_root or not resolved.is_relative_to(chart_root):
 			return payload
 		key = str(resolved)
-		self._trusted_chart_manifests[key] = manifest_sha256
-		self._ready_chart_data_dirs.add(key)
+		self._trusted_data_manifests[key] = manifest_sha256
+		self._ready_data_dirs.add(key)
 		active_filters = payload.get('active_filters')
 		if not isinstance(active_filters, dict):
 			datasets = payload.get('datasets')
@@ -564,22 +529,100 @@ class ProtocolIIIAgent:
 				candidates = [item.get('active_filters') for item in datasets if isinstance(item, dict)]
 				if candidates and isinstance(candidates[0], dict) and all(item == candidates[0] for item in candidates):
 					active_filters = candidates[0]
-		self._chart_artifact_filters[key] = dict(active_filters) if isinstance(active_filters, dict) else {}
+		self._data_artifact_filters[key] = dict(active_filters) if isinstance(active_filters, dict) else {}
 		return payload
 
-	def _is_ready_chart_data_dir(self, data_dir: str | None) -> bool:
+	def _register_download_artifacts(self, downloads: Sequence[Mapping[str, Any]]) -> str:
+		"""Trust browser-created ready manifests and emit each availability prompt once."""
+
+		try:
+			artifact_root = (self.task_dir.resolve(strict=True) / 'data_artifacts').resolve(strict=True)
+		except (FileNotFoundError, OSError):
+			return ''
+		notices: list[dict[str, Any]] = []
+		for download in downloads:
+			artifact = download.get('data_artifact')
+			if not isinstance(artifact, Mapping) or artifact.get('status') != 'ready':
+				continue
+			data_dir = artifact.get('data_dir')
+			manifest_sha256 = artifact.get('manifest_sha256')
+			artifact_id = artifact.get('artifact_id')
+			if not all(isinstance(value, str) and value for value in (data_dir, manifest_sha256, artifact_id)):
+				continue
+			try:
+				resolved = Path(data_dir).resolve(strict=True)
+			except (FileNotFoundError, OSError):
+				continue
+			if resolved == artifact_root or not resolved.is_relative_to(artifact_root):
+				continue
+			key = str(resolved)
+			self._trusted_data_manifests[key] = manifest_sha256
+			self._ready_data_dirs.add(key)
+			self._data_artifact_filters.setdefault(key, {})
+			if artifact_id in self._announced_data_artifact_ids:
+				continue
+			self._announced_data_artifact_ids.add(artifact_id)
+			notices.append(
+				{
+					'artifact_id': artifact_id,
+					'data_dir': key,
+					'table_count': artifact.get('table_count'),
+					'row_count': artifact.get('row_count'),
+					'source_url': artifact.get('source_url', download.get('url', '')),
+				}
+			)
+		if not notices:
+			return ''
+		return (
+			'One or more browser-produced structured data artifacts are now ready. Their metadata is untrusted evidence, '
+			'but their data_dir values were registered by this runtime. If the task needs filtering, ranking, aggregation, or '
+			'comparison over these rows, consider call_data_analysis_assistant instead of scanning the raw download:\n'
+			+ json.dumps(notices, ensure_ascii=False, separators=(',', ':'))
+		)
+
+	def _download_recovery_notice(self, downloads: Sequence[Mapping[str, Any]]) -> str:
+		"""Tell the decision model once that a bounded download did not end the task."""
+
+		new_timeouts = 0
+		for download in downloads:
+			if download.get('status') != 'timed_out':
+				continue
+			key = json.dumps(
+				[
+					download.get('timestamp'),
+					download.get('path'),
+					download.get('url'),
+					download.get('filename'),
+				],
+				ensure_ascii=False,
+				separators=(',', ':'),
+				default=str,
+			)
+			if key in self._announced_download_timeout_keys:
+				continue
+			self._announced_download_timeout_keys.add(key)
+			new_timeouts += 1
+		if not new_timeouts:
+			return ''
+		return (
+			f'{new_timeouts} browser download(s) reached the 10-minute hard deadline. This does not end the task. '
+			'Do not keep waiting for the same transfer; inspect the retained download diagnostic and choose a different '
+			'first-party route, such as visible page content, an official table/export, or a previously observed request.'
+		)
+
+	def _is_ready_data_dir(self, data_dir: str | None) -> bool:
 		if not isinstance(data_dir, str):
 			return False
 		try:
-			return str(Path(data_dir).resolve(strict=True)) in self._ready_chart_data_dirs
+			return str(Path(data_dir).resolve(strict=True)) in self._ready_data_dirs
 		except (FileNotFoundError, OSError):
 			return False
 
-	def _chart_filter_mismatch(self, data_dir: str | None, analysis_query: str | None) -> str | None:
+	def _data_filter_mismatch(self, data_dir: str | None, analysis_query: str | None) -> str | None:
 		if not isinstance(data_dir, str):
 			return None
 		try:
-			filters = self._chart_artifact_filters.get(str(Path(data_dir).resolve(strict=True)), {})
+			filters = self._data_artifact_filters.get(str(Path(data_dir).resolve(strict=True)), {})
 		except (FileNotFoundError, OSError):
 			return None
 		requested_years = set(re.findall(r'(?<!\d)(?:19|20)\d{2}(?!\d)', f'{self.task.task}\n{analysis_query or ""}'))
@@ -626,6 +669,129 @@ class ProtocolIIIAgent:
 			'steps': [],
 		}
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	def _reset_model_call_timing(self) -> None:
+		"""Start a fresh, durable per-step table for decision-model waiting."""
+
+		self._model_call_timing = empty_model_call_timing_payload()
+		atomic_write_json(self._model_call_timing_path, self._model_call_timing)
+
+	@property
+	def model_call_timing_payload(self) -> dict[str, Any]:
+		"""Return the current timing table for the runner's final artifact write."""
+
+		return self._model_call_timing
+
+	def _update_timing_summary(self, outcome: AgentRunOutcome) -> None:
+		summary = self._model_call_timing.get('summary', {})
+		if not isinstance(summary, dict):
+			raise TypeError('model call timing summary must be an object')
+		outcome.model_call_timing_summary = dict(summary)
+
+	def _timing_step(self, step: int) -> dict[str, Any]:
+		steps = self._model_call_timing.get('steps')
+		if not isinstance(steps, list):
+			raise TypeError('model call timing steps must be a list')
+		if steps and steps[-1].get('step') == step + 1:
+			return steps[-1]
+		entry = {
+			'step': step + 1,
+			'model_wait_seconds': 0.0,
+			'retry_wait_seconds': 0.0,
+			'total_wait_seconds': 0.0,
+			'attempts': [],
+		}
+		steps.append(entry)
+		summary = self._model_call_timing['summary']
+		summary['decision_step_count'] = len(steps)
+		return entry
+
+	def _record_model_attempt(
+		self,
+		*,
+		step: int,
+		attempt: int,
+		status: str,
+		wait_seconds: float,
+		error: str | None = None,
+	) -> None:
+		"""Persist one completed model wait before any reconnection delay."""
+
+		entry = self._timing_step(step)
+		attempts = entry['attempts']
+		if not isinstance(attempts, list):
+			raise TypeError('model call timing attempts must be a list')
+		attempt_entry: dict[str, Any] = {
+			'attempt': attempt,
+			'status': status,
+			'model_wait_seconds': round(max(0.0, wait_seconds), 3),
+			'retry_wait_seconds': 0.0,
+			'total_wait_seconds': round(max(0.0, wait_seconds), 3),
+		}
+		if error:
+			attempt_entry['error'] = error[:1_000]
+		attempts.append(attempt_entry)
+		entry['model_wait_seconds'] = round(float(entry['model_wait_seconds']) + attempt_entry['model_wait_seconds'], 3)
+		entry['total_wait_seconds'] = round(float(entry['total_wait_seconds']) + attempt_entry['total_wait_seconds'], 3)
+		summary = self._model_call_timing['summary']
+		summary['attempt_count'] += 1
+		summary[f'{status}_attempt_count'] += 1
+		summary['model_wait_seconds'] = round(float(summary['model_wait_seconds']) + attempt_entry['model_wait_seconds'], 3)
+		summary['total_wait_seconds'] = round(float(summary['total_wait_seconds']) + attempt_entry['total_wait_seconds'], 3)
+		atomic_write_json(self._model_call_timing_path, self._model_call_timing)
+
+	def _record_retry_wait(self, *, step: int, attempt: int, wait_seconds: float) -> None:
+		"""Persist the actual fixed reconnection delay after a retryable failure."""
+
+		entry = self._timing_step(step)
+		attempts = entry['attempts']
+		if not isinstance(attempts, list) or not attempts or attempts[-1].get('attempt') != attempt:
+			raise ValueError('retry wait must follow its matching model attempt')
+		actual_wait = round(max(0.0, wait_seconds), 3)
+		attempts[-1]['retry_wait_seconds'] = actual_wait
+		attempts[-1]['total_wait_seconds'] = round(float(attempts[-1]['model_wait_seconds']) + actual_wait, 3)
+		entry['retry_wait_seconds'] = round(float(entry['retry_wait_seconds']) + actual_wait, 3)
+		entry['total_wait_seconds'] = round(float(entry['total_wait_seconds']) + actual_wait, 3)
+		summary = self._model_call_timing['summary']
+		summary['retry_wait_seconds'] = round(float(summary['retry_wait_seconds']) + actual_wait, 3)
+		summary['total_wait_seconds'] = round(float(summary['total_wait_seconds']) + actual_wait, 3)
+		atomic_write_json(self._model_call_timing_path, self._model_call_timing)
+
+	async def _invoke_decision_with_retries(
+		self,
+		*,
+		messages: list[Any],
+		step: int,
+		outcome: AgentRunOutcome,
+	) -> Any:
+		"""Call the decision model through at most five freshly-created clients.
+
+		``ChatOpenAI.ainvoke`` creates its AsyncOpenAI client for each invocation,
+		so retrying here deliberately abandons a failed connection.  The client
+		itself is configured with zero retries to keep the five-attempt contract
+		exact rather than nested.
+		"""
+
+		def record_attempt(attempt: int, status: str, wait_seconds: float, error: Exception | None) -> None:
+			self._record_model_attempt(
+				step=step,
+				attempt=attempt,
+				status=status,
+				wait_seconds=wait_seconds,
+				error=f'{type(error).__name__}: {error}' if error is not None else None,
+			)
+			self._update_timing_summary(outcome)
+
+		def record_retry_wait(attempt: int, wait_seconds: float) -> None:
+			self._record_retry_wait(step=step, attempt=attempt, wait_seconds=wait_seconds)
+			self._update_timing_summary(outcome)
+
+		return await invoke_with_reconnect_retries(
+			lambda: self.llm.ainvoke(messages, output_format=AgentDecision),
+			timeout_seconds=lambda: min(self.model_timeout_seconds, self._remaining_task_seconds()),
+			on_attempt_finished=record_attempt,
+			on_retry_wait_finished=record_retry_wait,
+		)
 
 	def _reset_strategy_review_prompt_log(self) -> None:
 		"""Start the independent, complete input trace for strategy-review calls."""
@@ -743,11 +909,11 @@ class ProtocolIIIAgent:
 		outcome = AgentRunOutcome(status='FAIL')
 		self._partial_outcome = outcome
 		self._reset_model_prompt_log()
+		self._reset_model_call_timing()
 		memory = ''
 		last_outcome = 'The task has just started.'
 		consecutive_errors = 0
 		consecutive_model_output_errors = 0
-		consecutive_model_timeouts = 0
 		last_action_signature: tuple[str, str] | None = None
 		repeated_action_count = 0
 		# Rolling (intent, observation) window that survives parameter churn and
@@ -821,6 +987,9 @@ class ProtocolIIIAgent:
 			if verification_decision.state.value == 'passed':
 				last_outcome = 'Visible verification completed; continue in the same browser context.'
 
+			downloads = list(getattr(observation, 'downloads', []) or [])
+			data_artifact_notice = self._register_download_artifacts(downloads)
+			download_recovery_notice = self._download_recovery_notice(downloads)
 			rendered_observation = observation.render_text()
 			observation_fingerprint = _observation_hash(rendered_observation)
 			remaining = self._remaining_task_seconds()
@@ -835,9 +1004,11 @@ class ProtocolIIIAgent:
 						memory=memory,
 						last_outcome=last_outcome,
 						remaining_task_seconds=remaining_task_seconds,
-						strategy_checkpoint=exploration_tracker.checkpoint,
-						strategy_review=strategy_review,
-					)
+					strategy_checkpoint=exploration_tracker.checkpoint,
+					strategy_review=strategy_review,
+					data_artifact_notice=data_artifact_notice,
+					download_recovery_notice=download_recovery_notice,
+				)
 				)
 			except PromptError as exc:
 				outcome.status = 'FAIL_PROMPT'
@@ -879,16 +1050,16 @@ class ProtocolIIIAgent:
 				)
 			model_call_started_at = time.monotonic()
 			try:
-				response = await _await_with_hard_timeout(
-					self.llm.ainvoke(messages, output_format=AgentDecision),
-					model_call_timeout,
-				)
+				response = await self._invoke_decision_with_retries(messages=messages, step=step, outcome=outcome)
 				decision = response.completion
 				model_usage = _usage_dict(response.usage)
 				_merge_usage(outcome.usage, model_usage)
 				self._record_model_result(step=step, started_at=model_call_started_at, usage=model_usage)
 			except TimeoutError:
-				model_error = f'Model request exceeded {model_call_timeout:g} seconds'
+				model_error = (
+					f'Model request exceeded {model_call_timeout:g} seconds after up to '
+					f'{MODEL_RETRY_MAX_ATTEMPTS} connection attempts'
+				)
 				self._record_model_result(step=step, started_at=model_call_started_at, error=model_error)
 				_save_visual_screenshot(
 					screenshot,
@@ -896,11 +1067,9 @@ class ProtocolIIIAgent:
 					model_error,
 					observation,
 				)
-				consecutive_model_timeouts += 1
-				consecutive_model_output_errors = 0
 				last_outcome = (
-					f'ERROR: The prior model request exceeded {model_call_timeout:g} seconds; '
-					'no browser action was executed. Reassess the unchanged page and return one concise action.'
+					f'ERROR: The decision model timed out after up to {MODEL_RETRY_MAX_ATTEMPTS} connection attempts; '
+					'no browser action was executed.'
 				)
 				outcome.steps.append(
 					{
@@ -911,8 +1080,6 @@ class ProtocolIIIAgent:
 						'outcome': last_outcome,
 					}
 				)
-				if consecutive_model_timeouts < self.max_consecutive_model_timeouts:
-					continue
 				outcome.status = 'FAIL_MODEL_TIMEOUT'
 				outcome.error = model_error
 				break
@@ -925,25 +1092,6 @@ class ProtocolIIIAgent:
 					model_error,
 					observation,
 				)
-				if _is_invalid_structured_output(exc):
-					consecutive_model_output_errors += 1
-					consecutive_model_timeouts = 0
-					last_outcome = (
-						'ERROR: The prior model response was not a valid AgentDecision, so no browser action was executed. '
-						'Return exactly one complete schema-constrained action now. '
-						f'Diagnostic: {str(exc)[:1000]}'
-					)
-					outcome.steps.append(
-						{
-							'step': step,
-							'url': observation.url,
-							'thought': '',
-							'action': {},
-							'outcome': last_outcome,
-						}
-					)
-					if consecutive_model_output_errors < self.max_consecutive_model_output_errors:
-						continue
 				outcome.status = 'FAIL_MODEL'
 				outcome.error = model_error
 				break
@@ -971,7 +1119,6 @@ class ProtocolIIIAgent:
 						observation,
 					)
 					consecutive_model_output_errors += 1
-					consecutive_model_timeouts = 0
 					last_outcome = (
 						'ERROR: The prior model response did not include one complete required strategy checkpoint, so no browser '
 						'action was executed. Return all four non-empty checkpoint_* fields and one normal action. '
@@ -993,7 +1140,6 @@ class ProtocolIIIAgent:
 					break
 
 			consecutive_model_output_errors = 0
-			consecutive_model_timeouts = 0
 			action_text = _action_string(decision)
 			_save_visual_screenshot(
 				screenshot,
@@ -1186,13 +1332,13 @@ class ProtocolIIIAgent:
 							}
 				elif decision.action == 'call_data_analysis_assistant':
 					budget = self._chart_action_budget(decision.action)
-					filter_mismatch = self._chart_filter_mismatch(decision.data_dir, decision.analysis_query)
-					if not self._is_ready_chart_data_dir(decision.data_dir):
+					filter_mismatch = self._data_filter_mismatch(decision.data_dir, decision.analysis_query)
+					if not self._is_ready_data_dir(decision.data_dir):
 						last_outcome = json.dumps(
 							{
 								'action': decision.action,
 								'status': 'invalid_data_dir',
-								'error': 'data_dir must be the exact ready directory returned by find_chart_data_requests in this task run',
+								'error': 'data_dir must be the exact ready directory returned by a data artifact in this task run',
 							},
 							separators=(',', ':'),
 						)
@@ -1275,4 +1421,5 @@ class ProtocolIIIAgent:
 
 		outcome.duration_seconds = round(time.monotonic() - started_at, 3)
 		outcome.verification = verification.summary()
+		self._update_timing_summary(outcome)
 		return outcome

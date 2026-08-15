@@ -24,6 +24,7 @@ from browser_use.webretriever.runner import (
 	RunnerConfig,
 	run,
 	run_patchright_experiment,
+	run_rebrowser_experiment,
 )
 
 
@@ -96,7 +97,9 @@ def _task_index_default(configuration: FileConfiguration | None) -> list[str] | 
 class _TaskIndexOverrideAction(argparse.Action):
 	"""Append command-line task selections without retaining file defaults."""
 
-	def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str, option_string: str | None = None) -> None:
+	def __call__(
+		self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str, option_string: str | None = None
+	) -> None:
 		if not getattr(namespace, '_task_index_overridden', False):
 			setattr(namespace, self.dest, [])
 			setattr(namespace, '_task_index_overridden', True)
@@ -180,7 +183,9 @@ def build_parser(configuration: FileConfiguration | None = None) -> argparse.Arg
 	)
 	parser.add_argument(
 		'--thought-language',
-		default=_setting(configuration, 'thought_language', _first_env('WEBRETRIEVER_THOUGHT_LANGUAGE') or DEFAULT_THOUGHT_LANGUAGE),
+		default=_setting(
+			configuration, 'thought_language', _first_env('WEBRETRIEVER_THOUGHT_LANGUAGE') or DEFAULT_THOUGHT_LANGUAGE
+		),
 		help='language used for each model-generated thought',
 	)
 	parser.add_argument(
@@ -189,7 +194,9 @@ def build_parser(configuration: FileConfiguration | None = None) -> argparse.Arg
 		default=_setting(configuration, 'structured_prompt_log', False),
 		help='write the optional detailed prompt-trace schema instead of the default line-oriented prompt log',
 	)
-	parser.add_argument('--max-steps', type=int, default=_setting(configuration, 'max_steps', 100), help='hard-capped by the rules at 100')
+	parser.add_argument(
+		'--max-steps', type=int, default=_setting(configuration, 'max_steps', 100), help='hard-capped by the rules at 100'
+	)
 	parser.add_argument(
 		'--model-timeout',
 		type=float,
@@ -258,6 +265,18 @@ def build_parser(configuration: FileConfiguration | None = None) -> argparse.Arg
 		help='run the two-round AB/BA experiment across the configured local CDP endpoints',
 	)
 	parser.add_argument(
+		'--rebrowser-qualification-report',
+		type=Path,
+		default=_setting(configuration, 'rebrowser_qualification_report', None),
+		help='passing one-endpoint Rebrowser experiment_summary.json required before a formal Rebrowser CDP run',
+	)
+	parser.add_argument(
+		'--rebrowser-experiment',
+		action=argparse.BooleanOptionalAction,
+		default=_setting(configuration, 'rebrowser_experiment', False),
+		help='run the one-endpoint, one-round Playwright/Rebrowser comparison',
+	)
+	parser.add_argument(
 		'--validate-only',
 		action=argparse.BooleanOptionalAction,
 		default=_setting(configuration, 'validate_only', False),
@@ -322,7 +341,9 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 		task_indices=task_indices,
 		limit=args.limit,
 		browser_driver=BrowserDriver(args.browser_driver),
+		experiment_mode=bool(args.patchright_experiment or args.rebrowser_experiment),
 		patchright_qualification_report=args.patchright_qualification_report,
+		rebrowser_qualification_report=args.rebrowser_qualification_report,
 	)
 	try:
 		config.validate()
@@ -360,9 +381,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 		return 0
 
 	config = config_from_args(args, parser)
+	if args.patchright_experiment and args.rebrowser_experiment:
+		parser.error('--patchright-experiment and --rebrowser-experiment are mutually exclusive')
 	try:
 		if args.patchright_experiment:
 			summary = asyncio.run(run_patchright_experiment(config)).to_dict()
+		elif args.rebrowser_experiment:
+			summary = asyncio.run(run_rebrowser_experiment(config)).to_dict()
 		else:
 			summary = asyncio.run(run(config))
 	except KeyboardInterrupt:

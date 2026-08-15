@@ -5,8 +5,9 @@
 ## 结论
 
 针对本仓库的运行方式——Python、Playwright 1.61、由赛事传入一个已经启动的 Chromium
-CDP URL——最值得实测的是 **Patchright**。第二候选是 **rebrowser-playwright**，但其
-Python 包当前公开版本停在 Playwright 1.52，与本项目 1.61 不匹配。传统
+CDP URL——最值得实测的是 **Patchright**。第二候选是 **Rebrowser 前移补丁驱动**：其
+Python 包当前公开版本停在 Playwright 1.52，与本项目 1.61 不匹配，因此本仓库只在
+显式实验路径中对已知 1.61 Node driver 哈希应用可恢复补丁。传统
 `playwright-stealth` 和指纹注入器可以作用于页面或新 context，却主要依赖 JavaScript
 覆盖；若覆盖值与真实浏览器、UA-CH、GPU、操作系统或网络指纹不一致，可能增加而不是
 减少风险信号。
@@ -22,7 +23,7 @@ Playwright、正式评测接收官方 CDP URL，并保存可审计轨迹；在�
 | 项目 | 主要机制 | 既有 Chromium CDP | 本项目适配性 |
 | --- | --- | --- | --- |
 | [Patchright Python](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) | 修改 Playwright driver，规避 `Runtime.enable`、Console、默认启动参数等泄漏；保留 Playwright API | **可连接；客户端补丁可部分生效**，但无法改变官方浏览器已有启动参数 | **首选 A/B 候选**；Python 与 API 迁移成本最低，需规则确认 |
-| [rebrowser-patches](https://github.com/rebrowser/rebrowser-patches) / [rebrowser-playwright-python](https://github.com/rebrowser/rebrowser-playwright-python) | 修补 Playwright/Puppeteer 源码中的 `Runtime.enable`、utility world、sourceURL 等 CDP 痕迹 | **可连接；客户端补丁可生效** | 思路合适，但 [PyPI 最新公开版为 1.52.0](https://pypi.org/project/rebrowser-playwright/)，落后于本项目 Playwright 1.61 |
+| [rebrowser-patches](https://github.com/rebrowser/rebrowser-patches) / [rebrowser-playwright-python](https://github.com/rebrowser/rebrowser-playwright-python) | 修补 Playwright/Puppeteer 源码中的 `Runtime.enable`、utility world、sourceURL 等 CDP 痕迹 | **可连接；客户端补丁可生效** | [PyPI 最新公开版为 1.52.0](https://pypi.org/project/rebrowser-playwright/)，故本仓库维护仅面向已知 Playwright 1.61 driver 哈希的、可恢复的前移补丁；只可作为显式对照实验候选 |
 | [playwright-stealth](https://github.com/AtuboDad/playwright_stealth) | 将 puppeteer-extra 的 navigator、plugins、WebGL 等 evasions 作为 init script 注入页面 | **可以**，必须在目标文档脚本运行前注入 | 接入容易但项目最后一次仓库提交为 2023-09；只适合小范围实验，不应默认全开 |
 | [puppeteer-extra-plugin-stealth](https://github.com/berstend/puppeteer-extra/tree/master/packages/puppeteer-extra-plugin-stealth) / `playwright-extra` | Node 插件体系，多组 JavaScript evasions | Playwright-extra/Puppeteer 可以接入 CDP | Node 控制面与当前 Python runner 不匹配；原插件自己也承认不可能消除全部检测方式 |
 | [Apify fingerprint-suite](https://github.com/apify/fingerprint-suite) | 贝叶斯生成相互关联的 headers、UA、screen、navigator、WebGL 等并注入 Playwright context | **部分可用**，通常创建新的 injected context | 项目活跃，但以 Node 为主；不能伪装 TLS、IP 或官方浏览器启动状态 |
@@ -85,8 +86,10 @@ Camoufox、CloakBrowser 等把修复放进 Firefox/Chromium 内核，理论上�
    `Verifying`、页面重置和 `cf_clearance` 时间点。
 3. 只有 Patchright 的 driver 补丁没有改善时，才测试 playwright-stealth 的单项 evasion；
    不启用 UA、platform、WebGL、screen 等整套随机覆盖。
-4. Rebrowser Python 当前版本与 Playwright 1.61 不匹配，除非其发布匹配版本或团队自行维护
-   可审计补丁，否则不作为首轮候选。
+4. 使用 `--rebrowser-experiment` 在一个 CDP 端点、一个顺序轮次中对照标准 Playwright 和
+   Rebrowser；前移补丁必须先通过 `webretriever-rebrowser-smoke`，并记录实际
+   `REBROWSER_PATCHES_RUNTIME_FIX_MODE`。该模式下不使用 `page.set_content()`，因为它依赖
+   被 Runtime.Enable 缓解关闭的 console 事件；正常任务通过网页导航，不受此限制。
 5. Camoufox、CloakBrowser、nodriver、undetected-chromedriver 不进入正式比赛实验矩阵。
 
 ## 边界与证据强度

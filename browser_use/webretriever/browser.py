@@ -67,9 +67,16 @@ _MAX_RENDERED_TEXT = 100_000
 _MAX_RESPONSE_BODY_BYTES = 128 * 1024
 _NETWORK_SEARCH_TIMEOUT_SECONDS = 30.0
 _NETWORK_SEARCH_NODE_HEAP_MIB = 512
+_TEXT_SEARCH_TIMEOUT_SECONDS = 30.0
 _NETWORK_BODY_PAGE_CHARACTERS = 60_000
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _MAX_DOWNLOAD_TEXT = 250_000
+_DOWNLOAD_PREVIEW_HEAD_CHARS = 600
+_DOWNLOAD_PREVIEW_TAIL_CHARS = 600
+_DEFAULT_RUNTIME_CLEANUP_TIMEOUT_SECONDS = 60.0
+_NAVIGATION_FIRST_OBSERVATION_TIMEOUT_MS = 10_000
+_NAVIGATION_HARD_TIMEOUT_MS = 120_000
+_DOWNLOAD_HARD_TIMEOUT_MS = 10 * 60 * 1000
 _MAX_ARCHIVE_FILES = 1_000
 _DOWNLOAD_PLACEHOLDER_URL = ':'
 _MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
@@ -79,14 +86,25 @@ _MAX_RECENT_DIALOGS = 8
 _MAX_DIALOG_MESSAGE = 2_000
 _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 _DOCUMENT_MIME_EXTENSIONS = {
+	'application/json': '.json',
+	'application/ld+json': '.json',
+	'application/xml': '.xml',
 	'application/pdf': '.pdf',
+	'application/zip': '.zip',
+	'application/x-zip-compressed': '.zip',
+	'application/octet-stream': '.bin',
 	'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
 	'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
 	'application/vnd.ms-excel': '.xls',
 	'text/csv': '.csv',
 	'application/csv': '.csv',
+	'text/tab-separated-values': '.tsv',
+	'text/tsv': '.tsv',
+	'text/plain': '.txt',
+	'text/xml': '.xml',
 }
 _DOCUMENT_EXTENSIONS = frozenset(_DOCUMENT_MIME_EXTENSIONS.values())
+_STRUCTURED_DOWNLOAD_EXTENSIONS = frozenset({'.json', '.csv', '.tsv', '.xlsx', '.zip'})
 
 
 class _ScreenshotFallbackError(RuntimeError):
@@ -95,6 +113,14 @@ class _ScreenshotFallbackError(RuntimeError):
 
 class _ArchiveResourceLimitError(RuntimeError):
 	"""Raised when a ZIP member exceeds an extraction resource budget."""
+
+
+@dataclass(slots=True)
+class _PendingNavigation:
+	page: Page
+	url: str
+	started_at: float
+	task: asyncio.Task[Any]
 
 
 class _ExtractedArchiveMember(BaseModel):
@@ -306,6 +332,48 @@ class BrowserObservation:
 	screenshot_path: str = ''
 	visual_screenshot_path: str = ''
 
+	@staticmethod
+	def download_prompt_record(download: Mapping[str, Any]) -> dict[str, Any]:
+		"""Return complete download metadata plus a bounded content preview.
+
+		The raw ``text`` field can contain hundreds of thousands of characters and
+		must not be serialized wholesale into a model prompt.  Every other field is
+		metadata and is retained verbatim (with non-JSON values stringified); the
+		preview is deliberately split into head and tail so both document identity
+		and late-page evidence remain visible.
+		"""
+
+		def json_safe(value: Any) -> Any:
+			if isinstance(value, Mapping):
+				return {str(key): json_safe(child) for key, child in value.items()}
+			if isinstance(value, (list, tuple)):
+				return [json_safe(child) for child in value]
+			try:
+				json.dumps(value, ensure_ascii=False)
+			except (TypeError, ValueError):
+				return str(value)
+			return value
+
+		text = str(download.get('text', ''))
+		result = {
+			str(key): json_safe(value)
+			for key, value in download.items()
+			if key != 'text'
+		}
+		result.update(
+			{
+				'content_characters': len(text),
+				'content_preview_truncated': len(text) > _DOWNLOAD_PREVIEW_HEAD_CHARS + _DOWNLOAD_PREVIEW_TAIL_CHARS,
+				'content_preview_head': text[:_DOWNLOAD_PREVIEW_HEAD_CHARS],
+				'content_preview_tail': (
+					text[-_DOWNLOAD_PREVIEW_TAIL_CHARS:]
+					if len(text) > _DOWNLOAD_PREVIEW_HEAD_CHARS + _DOWNLOAD_PREVIEW_TAIL_CHARS
+					else ''
+				),
+			}
+		)
+		return result
+
 	def render_text(self) -> str:
 		"""Render bounded, model-friendly browser state (image bytes excluded)."""
 
@@ -327,13 +395,9 @@ class BrowserObservation:
 		for item in self.recent_network[-12:]:
 			status = item.get('status', 'pending')
 			network_lines.append(f'  {clip(item.get("method", ""), 20)} {clip(item.get("url", ""), 1_500)} [{status}]')
-		archive_summaries = [item for item in self.downloads if 'extraction_status' in item][-4:]
-		summary_paths = {str(item.get('path', '')) for item in archive_summaries}
-		other_downloads = [item for item in self.downloads if str(item.get('path', '')) not in summary_paths]
-		download_items = [*archive_summaries, *other_downloads[-(8 - len(archive_summaries)) :]]
-		download_items.sort(key=lambda item: float(item.get('timestamp', 0)))
+		download_items = sorted(self.downloads, key=lambda item: float(item.get('timestamp', 0)))
 		download_lines = [
-			f'  {clip(item.get("filename", item.get("suggested_filename", "download")), 300)}: {clip(item.get("text", ""), 800)}'
+			f'  {json.dumps(self.download_prompt_record(item), ensure_ascii=False, separators=(",", ":"))}'
 			for item in download_items
 		]
 		# Put compact, high-value evidence before potentially very long page text,
@@ -346,7 +410,7 @@ class BrowserObservation:
 			section('Tabs', tab_lines, 8_000),
 			section('Interactive elements', element_lines, 40_000),
 			section('Recent XHR/Fetch', network_lines, 14_000),
-			section('Downloads', download_lines, 14_000),
+			section('Downloads', download_lines, 36_000),
 		]
 		prefix = '\n\n'.join(sections)
 		page_budget = max(0, _MAX_RENDERED_TEXT - len(prefix) - len('\n\nPage text:\n'))
@@ -460,22 +524,32 @@ class BrowserRuntime:
 		task_dir: Path,
 		logger: logging.Logger,
 		*,
-		navigation_timeout_ms: int = 60_000,
+		navigation_timeout_ms: int = _NAVIGATION_HARD_TIMEOUT_MS,
+		navigation_first_observation_timeout_ms: int = _NAVIGATION_FIRST_OBSERVATION_TIMEOUT_MS,
+		download_timeout_ms: int = _DOWNLOAD_HARD_TIMEOUT_MS,
 		action_timeout_ms: int = 30_000,
 		screenshot_timeout_ms: int = 20_000,
 		cdp_screenshot_timeout_ms: int = 20_000,
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
 		declared_user_agent: str | None = None,
+		task_identity: Mapping[str, Any] | None = None,
 	) -> None:
+		if not 0 < navigation_first_observation_timeout_ms <= navigation_timeout_ms:
+			raise ValueError('navigation_first_observation_timeout_ms must be in (0, navigation_timeout_ms]')
+		if download_timeout_ms <= 0:
+			raise ValueError('download_timeout_ms must be greater than 0')
 		self.context = context
 		self.task_dir = Path(task_dir)
 		self.logger = logger
 		self.navigation_timeout_ms = navigation_timeout_ms
+		self.navigation_first_observation_timeout_ms = navigation_first_observation_timeout_ms
+		self.download_timeout_ms = download_timeout_ms
 		self.action_timeout_ms = action_timeout_ms
 		self.screenshot_timeout_ms = screenshot_timeout_ms
 		self.cdp_screenshot_timeout_ms = cdp_screenshot_timeout_ms
 		self.max_response_body_bytes = max(0, max_response_body_bytes)
 		self.declared_user_agent = declared_user_agent
+		self.task_identity = dict(task_identity) if isinstance(task_identity, Mapping) else None
 
 		self.page: Page | None = None
 		self.website = ''
@@ -505,6 +579,8 @@ class BrowserRuntime:
 		self._last_safe_urls: dict[int, str] = {}
 		self._background_tasks: set[asyncio.Task[Any]] = set()
 		self._download_tasks: set[asyncio.Task[Any]] = set()
+		self._pending_navigations: dict[int, _PendingNavigation] = {}
+		self._navigation_notices: list[dict[str, Any]] = []
 		self._policy_tasks: set[asyncio.Task[Any]] = set()
 		self._dialog_tasks: set[asyncio.Task[Any]] = set()
 		self._screenshot_recovery_tasks: set[asyncio.Task[Any]] = set()
@@ -519,6 +595,7 @@ class BrowserRuntime:
 		self._next_dialog_id = 0
 		self._started = False
 		self._closed = False
+		self._cleanup_diagnostics: dict[str, Any] = {'status': 'not_started', 'residual_tasks': {}}
 		self._execute_lock = asyncio.Lock()
 		self._archive_extraction_lock = asyncio.Lock()
 
@@ -554,7 +631,7 @@ class BrowserRuntime:
 		self._started = True
 		self.logger.info('Opening exact task start URL: %s', redact_cdp_url(website))
 		download_started = await self._goto_exact(page, website)
-		self._record_url(website if download_started else page.url, unless_last=True)
+		self._record_url(website if download_started or id(page) in self._pending_navigations else page.url, unless_last=True)
 		if not is_forbidden_search_url(page.url):
 			self._last_safe_urls[id(page)] = page.url
 		await self._enforce_search_policy()
@@ -567,6 +644,7 @@ class BrowserRuntime:
 		await self._drain_dialog_tasks()
 		await self._enforce_search_policy()
 		await self._drain_dialog_tasks()
+		await self._settle_pending_navigations()
 		await self._drain_download_tasks()
 		page = await self._active_page_for_observation()
 		await self._clear_markers(remove_attributes=True)
@@ -574,9 +652,9 @@ class BrowserRuntime:
 		step_name = self._safe_step_name(step)
 		raw_path = self.trajectory_dir / f'{step_name}.png'
 		visual_path = self.trajectory_visual_dir / f'{step_name}.png'
-		raw_screenshot = await self._capture_screenshot(page, raw_path)
+		page, raw_screenshot = await self._capture_observation_screenshot(page, raw_path)
 
-		page_text = self._dialog_observation_text() + await self._collect_page_text(page)
+		page_text = self._dialog_observation_text() + self._navigation_observation_text(page) + await self._collect_page_text(page)
 		elements = await self._collect_elements(page)
 		viewport = await self._viewport(page)
 		try:
@@ -586,8 +664,6 @@ class BrowserRuntime:
 				screenshot = self._annotate_element_screenshot(visual_screenshot, elements, viewport)
 				if screenshot != visual_screenshot:
 					visual_path.write_bytes(screenshot)
-		except _ScreenshotFallbackError:
-			raise
 		except Exception:
 			self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
 			screenshot = raw_screenshot
@@ -634,6 +710,64 @@ class BrowserRuntime:
 				failure=screenshot_error,
 				failure_description='failed with Page.captureScreenshot protocol error',
 			)
+
+	async def _capture_observation_screenshot(self, page: Page, path: Path) -> tuple[Page, bytes]:
+		"""Capture an observation screenshot, switching only to a live owned recovery page on failure."""
+
+		try:
+			return page, await self._capture_screenshot(page, path)
+		except asyncio.CancelledError:
+			raise
+		except Exception as capture_error:
+			for candidate in await self._screenshot_recovery_pages(page):
+				path.unlink(missing_ok=True)
+				try:
+					screenshot = await self._capture_screenshot(candidate, path)
+				except asyncio.CancelledError:
+					raise
+				except Exception as recovery_error:
+					self.logger.warning(
+						'Screenshot recovery candidate failed (%s): %s',
+						redact_cdp_url(candidate.url),
+						recovery_error,
+					)
+					continue
+				self.logger.warning(
+					'Screenshot failed for %s; switching observation to live page %s',
+					redact_cdp_url(page.url),
+					redact_cdp_url(candidate.url),
+				)
+				self.page = candidate
+				self._element_bindings.clear()
+				self._legacy_marker_bindings_active = False
+				with contextlib.suppress(Exception):
+					await candidate.bring_to_front()
+				return candidate, screenshot
+			raise capture_error
+
+	async def _screenshot_recovery_pages(self, failed_page: Page) -> list[Page]:
+		"""Return live owned recovery pages, preferring the failed page's opener."""
+
+		candidates: list[Page] = []
+
+		def add_if_safe(candidate: Page | None) -> None:
+			if (
+				candidate is None
+				or candidate is failed_page
+				or candidate.is_closed()
+				or candidate.url == _DOWNLOAD_PLACEHOLDER_URL
+				or is_forbidden_search_url(candidate.url)
+				or all(id(owned) != id(candidate) for owned in self._owned_pages)
+			):
+				return
+			if all(id(existing) != id(candidate) for existing in candidates):
+				candidates.append(candidate)
+
+		with contextlib.suppress(Exception):
+			add_if_safe(await failed_page.opener())
+		for candidate in reversed(self._live_owned_pages()):
+			add_if_safe(candidate)
+		return candidates
 
 	@staticmethod
 	def _annotate_element_screenshot(
@@ -776,7 +910,19 @@ class BrowserRuntime:
 
 			result = await self._perform_action(action, params)
 			if action not in {'wait'} and self.page is not None and not self.page.is_closed():
-				await self.page.wait_for_timeout(200)
+				settle_page = self.page
+				try:
+					await settle_page.wait_for_timeout(200)
+				except PlaywrightError:
+					if settle_page.url != _DOWNLOAD_PLACEHOLDER_URL:
+						raise
+					self.logger.info('Download placeholder page closed while settling action; restoring a live page')
+				if action in {'click', 'double_click', 'press', 'xy'} and not settle_page.is_closed():
+					# Link/form navigation is normally triggered by an interaction rather
+					# than a navigate action. If it is still loading after the short
+					# settle, give it the same 10s/120s observation contract.
+					with contextlib.suppress(PlaywrightError, AttributeError):
+						await self._observe_interaction_navigation(settle_page)
 			await self._drain_dialog_tasks()
 			await self._enforce_search_policy(previous_page, previous_url, known_page_ids)
 			await self._drain_dialog_tasks()
@@ -803,32 +949,159 @@ class BrowserRuntime:
 		destination.write_text(json.dumps(self.capture_payload(), ensure_ascii=False, indent=2), encoding='utf-8')
 		return destination
 
-	async def close(self) -> None:
-		"""Detach listeners, finish collectors, and close only runtime-owned pages."""
+	def cleanup_diagnostics(self) -> dict[str, Any]:
+		"""Return the latest bounded-cleanup report for the task artifact."""
 
+		return copy.deepcopy(self._cleanup_diagnostics)
+
+	@staticmethod
+	def _cleanup_remaining_seconds(deadline: float) -> float:
+		return max(0.0, deadline - time.monotonic())
+
+	@staticmethod
+	def _detach_cleanup_task(task: asyncio.Task[Any]) -> None:
+		task.add_done_callback(_consume_detached_task_result)
+		task.cancel()
+
+	async def _await_cleanup_operation(self, awaitable: Coroutine[Any, Any, Any], deadline: float) -> bool:
+		"""Await one cleanup operation only until the shared cleanup deadline."""
+
+		task = asyncio.create_task(awaitable)
+		try:
+			remaining = self._cleanup_remaining_seconds(deadline)
+			if remaining <= 0:
+				self._detach_cleanup_task(task)
+				return False
+			done, _ = await asyncio.wait({task}, timeout=remaining)
+		except BaseException:
+			if not task.done():
+				self._detach_cleanup_task(task)
+			raise
+		if task in done or task.done():
+			with contextlib.suppress(asyncio.CancelledError, Exception):
+				task.result()
+			return True
+		self._detach_cleanup_task(task)
+		return False
+
+	async def _cancel_and_drain_task_groups(self, deadline: float) -> tuple[int, dict[str, int]]:
+		"""Cancel non-essential runtime work and wait only for the shared deadline."""
+
+		groups = {
+			'background': self._background_tasks,
+			'download': self._download_tasks,
+			'policy': self._policy_tasks,
+			'dialog': self._dialog_tasks,
+		}
+		task_groups: dict[asyncio.Task[Any], str] = {}
+		cancelled = 0
+		for name, group in groups.items():
+			tasks = tuple(group)
+			group.clear()
+			for task in tasks:
+				task_groups[task] = name
+				if not task.done():
+					cancelled += 1
+					task.cancel()
+		if not task_groups:
+			return cancelled, {}
+
+		try:
+			remaining = self._cleanup_remaining_seconds(deadline)
+			if remaining > 0:
+				done, pending = await asyncio.wait(tuple(task_groups), timeout=remaining)
+			else:
+				done, pending = set(), set(task_groups)
+		except BaseException:
+			for task in task_groups:
+				if not task.done():
+					self._detach_cleanup_task(task)
+			raise
+
+		for task in done:
+			_consume_detached_task_result(task)
+		residual: dict[str, int] = {}
+		for task in pending:
+			name = task_groups[task]
+			residual[name] = residual.get(name, 0) + 1
+			self._detach_cleanup_task(task)
+		return cancelled, residual
+
+	async def _close_owned_pages_before_deadline(self, deadline: float) -> int:
+		tasks: list[asyncio.Task[Any]] = []
+		for page in reversed(self._owned_pages):
+			with contextlib.suppress(Exception):
+				if not page.is_closed():
+					tasks.append(asyncio.create_task(page.close(run_before_unload=False)))
+		if not tasks:
+			return 0
+		try:
+			remaining = self._cleanup_remaining_seconds(deadline)
+			if remaining > 0:
+				done, pending = await asyncio.wait(tasks, timeout=remaining)
+			else:
+				done, pending = set(), set(tasks)
+		except BaseException:
+			for task in tasks:
+				if not task.done():
+					self._detach_cleanup_task(task)
+			raise
+		for task in done:
+			_consume_detached_task_result(task)
+		for task in pending:
+			self._detach_cleanup_task(task)
+		return len(pending)
+
+	async def close(self, *, timeout_seconds: float = _DEFAULT_RUNTIME_CLEANUP_TIMEOUT_SECONDS) -> dict[str, Any]:
+		"""Boundedly cancel runtime work and close only runtime-owned pages.
+
+		A task result must outlive an unresponsive CDP operation.  Closing therefore
+		cancels collector work first, then waits only within ``timeout_seconds``.
+		"""
+
+		if timeout_seconds <= 0:
+			raise ValueError('timeout_seconds must be greater than 0')
 		if self._closed:
-			return
+			return self.cleanup_diagnostics()
 		self._closed = True
+		started_at = time.monotonic()
+		deadline = started_at + timeout_seconds
+		report: dict[str, Any] = {
+			'status': 'in_progress',
+			'grace_seconds': timeout_seconds,
+			'elapsed_seconds': 0.0,
+			'cancelled_tasks': 0,
+			'residual_tasks': {},
+		}
+		self._cleanup_diagnostics = report
 		for event, handler in self._context_handlers:
 			with contextlib.suppress(Exception):
 				self.context.remove_listener(event, handler)
 		self._context_handlers.clear()
+		residual_navigation = await self._cancel_pending_navigations(
+			timeout_seconds=self._cleanup_remaining_seconds(deadline)
+		)
+		if residual_navigation:
+			report['residual_tasks']['navigation'] = residual_navigation
 
 		for page in list(self._owned_pages):
 			for event, handler in self._page_handlers.pop(id(page), []):
 				with contextlib.suppress(Exception):
 					page.remove_listener(event, handler)
-		await self._drain_dialog_tasks()
-		await self._cancel_screenshot_recovery_tasks()
-		await self._drain_background_tasks()
-		await self._drain_download_tasks()
-		await self._drain_policy_tasks()
-		with contextlib.suppress(Exception):
-			await self._clear_markers(remove_attributes=True)
-		for page in reversed(self._owned_pages):
-			with contextlib.suppress(Exception):
-				if not page.is_closed():
-					await page.close(run_before_unload=False)
+		residual_screenshots = await self._cancel_screenshot_recovery_tasks(
+			timeout_seconds=self._cleanup_remaining_seconds(deadline)
+		)
+		if residual_screenshots:
+			report['residual_tasks']['screenshot_recovery'] = residual_screenshots
+		cancelled_tasks, residual_tasks = await self._cancel_and_drain_task_groups(deadline)
+		report['cancelled_tasks'] = cancelled_tasks
+		report['residual_tasks'].update(residual_tasks)
+		markers_cleared = await self._await_cleanup_operation(self._clear_markers(remove_attributes=True), deadline)
+		if not markers_cleared:
+			report['residual_tasks']['marker_cleanup'] = 1
+		residual_page_closes = await self._close_owned_pages_before_deadline(deadline)
+		if residual_page_closes:
+			report['residual_tasks']['page_close'] = residual_page_closes
 		self._owned_pages.clear()
 		self._element_bindings.clear()
 		self._request_entries.clear()
@@ -842,17 +1115,26 @@ class BrowserRuntime:
 		self._page_document_generations.clear()
 		self._reserved_download_paths.clear()
 		self.page = None
+		report['elapsed_seconds'] = round(time.monotonic() - started_at, 3)
+		report['status'] = 'timed_out' if report['residual_tasks'] else 'completed'
+		self._cleanup_diagnostics = report
+		return self.cleanup_diagnostics()
 
-	async def _cancel_screenshot_recovery_tasks(self) -> None:
+	async def _cancel_screenshot_recovery_tasks(self, *, timeout_seconds: float | None = None) -> int:
 		tasks = tuple(self._screenshot_recovery_tasks)
 		if not tasks:
-			return
+			return 0
 		for task in tasks:
 			task.cancel()
 		cleanup_timeout = min(1.0, max(0.0, self.cdp_screenshot_timeout_ms / 1000))
+		if timeout_seconds is not None:
+			cleanup_timeout = min(cleanup_timeout, max(0.0, timeout_seconds))
 		_, pending = await asyncio.wait(tasks, timeout=cleanup_timeout)
 		if pending:
 			self.logger.warning('%d timed-out CDP screenshot recovery task(s) resisted bounded cleanup', len(pending))
+			for task in pending:
+				self._detach_cleanup_task(task)
+		return len(pending)
 
 	def _install_context_listeners(self) -> None:
 		handlers: list[tuple[str, Callable[..., Any]]] = [
@@ -1242,6 +1524,98 @@ class BrowserRuntime:
 		self._download_urls_seen.add(download.url)
 		self._spawn_download(self._save_download(download))
 
+	async def _run_download_until_deadline(self, item: dict[str, Any], awaitable: Coroutine[Any, Any, None]) -> None:
+		"""Run one download pipeline without letting cancellation resistance block observe()."""
+
+		task = asyncio.create_task(awaitable)
+		try:
+			done, _ = await asyncio.wait({task}, timeout=self.download_timeout_ms / 1000)
+		except BaseException:
+			if not task.done():
+				task.add_done_callback(_consume_detached_task_result)
+				task.cancel()
+			raise
+		if task in done or task.done():
+			task.result()
+			return
+		task.add_done_callback(_consume_detached_task_result)
+		task.cancel()
+		item['status'] = 'timed_out'
+		item['failure'] = f'download exceeded the {self.download_timeout_ms / 1000:g}-second hard deadline'
+		item.setdefault('text', '')
+		item.setdefault('text_truncated', True)
+
+	async def _prepare_download_data_artifact(self, item: dict[str, Any], destination: Path) -> None:
+		if destination.suffix.casefold() not in _STRUCTURED_DOWNLOAD_EXTENSIONS or self.task_identity is None:
+			return
+		from browser_use.webretriever.download_artifacts import prepare_download_artifact
+
+		artifact = await asyncio.to_thread(
+			prepare_download_artifact,
+			task_dir=self.task_dir,
+			task_identity=self.task_identity,
+			source_path=destination,
+			source_url=str(item.get('url', '')),
+			content_type=str(item.get('mime_type', '')),
+		)
+		item['data_artifact'] = artifact
+
+	async def _finish_saved_download(self, item: dict[str, Any], destination: Path) -> None:
+		if item.get('status') != 'pending':
+			return
+		item['size_bytes'] = destination.stat().st_size
+		if destination.suffix.lower() == '.zip':
+			async with self._archive_extraction_lock:
+				extraction = await asyncio.to_thread(self._extract_download_archive, destination)
+			if item.get('status') != 'pending':
+				return
+			item['extraction_status'] = extraction.status
+			item['extracted_count'] = len(extraction.members)
+			item['skipped_count'] = extraction.skipped_count
+			item['extraction_warnings'] = extraction.warnings
+			item['text'] = self._archive_extraction_summary(extraction)
+			item['text_truncated'] = False
+			for member in extraction.members:
+				text = ''
+				truncated = False
+				text_extraction_error: str | None = None
+				if member.path.suffix.lower() != '.zip':
+					try:
+						text, truncated = await asyncio.to_thread(self._extract_download_text, member.path)
+					except Exception as exc:
+						text_extraction_error = f'{type(exc).__name__}: {exc}'[:500]
+						text = f'[text extraction failed: {text_extraction_error}]'
+				member_item = _ArchiveMemberDownload(
+					timestamp=time.time(),
+					url=str(item.get('url', '')),
+					suggested_filename=member.archive_name,
+					filename=member.relative_name,
+					path=str(member.path),
+					size_bytes=member.size_bytes,
+					source='archive_member',
+					source_archive=destination.name,
+					text=text,
+					text_truncated=truncated,
+					text_extraction_error=text_extraction_error,
+				)
+				self.downloads.append(member_item.model_dump(exclude_none=True))
+		else:
+			text, truncated = await asyncio.to_thread(self._extract_download_text, destination)
+			if item.get('status') != 'pending':
+				return
+			item['text'] = text
+			item['text_truncated'] = truncated
+		try:
+			await self._prepare_download_data_artifact(item, destination)
+		except Exception as exc:
+			if item.get('status') != 'pending':
+				return
+			item['status'] = 'failed'
+			item['failure'] = f'data artifact normalization failed: {type(exc).__name__}: {exc}'[:500]
+			return
+		if item.get('status') == 'pending':
+			item['status'] = 'ready'
+
 	async def _save_download(self, download: Download) -> None:
 		suggested = self._safe_download_name(download.suggested_filename)
 		destination = self._unique_download_path(suggested)
@@ -1251,59 +1625,33 @@ class BrowserRuntime:
 			'suggested_filename': download.suggested_filename,
 			'filename': destination.name,
 			'path': str(destination),
+			'source': 'browser_download',
+			'status': 'pending',
 		}
 		self.downloads.append(item)
 		try:
-			await download.save_as(str(destination))
-			failure = await download.failure()
-			if failure:
-				item['failure'] = failure
-				return
-			item['size_bytes'] = destination.stat().st_size
-			if destination.suffix.lower() == '.zip':
-				async with self._archive_extraction_lock:
-					extraction = await asyncio.to_thread(self._extract_download_archive, destination)
-				item['extraction_status'] = extraction.status
-				item['extracted_count'] = len(extraction.members)
-				item['skipped_count'] = extraction.skipped_count
-				item['extraction_warnings'] = extraction.warnings
-				item['text'] = self._archive_extraction_summary(extraction)
-				item['text_truncated'] = False
-				for member in extraction.members:
-					text = ''
-					truncated = False
-					text_extraction_error: str | None = None
-					if member.path.suffix.lower() != '.zip':
-						try:
-							text, truncated = await asyncio.to_thread(self._extract_download_text, member.path)
-						except Exception as exc:
-							text_extraction_error = f'{type(exc).__name__}: {exc}'[:500]
-							text = f'[text extraction failed: {text_extraction_error}]'
-					member_item = _ArchiveMemberDownload(
-						timestamp=time.time(),
-						url=download.url,
-						suggested_filename=member.archive_name,
-						filename=member.relative_name,
-						path=str(member.path),
-						size_bytes=member.size_bytes,
-						source='archive_member',
-						source_archive=destination.name,
-						text=text,
-						text_truncated=truncated,
-						text_extraction_error=text_extraction_error,
-					)
-					self.downloads.append(member_item.model_dump(exclude_none=True))
-			else:
-				text, truncated = await asyncio.to_thread(self._extract_download_text, destination)
-				item['text'] = text
-				item['text_truncated'] = truncated
+			async def save() -> None:
+				await download.save_as(str(destination))
+				if item.get('status') != 'pending':
+					return
+				failure = await download.failure()
+				if item.get('status') != 'pending':
+					return
+				if failure:
+					item['status'] = 'failed'
+					item['failure'] = failure
+					return
+				await self._finish_saved_download(item, destination)
+
+			await self._run_download_until_deadline(item, save())
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
+			item['status'] = 'failed'
 			item['failure'] = f'{type(exc).__name__}: {exc}'[:500]
 
 	async def _save_document_response(self, response: Response, extension: str) -> None:
-		"""Persist inline PDF/Office documents whose viewer DOM has no useful text."""
+		"""Persist an inline top-level document, then normalize supported data formats."""
 
 		# A headless Chromium build can convert even an ``inline`` PDF response
 		# into a Playwright Download.  Give that higher-fidelity event one loop
@@ -1322,30 +1670,36 @@ class BrowserRuntime:
 			'path': str(destination),
 			'mime_type': content_type,
 			'source': 'document_response',
+			'status': 'pending',
 		}
 		self.downloads.append(item)
 		try:
-			content_length = self._content_length(response.headers)
-			if content_length is not None and content_length > _MAX_DOWNLOAD_BYTES:
-				item['failure'] = f'document body exceeds {_MAX_DOWNLOAD_BYTES} byte extraction limit'
-				item['text'] = ''
-				item['text_truncated'] = True
-				return
-			body = await asyncio.wait_for(response.body(), timeout=max(1, self.navigation_timeout_ms / 1000))
-			if len(body) > _MAX_DOWNLOAD_BYTES:
-				item['failure'] = f'document body exceeds {_MAX_DOWNLOAD_BYTES} byte extraction limit'
-				item['size_bytes'] = len(body)
-				item['text'] = ''
-				item['text_truncated'] = True
-				return
-			destination.write_bytes(body)
-			item['size_bytes'] = len(body)
-			text, truncated = await asyncio.to_thread(self._extract_download_text, destination)
-			item['text'] = text
-			item['text_truncated'] = truncated
+			async def save() -> None:
+				content_length = self._content_length(response.headers)
+				if content_length is not None and content_length > _MAX_DOWNLOAD_BYTES:
+					item['status'] = 'failed'
+					item['failure'] = f'document body exceeds {_MAX_DOWNLOAD_BYTES} byte extraction limit'
+					item['text'] = ''
+					item['text_truncated'] = True
+					return
+				body = await response.body()
+				if item.get('status') != 'pending':
+					return
+				if len(body) > _MAX_DOWNLOAD_BYTES:
+					item['status'] = 'failed'
+					item['failure'] = f'document body exceeds {_MAX_DOWNLOAD_BYTES} byte extraction limit'
+					item['size_bytes'] = len(body)
+					item['text'] = ''
+					item['text_truncated'] = True
+					return
+				destination.write_bytes(body)
+				await self._finish_saved_download(item, destination)
+
+			await self._run_download_until_deadline(item, save())
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
+			item['status'] = 'failed'
 			item['failure'] = f'{type(exc).__name__}: {exc}'[:500]
 
 	async def _perform_action(self, action: str, params: dict[str, Any]) -> str:
@@ -1468,7 +1822,15 @@ class BrowserRuntime:
 		if action == 'drag':
 			return await self._drag(params)
 		if action == 'back':
-			await page.go_back(wait_until='domcontentloaded', timeout=self.navigation_timeout_ms)
+			status = await self._start_navigation(
+				page,
+				page.url,
+				page.go_back(wait_until='domcontentloaded', timeout=self.navigation_timeout_ms),
+			)
+			if status == 'pending':
+				return 'first observation is available while back navigation continues'
+			if status == 'download':
+				return 'downloaded document while navigating back'
 			return f'navigated back to {page.url}'
 		if action == 'navigate':
 			url = str(self._required(params, 'url'))
@@ -1482,6 +1844,8 @@ class BrowserRuntime:
 				await self._configure_owned_page(page)
 			download_started = await self._goto_exact(page, url)
 			self._record_url(url if download_started else page.url, unless_last=True)
+			if id(page) in self._pending_navigations:
+				return f'first observation is available while navigation continues to {url}'
 			return f'downloaded document from {url}' if download_started else f'navigated to {page.url}'
 		if action == 'wait':
 			milliseconds = self._wait_milliseconds(params)
@@ -1747,19 +2111,137 @@ class BrowserRuntime:
 				continue
 			if len(matches) == 20:
 				break
-		query_lower = query.casefold()
-		for download in self.downloads:
-			text = self._download_text_for_search(download)
-			start = text.casefold().find(query_lower)
+		page = self._active_page()
+		page_text = await self._collect_page_text(page)
+		documents: list[dict[str, Any]] = [
+			{
+				'id': 'page:active',
+				'source': 'page',
+				'field': 'page_text',
+				'url': page.url,
+				'text': page_text,
+			}
+		]
+		for index, download in enumerate(self.downloads):
+			documents.append(
+				{
+					'id': f'download:{index}',
+					'source': 'download',
+					'field': 'download.text',
+					'filename': str(download.get('filename', download.get('suggested_filename', 'download'))),
+					'url': str(download.get('url', '')),
+					'text': self._download_text_for_search(download),
+				}
+			)
+		result = await self._run_text_search(query, documents)
+		result['dom_matches'] = matches
+		rendered_matches = list(matches)
+		for item in result.get('results', []):
+			if not isinstance(item, Mapping):
+				continue
+			if str(item.get('source')) == 'download':
+				label = f"download {item.get('filename') or 'download'}"
+			else:
+				label = f"page {item.get('url') or page.url}"
+			rendered_matches.append(f'{label}: {item.get("text", "")}')
+		result['matches'] = rendered_matches[:20]
+		if not rendered_matches:
+			return f'No visible text matching {query!r}'
+		return json.dumps(result, ensure_ascii=False, indent=2)[:_MAX_PAGE_TEXT]
+
+	async def _run_text_search(self, query: str, documents: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+		"""Search current page/download evidence with the task-local Lunr index."""
+
+		script = Path(__file__).with_name('lunr_text_search.js')
+		payload = {'query': query, 'documents': list(documents)}
+		try:
+			process = await asyncio.create_subprocess_exec(
+				'node',
+				f'--max-old-space-size={_NETWORK_SEARCH_NODE_HEAP_MIB}',
+				str(script),
+				stdin=asyncio.subprocess.PIPE,
+				stdout=asyncio.subprocess.PIPE,
+				stderr=asyncio.subprocess.PIPE,
+			)
+		except OSError as exc:
+			return self._substring_text_search(payload, f'{type(exc).__name__}: {exc}')
+		input_bytes = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
+		try:
+			stdout, stderr = await asyncio.wait_for(
+				process.communicate(input_bytes),
+				timeout=_TEXT_SEARCH_TIMEOUT_SECONDS,
+			)
+		except asyncio.CancelledError:
+			with contextlib.suppress(ProcessLookupError):
+				process.kill()
+			await process.wait()
+			raise
+		except TimeoutError:
+			with contextlib.suppress(ProcessLookupError):
+				process.kill()
+			await process.wait()
+			return self._substring_text_search(payload, 'Lunr text search exceeded 30 seconds')
+		if process.returncode != 0:
+			reason = stderr.decode('utf-8', errors='replace')[:500] or f'Node search exited {process.returncode}'
+			return self._substring_text_search(payload, reason)
+		try:
+			result = json.loads(stdout)
+		except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+			return self._substring_text_search(payload, f'Invalid Node text search output: {exc}')
+		if not isinstance(result, dict):
+			return self._substring_text_search(payload, 'Node text search output was not an object')
+		return result
+
+	@staticmethod
+	def _substring_text_search(payload: Mapping[str, Any], reason: str) -> dict[str, Any]:
+		"""Keep exact search available if the optional Node runtime is unavailable."""
+
+		query = str(payload.get('query', ''))
+		query_folded = unicodedata.normalize('NFKC', query).casefold()
+		numeric_only = query_folded.isdigit()
+		results: list[dict[str, Any]] = []
+		for document in payload.get('documents', []):
+			if not isinstance(document, Mapping):
+				continue
+			text = str(document.get('text', ''))
+			folded_text = unicodedata.normalize('NFKC', text).casefold()
+			start = folded_text.find(query_folded)
+			while start >= 0 and numeric_only and (
+				(start > 0 and folded_text[start - 1].isdigit())
+				or (start + len(query_folded) < len(folded_text) and folded_text[start + len(query_folded)].isdigit())
+			):
+				start = folded_text.find(query_folded, start + max(1, len(query_folded)))
 			if start < 0:
 				continue
 			context_start = max(0, start - 500)
 			context_end = min(len(text), start + len(query) + 1_500)
-			filename = download.get('filename', download.get('suggested_filename', 'download'))
-			matches.append(f'download {filename}: {text[context_start:context_end]}')
-			if len(matches) == 20:
+			results.append(
+				{
+					'source_id': document.get('id'),
+					'source': document.get('source', 'page'),
+					'field': document.get('field', 'text'),
+					'filename': document.get('filename', ''),
+					'url': document.get('url', ''),
+					'text': text[context_start:context_end],
+					'start': start,
+					'end': start + len(query),
+					'exact': True,
+					'score': None,
+					'matched_fields': [str(document.get('field', 'text'))],
+				}
+			)
+			if len(results) == 20:
 				break
-		return '\n'.join(matches) if matches else f'No visible text matching {query!r}'
+		return {
+			'search_mode': 'substring_fallback',
+			'fallback_reason': reason,
+			'query': query,
+			'query_truncated': False,
+			'indexed_documents': len(payload.get('documents', [])),
+			'indexed_chunks': 0,
+			'exact_match_count': len(results),
+			'results': results,
+		}
 
 	def _download_text_for_search(self, download: Mapping[str, Any]) -> str:
 		"""Return searchable download text, lazily reopening truncated text files.
@@ -2830,21 +3312,152 @@ class BrowserRuntime:
 			self._download_tasks.difference_update(tasks)
 			await asyncio.gather(*tasks, return_exceptions=True)
 
-	async def _goto_exact(self, page: Page, url: str) -> bool:
-		"""Navigate without rewriting *url*; return true for download navigations."""
+	def _cancel_pending_navigation(self, page: Page) -> None:
+		pending = self._pending_navigations.pop(id(page), None)
+		if pending is None or pending.task.done():
+			return
+		pending.task.add_done_callback(_consume_detached_task_result)
+		pending.task.cancel()
 
+	async def _cancel_pending_navigations(self, *, timeout_seconds: float | None = None) -> int:
+		pendings = tuple(self._pending_navigations.values())
+		self._pending_navigations.clear()
+		for pending in pendings:
+			if not pending.task.done():
+				pending.task.add_done_callback(_consume_detached_task_result)
+				pending.task.cancel()
+		if pendings:
+			cleanup_timeout = min(1.0, self.navigation_first_observation_timeout_ms / 1000)
+			if timeout_seconds is not None:
+				cleanup_timeout = min(cleanup_timeout, max(0.0, timeout_seconds))
+			_, still_pending = await asyncio.wait(
+				[pending.task for pending in pendings], timeout=cleanup_timeout
+			)
+			if still_pending:
+				self.logger.warning('%d pending navigation task(s) resisted bounded cleanup', len(still_pending))
+				for task in still_pending:
+					self._detach_cleanup_task(task)
+			return len(still_pending)
+		return 0
+
+	def _record_navigation_notice(self, page: Page, url: str, status: str, error: str = '') -> None:
+		self._navigation_notices.append(
+			{
+				'page_id': id(page),
+				'url': url,
+				'status': status,
+				'error': error[:500],
+				'timestamp': time.time(),
+			}
+		)
+		del self._navigation_notices[:-12]
+
+	def _navigation_observation_text(self, page: Page) -> str:
+		notices = [notice for notice in self._navigation_notices if notice.get('page_id') == id(page)][-4:]
+		if not notices:
+			return ''
+		lines = ['[Runtime navigation status]']
+		for notice in notices:
+			line = f'- {notice.get("status", "unknown")}: {notice.get("url", "")}'
+			if notice.get('error'):
+				line += f' ({notice["error"]})'
+			lines.append(line)
+		return '\n'.join(lines) + '\n'
+
+	async def _stop_loading(self, page: Page) -> None:
+		"""Best-effort stop for a timed-out HTML navigation while retaining its DOM."""
+
+		with contextlib.suppress(Exception):
+			await page.evaluate('window.stop()')
+
+	async def _settle_pending_navigations(self) -> None:
+		for page_id, pending in list(self._pending_navigations.items()):
+			page = pending.page
+			if pending.task.done():
+				self._pending_navigations.pop(page_id, None)
+				try:
+					pending.task.result()
+				except PlaywrightError as exc:
+					if 'download is starting' in str(exc).casefold():
+						self._record_navigation_notice(page, pending.url, 'download_started')
+						# Playwright emits the Download event immediately after the
+						# navigation error. Yield once through the page event loop so
+						# observe() sees the newly spawned blocking task below.
+						with contextlib.suppress(PlaywrightError):
+							await page.wait_for_timeout(100)
+					else:
+						await self._stop_loading(page)
+						status = 'navigation_timed_out' if isinstance(exc, PlaywrightTimeoutError) else 'navigation_failed'
+						self._record_navigation_notice(page, pending.url, status, f'{type(exc).__name__}: {exc}')
+				except Exception as exc:
+					await self._stop_loading(page)
+					self._record_navigation_notice(page, pending.url, 'navigation_failed', f'{type(exc).__name__}: {exc}')
+				continue
+			if (time.monotonic() - pending.started_at) * 1000 < self.navigation_timeout_ms:
+				continue
+			self._pending_navigations.pop(page_id, None)
+			pending.task.add_done_callback(_consume_detached_task_result)
+			pending.task.cancel()
+			await self._stop_loading(page)
+			self._record_navigation_notice(page, pending.url, 'navigation_timed_out', 'hard navigation deadline elapsed')
+
+	async def _observe_interaction_navigation(self, page: Page) -> None:
+		"""Apply the navigation observation deadlines to link/form interactions."""
+
+		if id(page) in self._pending_navigations or page.url == _DOWNLOAD_PLACEHOLDER_URL:
+			return
 		try:
-			await page.goto(url, wait_until='domcontentloaded', timeout=self.navigation_timeout_ms)
-			return False
-		except PlaywrightError as exc:
-			if 'download is starting' not in str(exc).casefold():
-				raise
-			# The page itself stays at its previous URL, but the requested URL is
-			# still valuable trajectory evidence and its Download event is handled
-			# solely through Playwright.
-			await page.wait_for_timeout(100)
-			await self._drain_download_tasks()
-			return True
+			await self._start_navigation(
+				page,
+				page.url,
+				page.wait_for_load_state('domcontentloaded', timeout=self.navigation_timeout_ms),
+			)
+		except PlaywrightError:
+			# The interaction already completed. A detached/closed target should not
+			# turn the next observation into a second action failure.
+			return
+
+	async def _start_navigation(self, page: Page, url: str, operation: Coroutine[Any, Any, Any]) -> Literal['complete', 'download', 'pending']:
+		"""Give one navigation operation the 10-second first-observation contract."""
+
+		self._cancel_pending_navigation(page)
+		started_at = time.monotonic()
+		task = asyncio.create_task(operation)
+		try:
+			done, _ = await asyncio.wait({task}, timeout=self.navigation_first_observation_timeout_ms / 1000)
+		except BaseException:
+			if not task.done():
+				task.add_done_callback(_consume_detached_task_result)
+				task.cancel()
+			raise
+		if task in done or task.done():
+			try:
+				task.result()
+				return 'complete'
+			except PlaywrightError as exc:
+				if 'download is starting' not in str(exc).casefold():
+					raise
+				self._record_navigation_notice(page, url, 'download_started')
+				# A top-level non-HTML navigation is a blocking download. The
+				# Download event itself is dispatched just after the navigation
+				# error; let it enqueue before draining to terminal state.
+				with contextlib.suppress(PlaywrightError):
+					await page.wait_for_timeout(100)
+				await self._drain_download_tasks()
+				return 'download'
+		self._pending_navigations[id(page)] = _PendingNavigation(page=page, url=url, started_at=started_at, task=task)
+		self._record_navigation_notice(page, url, 'first_observation_ready', 'DOM content is still loading')
+		return 'pending'
+
+	async def _goto_exact(self, page: Page, url: str) -> bool:
+		"""Start an exact navigation with a 10s first-observation and 120s hard deadline."""
+
+		status = await self._start_navigation(
+			page,
+			url,
+			page.goto(url, wait_until='domcontentloaded', timeout=self.navigation_timeout_ms),
+		)
+		return status == 'download'
 
 	@staticmethod
 	def _decision_dict(decision: AgentDecision | Mapping[str, Any]) -> dict[str, Any]:
@@ -3181,6 +3794,8 @@ class BrowserRuntime:
 		try:
 			if response.request.resource_type != 'document':
 				return None
+			if not 200 <= int(getattr(response, 'status', 200)) < 300:
+				return None
 			headers = response.headers
 		except Exception:
 			return None
@@ -3191,12 +3806,24 @@ class BrowserRuntime:
 			return None
 		filename_match = re.search(r'filename\*?\s*=\s*(?:UTF-8\'\')?"?([^";]+)', content_disposition, re.IGNORECASE)
 		filename = unquote(filename_match.group(1).strip()) if filename_match else ''
+		content_type = headers.get('content-type', '').split(';', 1)[0].strip().lower()
+		if content_type in {'text/html', 'application/html', 'application/xhtml+xml'}:
+			return None
 		for candidate in (filename, unquote(urlsplit(response.url).path)):
 			suffix = Path(candidate).suffix.lower()
 			if suffix in _DOCUMENT_EXTENSIONS:
 				return suffix
-		content_type = headers.get('content-type', '').split(';', 1)[0].strip().lower()
-		return _DOCUMENT_MIME_EXTENSIONS.get(content_type)
+		if content_type.endswith('+json'):
+			return '.json'
+		if content_type in _DOCUMENT_MIME_EXTENSIONS:
+			return _DOCUMENT_MIME_EXTENSIONS[content_type]
+		for candidate in (filename, unquote(urlsplit(response.url).path)):
+			suffix = Path(candidate).suffix.lower()
+			if suffix in {'.html', '.htm'}:
+				return None
+			if re.fullmatch(r'\.[a-z0-9]{1,16}', suffix):
+				return suffix
+		return '.bin'
 
 	@classmethod
 	def _response_filename(cls, response: Response, extension: str) -> str:
