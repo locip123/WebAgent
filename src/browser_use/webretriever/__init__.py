@@ -7,7 +7,7 @@ through Playwright.
 
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.browser import BrowserObservation, BrowserRuntime, ElementRef
-from browser_use.webretriever.models import AgentDecision, CompetitionTask, load_tasks
+from browser_use.webretriever.models import AgentDecision, CompetitionTask, WebRetrieverActionResult, load_tasks
 
 __all__ = [
 	'AgentDecision',
@@ -17,5 +17,6 @@ __all__ = [
 	'CompetitionTask',
 	'ElementRef',
 	'ProtocolIIIAgent',
+	'WebRetrieverActionResult',
 	'load_tasks',
 ]

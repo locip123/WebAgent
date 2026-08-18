@@ -13,6 +13,7 @@ from typing import Any, TextIO
 
 from pydantic import BaseModel
 
+from browser_use.webretriever.exploration_paths import EXPLORATION_PATH_FILENAME, EXPLORATION_PATH_SCHEMA_VERSION
 from browser_use.webretriever.models import CompetitionTask
 
 MODEL_PROMPT_LOG_FILENAME = 'model_prompts.json'
@@ -20,6 +21,7 @@ MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-lines'
 STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-structured'
 STRATEGY_REVIEW_PROMPT_LOG_FILENAME = 'strategy_review_prompts.json'
 STRATEGY_REVIEW_PROMPT_LOG_FORMAT = 'webretriever-strategy-review-prompts/v1-lines'
+EXPLORATION_PATHS_FILENAME = EXPLORATION_PATH_FILENAME
 MODEL_CALL_TIMING_FILENAME = 'model_call_timing.json'
 MODEL_CALL_TIMING_FORMAT = 'webretriever-model-call-timing/v1'
 
@@ -223,6 +225,7 @@ class TaskArtifactWriter:
 		self.capture_path = self.task_dir / 'capture.json'
 		self.model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self.strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
+		self.exploration_paths_path = self.task_dir / EXPLORATION_PATHS_FILENAME
 		self.model_call_timing_path = self.task_dir / MODEL_CALL_TIMING_FILENAME
 		self.logs_dir = self.output_dir / 'logs'
 		self.lock_path = self.output_dir / 'locks' / f'{task.directory_name}.lock'
@@ -265,6 +268,13 @@ class TaskArtifactWriter:
 			'reviews': [],
 		}
 
+	def _empty_exploration_paths(self) -> dict[str, Any]:
+		return {
+			'schema_version': EXPLORATION_PATH_SCHEMA_VERSION,
+			'task_id': self.task.task_id,
+			'paths': [],
+		}
+
 	def prepare(self) -> Path:
 		"""Idempotently create the task tree and initial JSON documents."""
 
@@ -286,6 +296,8 @@ class TaskArtifactWriter:
 				atomic_write_json(self.model_prompt_log_path, self._empty_model_prompt_log())
 			if not self.strategy_review_prompt_log_path.exists():
 				atomic_write_json(self.strategy_review_prompt_log_path, self._empty_strategy_review_prompt_log())
+			if not self.exploration_paths_path.exists():
+				atomic_write_json(self.exploration_paths_path, self._empty_exploration_paths())
 			if not self.model_call_timing_path.exists():
 				atomic_write_json(self.model_call_timing_path, empty_model_call_timing_payload())
 		finally:

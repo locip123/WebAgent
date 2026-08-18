@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from browser_use.webretriever.exploration_paths import PathJsonAction
 from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELD_LIMITS, CHECKPOINT_DECISION_FIELDS
 
 ActionName: TypeAlias = Literal[
@@ -54,6 +55,8 @@ CalculationOperation: TypeAlias = Literal[
 	'argmin_growth',
 ]
 Evidence: TypeAlias = list[str]
+ActionResultStatus: TypeAlias = Literal['ok', 'error', 'no_change', 'uncertain']
+ActionResultRecovery: TypeAlias = Literal['none', 'observe', 're_ground', 'replan']
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +102,7 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 		frozenset({'operation', 'text'}), description='calculate over browser-observed JSON numbers'
 	),
 	'finish': ActionParameterContract(
-		frozenset({'success'}), frozenset({'answer', 'evidence'}), 'finish with grounded answer/evidence or explicit failure'
+		frozenset({'success'}), frozenset({'answer', 'evidence'}), 'finish with answer and origin explanation, or explicit failure'
 	),
 }
 
@@ -118,6 +121,50 @@ def render_action_parameter_contracts() -> str:
 		fields = '; '.join(field_parts) if field_parts else 'no parameters'
 		lines.append(f'- {action} ({fields}): {contract.description}.')
 	return '\n'.join(lines)
+
+
+class WebRetrieverActionResult(BaseModel):
+	"""Structured result of one WebRetriever browser action.
+
+	``executed`` describes the browser call; ``state_changed`` describes the
+	observable page effect.  They are intentionally separate so a successful
+	Playwright call that leaves a form unchanged is not mistaken for progress.
+	"""
+
+	model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
+
+	action: str = Field(min_length=1, max_length=64)
+	status: ActionResultStatus
+	executed: bool
+	state_changed: bool | None = None
+	summary: str = Field(default='', max_length=4_000)
+	extracted_content: str | None = Field(default=None, max_length=20_000)
+	error_type: str | None = Field(default=None, max_length=200)
+	error: str | None = Field(default=None, max_length=4_000)
+	recovery: ActionResultRecovery = 'none'
+	before: dict[str, Any] = Field(default_factory=dict)
+	after: dict[str, Any] = Field(default_factory=dict)
+	diff: list[str] = Field(default_factory=list, max_length=32)
+	details: dict[str, Any] = Field(default_factory=dict)
+
+	@model_validator(mode='after')
+	def validate_state_effect(self) -> WebRetrieverActionResult:
+		if self.status == 'no_change' and (not self.executed or self.state_changed is not False):
+			raise ValueError('no_change requires an executed action with state_changed=False')
+		if self.status == 'ok' and not self.executed:
+			raise ValueError('ok requires executed=True')
+		return self
+
+	def to_prompt_text(self) -> str:
+		"""Render a bounded, compact JSON result for the next model decision."""
+
+		payload = self.model_dump(exclude_none=True)
+		if self.state_changed is None:
+			payload['state_changed'] = None
+		for field_name in ('summary', 'before', 'after', 'diff', 'details'):
+			if not payload.get(field_name):
+				payload.pop(field_name, None)
+		return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
 
 
 _TASK_ALIASES: dict[str, tuple[str, ...]] = {
@@ -246,6 +293,12 @@ class AgentDecision(BaseModel):
 	action: ActionName
 	thought: str = ''
 	memory: str = ''
+	# Path-tree metadata is deliberately separate from browser action parameters.
+	# Empty defaults preserve construction compatibility for local callers; the
+	# Protocol III agent requires these fields only while exploration mode is active.
+	current_path_id: str = Field(default='', max_length=128)
+	progress: str = Field(default='无', min_length=1, max_length=4_000)
+	path_json_action: PathJsonAction = Field(default_factory=PathJsonAction)
 	# Strict structured-output providers require every flat property on every
 	# turn.  These values are therefore null outside a prompted checkpoint and
 	# all non-empty when a checkpoint is due; they are never action parameters.
@@ -422,6 +475,8 @@ class AgentDecision(BaseModel):
 
 		payload = self.model_dump(exclude_none=True)
 		for field_name in CHECKPOINT_DECISION_FIELDS:
+			payload.pop(field_name, None)
+		for field_name in ('current_path_id', 'progress', 'path_json_action'):
 			payload.pop(field_name, None)
 		return payload
 

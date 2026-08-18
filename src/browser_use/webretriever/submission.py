@@ -14,7 +14,7 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from browser_use.webretriever.connection import BrowserDriver

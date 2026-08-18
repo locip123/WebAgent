@@ -40,6 +40,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, ConfigDict
 
 from browser_use.webretriever.dom_collector import CdpCollectionError, collect_interactive_elements
+from browser_use.webretriever.models import WebRetrieverActionResult
 from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELDS
 
 if TYPE_CHECKING:
@@ -84,7 +85,27 @@ _MAX_ARCHIVE_TOTAL_BYTES = 250 * 1024 * 1024
 _MAX_ARCHIVE_WARNINGS = 100
 _MAX_RECENT_DIALOGS = 8
 _MAX_DIALOG_MESSAGE = 2_000
+_MAX_ACTION_RESULT_OUTPUT = 20_000
+_STATE_CHANGING_ACTIONS = frozenset(
+	{
+		'click',
+		'double_click',
+		'drag',
+		'hover',
+		'hover_xy',
+		'back',
+		'navigate',
+		'press',
+		'scroll',
+		'select',
+		'tab',
+		'type',
+		'xy',
+	}
+)
+_CONTENT_ACTIONS = frozenset({'find', 'read', 'inspect_network', 'calculate'})
 _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+_ANNOTATION_LABEL_GAP = 2
 _DOCUMENT_MIME_EXTENSIONS = {
 	'application/json': '.json',
 	'application/ld+json': '.json',
@@ -355,11 +376,7 @@ class BrowserObservation:
 			return value
 
 		text = str(download.get('text', ''))
-		result = {
-			str(key): json_safe(value)
-			for key, value in download.items()
-			if key != 'text'
-		}
+		result = {str(key): json_safe(value) for key, value in download.items() if key != 'text'}
 		result.update(
 			{
 				'content_characters': len(text),
@@ -503,6 +520,59 @@ _MARK_ELEMENTS_JS = r"""
   return results;
 }
 """
+
+
+def _place_annotation_label(
+	*,
+	anchor_left: float,
+	anchor_top: float,
+	label_width: int,
+	label_height: int,
+	image_width: int,
+	image_height: int,
+	occupied: Sequence[tuple[int, int, int, int]],
+) -> tuple[int, int]:
+	"""Place one numbered screenshot label without covering an earlier label.
+
+	Labels start at an element's top-left corner.  When that slot is occupied,
+	they are packed horizontally from left to right (the model still sees the
+	original element index).  If a row reaches the image edge, the next row is
+	used.  The bounded grid search keeps labels inside the screenshot even on a
+	dense page; the final clamped slot is a safe fallback if the image cannot fit
+	all labels without overlap.
+	"""
+	if label_width <= 0 or label_height <= 0 or image_width <= 0 or image_height <= 0:
+		return 0, 0
+	max_left = max(0, image_width - label_width)
+	max_top = max(0, image_height - label_height)
+	base_left = min(max(0, int(round(anchor_left))), max_left)
+	base_top = min(max(0, int(round(anchor_top))), max_top)
+	row_step = max(1, label_height + _ANNOTATION_LABEL_GAP)
+	row_count = max(1, image_height // row_step + 2)
+
+	def overlaps(left: int, top: int) -> list[tuple[int, int, int, int]]:
+		right = left + label_width
+		bottom = top + label_height
+		return [rect for rect in occupied if left < rect[2] and right > rect[0] and top < rect[3] and bottom > rect[1]]
+
+	for row in range(row_count):
+		top = min(max_top, base_top + row * row_step)
+		left = base_left
+		# At most one rightward jump per existing label is needed.  This is
+		# deliberately bounded because the screenshot is a diagnostic artifact,
+		# not a reason to delay the browser observation.
+		for _ in range(len(occupied) + 1):
+			conflicts = overlaps(left, top)
+			if not conflicts:
+				return left, top
+			next_left = max(rect[2] + _ANNOTATION_LABEL_GAP for rect in conflicts)
+			if next_left > max_left:
+				break
+			left = next_left
+
+	# There is no free slot in the bounded grid.  Keep the label visible and
+	# deterministic rather than allowing it to be clipped by the image edge.
+	return base_left, max_top
 
 
 _CLEAR_MARKERS_JS = r"""
@@ -654,7 +724,9 @@ class BrowserRuntime:
 		visual_path = self.trajectory_visual_dir / f'{step_name}.png'
 		page, raw_screenshot = await self._capture_observation_screenshot(page, raw_path)
 
-		page_text = self._dialog_observation_text() + self._navigation_observation_text(page) + await self._collect_page_text(page)
+		page_text = (
+			self._dialog_observation_text() + self._navigation_observation_text(page) + await self._collect_page_text(page)
+		)
 		elements = await self._collect_elements(page)
 		viewport = await self._viewport(page)
 		try:
@@ -789,6 +861,7 @@ class BrowserRuntime:
 				font = ImageFont.load_default()
 				scale_x = image.width / width
 				scale_y = image.height / height
+				occupied_labels: list[tuple[int, int, int, int]] = []
 				for element in elements:
 					left = max(0.0, element.x)
 					top = max(0.0, element.y)
@@ -799,12 +872,22 @@ class BrowserRuntime:
 					box = (left * scale_x, top * scale_y, right * scale_x, bottom * scale_y)
 					draw.rectangle(box, outline=(255, 45, 85, 255), width=max(1, round(2 * min(scale_x, scale_y))))
 					label = str(element.index)
-					label_box = draw.textbbox((box[0], box[1]), label, font=font)
+					label_box = draw.textbbox((0, 0), label, font=font)
 					label_width = label_box[2] - label_box[0] + 4
 					label_height = label_box[3] - label_box[1] + 2
-					label_top = max(0.0, box[1] - label_height)
-					draw.rectangle((box[0], label_top, box[0] + label_width, label_top + label_height), fill=(255, 45, 85, 255))
-					draw.text((box[0] + 2, label_top + 1), label, fill=(255, 255, 255, 255), font=font)
+					label_left, label_top = _place_annotation_label(
+						anchor_left=box[0],
+						anchor_top=box[1] - label_height,
+						label_width=label_width,
+						label_height=label_height,
+						image_width=image.width,
+						image_height=image.height,
+						occupied=occupied_labels,
+					)
+					label_rect = (label_left, label_top, label_left + label_width, label_top + label_height)
+					occupied_labels.append(label_rect)
+					draw.rectangle(label_rect, fill=(255, 45, 85, 255))
+					draw.text((label_left + 2, label_top + 1), label, fill=(255, 255, 255, 255), font=font)
 				buffer = io.BytesIO()
 				image.save(buffer, format='PNG')
 				return buffer.getvalue()
@@ -827,9 +910,7 @@ class BrowserRuntime:
 		failure: Exception,
 		failure_description: str,
 	) -> bytes:
-		self.logger.warning(
-			'Playwright screenshot %s for %s; falling back to CDP capture', failure_description, path.name
-		)
+		self.logger.warning('Playwright screenshot %s for %s; falling back to CDP capture', failure_description, path.name)
 		try:
 			screenshot = await self._capture_cdp_screenshot_before_deadline(page, path)
 		except Exception as fallback_error:
@@ -894,8 +975,8 @@ class BrowserRuntime:
 			if cdp_session is not None:
 				await cdp_session.detach()
 
-	async def execute(self, decision: AgentDecision | Mapping[str, Any]) -> str:
-		"""Execute one model decision and return a compact action result."""
+	async def execute(self, decision: AgentDecision | Mapping[str, Any]) -> WebRetrieverActionResult:
+		"""Execute one model decision and return its bounded structured result."""
 
 		self._ensure_started()
 		async with self._execute_lock:
@@ -907,26 +988,37 @@ class BrowserRuntime:
 			known_page_ids = {id(item) for item in self._live_owned_pages()}
 			dialog_cursor = self._next_dialog_id
 			await self._clear_markers(remove_attributes=False)
+			before = await self._capture_action_state(page, action, params)
 
-			result = await self._perform_action(action, params)
-			if action not in {'wait'} and self.page is not None and not self.page.is_closed():
-				settle_page = self.page
-				try:
-					await settle_page.wait_for_timeout(200)
-				except PlaywrightError:
-					if settle_page.url != _DOWNLOAD_PLACEHOLDER_URL:
-						raise
-					self.logger.info('Download placeholder page closed while settling action; restoring a live page')
-				if action in {'click', 'double_click', 'press', 'xy'} and not settle_page.is_closed():
-					# Link/form navigation is normally triggered by an interaction rather
-					# than a navigate action. If it is still loading after the short
-					# settle, give it the same 10s/120s observation contract.
-					with contextlib.suppress(PlaywrightError, AttributeError):
-						await self._observe_interaction_navigation(settle_page)
-			await self._drain_dialog_tasks()
-			await self._enforce_search_policy(previous_page, previous_url, known_page_ids)
-			await self._drain_dialog_tasks()
-			return self._append_dialog_outcome(result, since_id=dialog_cursor)
+			try:
+				raw_result = await self._perform_action(action, params)
+				if action not in {'wait'} and self.page is not None and not self.page.is_closed():
+					settle_page = self.page
+					try:
+						await settle_page.wait_for_timeout(200)
+					except PlaywrightError:
+						if settle_page.url != _DOWNLOAD_PLACEHOLDER_URL:
+							raise
+						self.logger.info('Download placeholder page closed while settling action; restoring a live page')
+					if action in {'click', 'double_click', 'press', 'xy'} and not settle_page.is_closed():
+						# Link/form navigation is normally triggered by an interaction rather
+						# than a navigate action. If it is still loading after the short
+						# settle, give it the same 10s/120s observation contract.
+						with contextlib.suppress(PlaywrightError, AttributeError):
+							await self._observe_interaction_navigation(settle_page)
+				await self._drain_dialog_tasks()
+				await self._enforce_search_policy(previous_page, previous_url, known_page_ids)
+				await self._drain_dialog_tasks()
+			except Exception as exc:
+				return self._action_error_result(action, exc, before)
+
+			try:
+				after_page = self._active_page()
+				after = await self._capture_action_state(after_page, action, params)
+			except Exception as exc:
+				after = {'probe_error': f'{type(exc).__name__}: {exc}'[:500]}
+			result_text = self._append_dialog_outcome(raw_result, since_id=dialog_cursor)
+			return self._build_action_result(action, result_text, before=before, after=after)
 
 	def capture_payload(self) -> dict[str, Any]:
 		"""Return the official ``capture.json`` envelope.
@@ -1078,9 +1170,7 @@ class BrowserRuntime:
 			with contextlib.suppress(Exception):
 				self.context.remove_listener(event, handler)
 		self._context_handlers.clear()
-		residual_navigation = await self._cancel_pending_navigations(
-			timeout_seconds=self._cleanup_remaining_seconds(deadline)
-		)
+		residual_navigation = await self._cancel_pending_navigations(timeout_seconds=self._cleanup_remaining_seconds(deadline))
 		if residual_navigation:
 			report['residual_tasks']['navigation'] = residual_navigation
 
@@ -1271,10 +1361,7 @@ class BrowserRuntime:
 
 	@staticmethod
 	def _render_dialog_lines(records: Sequence[Mapping[str, Any]]) -> str:
-		return '\n'.join(
-			f'  [{str(record.get("type", "dialog"))}] {str(record.get("message", ""))}'
-			for record in records
-		)
+		return '\n'.join(f'  [{str(record.get("type", "dialog"))}] {str(record.get("message", ""))}' for record in records)
 
 	def _on_frame_navigated(self, page: Page, frame: Frame) -> None:
 		# backendNodeId is scoped to one document and can be reused after any frame
@@ -1630,6 +1717,7 @@ class BrowserRuntime:
 		}
 		self.downloads.append(item)
 		try:
+
 			async def save() -> None:
 				await download.save_as(str(destination))
 				if item.get('status') != 'pending':
@@ -1674,6 +1762,7 @@ class BrowserRuntime:
 		}
 		self.downloads.append(item)
 		try:
+
 			async def save() -> None:
 				content_length = self._content_length(response.headers)
 				if content_length is not None and content_length > _MAX_DOWNLOAD_BYTES:
@@ -1701,6 +1790,189 @@ class BrowserRuntime:
 		except Exception as exc:
 			item['status'] = 'failed'
 			item['failure'] = f'{type(exc).__name__}: {exc}'[:500]
+
+	async def _capture_action_state(self, page: Page, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
+		"""Capture a bounded, action-relevant state probe without a screenshot."""
+
+		state: dict[str, Any] = {'url': str(page.url), 'action': action}
+		live_pages = self._live_owned_pages()
+		try:
+			state['active_page_index'] = next(index for index, candidate in enumerate(live_pages) if candidate is page)
+		except StopIteration:
+			state['active_page_index'] = -1
+		state['title'] = await self._page_title(page)
+		try:
+			page_text = await self._collect_page_text(page)
+			state['page_fingerprint'] = hashlib.sha256(page_text.encode('utf-8', errors='replace')).hexdigest()[:16]
+			state['page_text_length'] = len(page_text)
+		except Exception as exc:
+			state['probe_error'] = f'page_text: {type(exc).__name__}: {exc}'[:500]
+
+		try:
+			scroll = await page.evaluate(
+				"""() => ({
+					x: Number(window.scrollX || 0),
+					y: Number(window.scrollY || 0),
+					height: Number(document.documentElement?.scrollHeight || 0)
+			})"""
+			)
+			if isinstance(scroll, Mapping):
+				state['scroll_x'] = float(scroll.get('x', 0))
+				state['scroll_y'] = float(scroll.get('y', 0))
+				state['document_height'] = float(scroll.get('height', 0))
+		except Exception as exc:
+			state['probe_error'] = f'{state.get("probe_error", "")} scroll: {type(exc).__name__}: {exc}'[:500]
+
+		try:
+			state['network_request_count'] = len(self.current_page_network_requests())
+		except Exception:
+			state['network_request_count'] = len(self.network_requests)
+		state['download_count'] = len(self.downloads)
+		state['dialog_count'] = len(self._recent_dialogs)
+		state['target'] = await self._capture_target_state(params)
+		return state
+
+	async def _capture_target_state(self, params: Mapping[str, Any]) -> dict[str, Any]:
+		"""Read common form/ARIA properties from the action target when available."""
+
+		if not self._has_explicit_selector(params) and not self._has_target(params):
+			return {}
+		try:
+			locator = (
+				self._target_locator(params)
+				if self._has_explicit_selector(params)
+				else self._locator_for_index(self._target_index(params))
+			)
+			value = await locator.evaluate(
+				"""element => {
+					const rect = element.getBoundingClientRect();
+					const text = (element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim();
+					return {
+						tag: element.tagName.toLowerCase(),
+						value: 'value' in element ? String(element.value ?? '') : null,
+						checked: 'checked' in element ? Boolean(element.checked) : null,
+						selected: element.getAttribute('aria-selected'),
+						expanded: element.getAttribute('aria-expanded'),
+						disabled: 'disabled' in element ? Boolean(element.disabled) : null,
+						text: text.slice(0, 500),
+						visible: rect.bottom > 0 && rect.right > 0
+							&& rect.top < window.innerHeight && rect.left < window.innerWidth
+					};
+				}"""
+			)
+			return dict(value) if isinstance(value, Mapping) else {'value': str(value)}
+		except Exception as exc:
+			return {'probe_error': f'{type(exc).__name__}: {exc}'[:500]}
+
+	@staticmethod
+	def _action_state_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
+		"""Return bounded human-readable differences between two probes."""
+
+		if before.get('probe_error') or after.get('probe_error'):
+			return []
+		diff: list[str] = []
+		for key in (
+			'url',
+			'active_page_index',
+			'title',
+			'page_fingerprint',
+			'page_text_length',
+			'scroll_x',
+			'scroll_y',
+			'document_height',
+			'network_request_count',
+			'download_count',
+			'dialog_count',
+		):
+			if before.get(key) != after.get(key):
+				diff.append(f'{key}: {before.get(key)!r} -> {after.get(key)!r}')
+
+		before_target = before.get('target') if isinstance(before.get('target'), Mapping) else {}
+		after_target = after.get('target') if isinstance(after.get('target'), Mapping) else {}
+		for key in ('value', 'checked', 'selected', 'expanded', 'disabled', 'text', 'visible'):
+			if before_target.get(key) != after_target.get(key):
+				diff.append(f'target.{key}: {before_target.get(key)!r} -> {after_target.get(key)!r}')
+		return diff[:32]
+
+	@staticmethod
+	def _bounded_action_output(value: str) -> str:
+		if len(value) <= _MAX_ACTION_RESULT_OUTPUT:
+			return value
+		return value[:14_000] + '\n...[action result truncated]...\n' + value[-6_000:]
+
+	@staticmethod
+	def _error_metadata(exc: Exception) -> tuple[str, str]:
+		message = str(exc)
+		folded = message.casefold()
+		if 'outside the current viewport' in folded:
+			return 'ElementOutsideViewport', 'observe'
+		if 'unknown element index' in folded or 'stale' in folded or 'page changed' in folded:
+			return 'StaleElement', 'observe'
+		if isinstance(exc, (PlaywrightTimeoutError, TimeoutError)) or 'timeout' in folded:
+			return 'ActionTimeout', 'observe'
+		return type(exc).__name__, 'replan'
+
+	def _action_error_result(
+		self,
+		action: str,
+		exc: Exception,
+		before: Mapping[str, Any],
+	) -> WebRetrieverActionResult:
+		error_type, recovery = self._error_metadata(exc)
+		return WebRetrieverActionResult(
+			action=action,
+			status='error',
+			executed=False,
+			state_changed=False,
+			error_type=error_type,
+			error=str(exc)[:4_000],
+			recovery=recovery,
+			before=dict(before),
+			summary=f'{action} was not completed: {error_type}',
+		)
+
+	def _build_action_result(
+		self,
+		action: str,
+		raw_result: str,
+		*,
+		before: Mapping[str, Any],
+		after: Mapping[str, Any],
+	) -> WebRetrieverActionResult:
+		diff = self._action_state_diff(before, after)
+		probe_uncertain = bool(before.get('probe_error') or after.get('probe_error'))
+		state_changed: bool | None = None if probe_uncertain else bool(diff)
+		if action in _STATE_CHANGING_ACTIONS and probe_uncertain:
+			status: Literal['ok', 'error', 'no_change', 'uncertain'] = 'uncertain'
+			recovery: Literal['none', 'observe', 're_ground', 'replan'] = 'observe'
+		elif action in _STATE_CHANGING_ACTIONS and state_changed is False:
+			status = 'no_change'
+			recovery = 're_ground'
+		else:
+			status = 'ok'
+			recovery = 'none'
+
+		bounded_output = self._bounded_action_output(raw_result)
+		is_content_action = action in _CONTENT_ACTIONS
+		details: dict[str, Any] = {
+			'mutation_expected': action in _STATE_CHANGING_ACTIONS,
+			'evidence_changed': bool(raw_result.strip()) if is_content_action else False,
+		}
+		if probe_uncertain:
+			details['probe_error'] = str(before.get('probe_error') or after.get('probe_error'))[:500]
+		return WebRetrieverActionResult(
+			action=action,
+			status=status,
+			executed=True,
+			state_changed=state_changed,
+			summary='Action completed; extracted content is attached.' if is_content_action else bounded_output,
+			extracted_content=bounded_output if is_content_action else None,
+			recovery=recovery,
+			before=dict(before),
+			after=dict(after),
+			diff=diff,
+			details=details,
+		)
 
 	async def _perform_action(self, action: str, params: dict[str, Any]) -> str:
 		page = self._active_page()
@@ -1968,10 +2240,7 @@ class BrowserRuntime:
 				start_x, start_y = await self._backend_pointer(source_binding, source_index, ensure_visible=False)
 				end_x, end_y = await self._backend_pointer(target_binding, target_index, ensure_visible=False)
 				viewport = await self._viewport(self._active_page())
-				if not (
-					self._point_in_viewport(start_x, start_y, viewport)
-					and self._point_in_viewport(end_x, end_y, viewport)
-				):
+				if not (self._point_in_viewport(start_x, start_y, viewport) and self._point_in_viewport(end_x, end_y, viewport)):
 					raise ValueError('Both drag endpoints must be visible; scroll and observe before dragging')
 				mouse = self._active_page().mouse
 				await mouse.move(start_x, start_y)
@@ -2140,9 +2409,9 @@ class BrowserRuntime:
 			if not isinstance(item, Mapping):
 				continue
 			if str(item.get('source')) == 'download':
-				label = f"download {item.get('filename') or 'download'}"
+				label = f'download {item.get("filename") or "download"}'
 			else:
-				label = f"page {item.get('url') or page.url}"
+				label = f'page {item.get("url") or page.url}'
 			rendered_matches.append(f'{label}: {item.get("text", "")}')
 		result['matches'] = rendered_matches[:20]
 		if not rendered_matches:
@@ -2206,9 +2475,13 @@ class BrowserRuntime:
 			text = str(document.get('text', ''))
 			folded_text = unicodedata.normalize('NFKC', text).casefold()
 			start = folded_text.find(query_folded)
-			while start >= 0 and numeric_only and (
-				(start > 0 and folded_text[start - 1].isdigit())
-				or (start + len(query_folded) < len(folded_text) and folded_text[start + len(query_folded)].isdigit())
+			while (
+				start >= 0
+				and numeric_only
+				and (
+					(start > 0 and folded_text[start - 1].isdigit())
+					or (start + len(query_folded) < len(folded_text) and folded_text[start + len(query_folded)].isdigit())
+				)
 			):
 				start = folded_text.find(query_folded, start + max(1, len(query_folded)))
 			if start < 0:
@@ -3148,7 +3421,11 @@ class BrowserRuntime:
 
 	async def _backend_select(self, binding: _ElementBinding, index: int, value: str) -> list[str]:
 		matched = next(
-			((position, option_value) for position, (option_value, label) in enumerate(binding.options) if value in {option_value, label}),
+			(
+				(position, option_value)
+				for position, (option_value, label) in enumerate(binding.options)
+				if value in {option_value, label}
+			),
 			None,
 		)
 		if matched is None:
@@ -3330,9 +3607,7 @@ class BrowserRuntime:
 			cleanup_timeout = min(1.0, self.navigation_first_observation_timeout_ms / 1000)
 			if timeout_seconds is not None:
 				cleanup_timeout = min(cleanup_timeout, max(0.0, timeout_seconds))
-			_, still_pending = await asyncio.wait(
-				[pending.task for pending in pendings], timeout=cleanup_timeout
-			)
+			_, still_pending = await asyncio.wait([pending.task for pending in pendings], timeout=cleanup_timeout)
 			if still_pending:
 				self.logger.warning('%d pending navigation task(s) resisted bounded cleanup', len(still_pending))
 				for task in still_pending:
@@ -3417,7 +3692,9 @@ class BrowserRuntime:
 			# turn the next observation into a second action failure.
 			return
 
-	async def _start_navigation(self, page: Page, url: str, operation: Coroutine[Any, Any, Any]) -> Literal['complete', 'download', 'pending']:
+	async def _start_navigation(
+		self, page: Page, url: str, operation: Coroutine[Any, Any, Any]
+	) -> Literal['complete', 'download', 'pending']:
 		"""Give one navigation operation the 10-second first-observation contract."""
 
 		self._cancel_pending_navigation(page)
@@ -3662,9 +3939,7 @@ class BrowserRuntime:
 					target: Path | None = None
 					temporary_path: Path | None = None
 					try:
-						is_directory = info.is_dir() or (
-							info.create_system == 3 and file_type == stat.S_IFDIR
-						)
+						is_directory = info.is_dir() or (info.create_system == 3 and file_type == stat.S_IFDIR)
 						if is_directory:
 							self._archive_member_directory(parts, directory_aliases)
 							continue
@@ -3676,7 +3951,9 @@ class BrowserRuntime:
 						if not parent.resolve(strict=True).is_relative_to(self.download_dir.resolve(strict=True)):
 							raise ValueError('archive member parent escaped the downloads directory')
 						target = self._reserve_unique_archive_path(parent / parts[-1], kind='file')
-						with tempfile.NamedTemporaryFile(dir=parent, prefix=f'.{target.name}.', suffix='.part', delete=False) as output:
+						with tempfile.NamedTemporaryFile(
+							dir=parent, prefix=f'.{target.name}.', suffix='.part', delete=False
+						) as output:
 							temporary_path = Path(output.name)
 							with archive.open(info) as source:
 								member_bytes = 0
@@ -3764,11 +4041,7 @@ class BrowserRuntime:
 		counter = 1
 		original = candidate
 		while candidate.exists() or candidate.is_symlink() or candidate in self._reserved_download_paths:
-			name = (
-				f'{original.name}_{counter}'
-				if kind == 'directory'
-				else f'{original.stem}_{counter}{original.suffix}'
-			)
+			name = f'{original.name}_{counter}' if kind == 'directory' else f'{original.stem}_{counter}{original.suffix}'
 			candidate = original.with_name(name)
 			counter += 1
 		self._reserved_download_paths.add(candidate)
@@ -3781,8 +4054,7 @@ class BrowserRuntime:
 	def _archive_extraction_summary(result: _ArchiveExtractionResult) -> str:
 		assert result.skipped_count >= 0
 		summary = (
-			f'ZIP extraction {result.status}: {len(result.members)} file(s) extracted, '
-			f'{result.skipped_count} member(s) skipped.'
+			f'ZIP extraction {result.status}: {len(result.members)} file(s) extracted, {result.skipped_count} member(s) skipped.'
 		)
 		if result.warnings:
 			summary += '\nWarnings:\n' + '\n'.join(f'- {warning}' for warning in result.warnings)

@@ -13,10 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
+from pydantic import ValidationError
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.webretriever.artifacts import (
+	EXPLORATION_PATHS_FILENAME,
 	MODEL_CALL_TIMING_FILENAME,
 	MODEL_PROMPT_LOG_FILENAME,
 	MODEL_PROMPT_LOG_FORMAT,
@@ -28,6 +31,7 @@ from browser_use.webretriever.artifacts import (
 	model_prompt_log_metadata,
 	prompt_text_lines,
 )
+from browser_use.webretriever.exploration_paths import ExplorationPathError, ExplorationPathTracker, PathJsonActionResult
 from browser_use.webretriever.model_retry import (
 	MODEL_RETRY_MAX_ATTEMPTS,
 	invoke_with_reconnect_retries,
@@ -35,7 +39,7 @@ from browser_use.webretriever.model_retry import (
 from browser_use.webretriever.model_retry import (
 	await_with_hard_timeout as _await_with_hard_timeout,
 )
-from browser_use.webretriever.models import AgentDecision, CompetitionTask
+from browser_use.webretriever.models import ACTION_PARAMETER_CONTRACTS, AgentDecision, CompetitionTask, WebRetrieverActionResult
 from browser_use.webretriever.network import ChartNetworkInspector
 from browser_use.webretriever.prompts import (
 	DEFAULT_THOUGHT_LANGUAGE,
@@ -46,16 +50,205 @@ from browser_use.webretriever.prompts import (
 	StepContext,
 	normalize_thought_language,
 )
-from browser_use.webretriever.strategy import (
-	ExplorationCheckpointTracker,
-	StrategyCheckpointError,
-	StrategyReviewRequest,
-)
+from browser_use.webretriever.strategy import StrategyReviewRequest
 from browser_use.webretriever.verification import VerificationAction, VerificationController
 
 _FIND_CHART_MAX_SECONDS = 60.0
 _ANALYSIS_MAX_SECONDS = 90.0
 _FINISH_RESERVE_SECONDS = 30.0
+_FINISH_FALSE_RETRY_PREFIX = '你拥有强大的浏览器操作能力，你的任务是：'
+_FINISH_FALSE_RETRY_SUFFIX = '这个任务是一定可以完成的，当前尚未完成，请继续完成任务。'
+
+
+def _finish_false_retry_message(task: str) -> str:
+	"""Build the authoritative continuation prompt after ``finish(false)``."""
+
+	return f'{_FINISH_FALSE_RETRY_PREFIX}{task.strip()}。{_FINISH_FALSE_RETRY_SUFFIX}'
+
+
+class _DecisionTaskDeadline(TimeoutError):
+	"""The task deadline elapsed before a decision-model request could start."""
+
+
+class _InvalidStructuredDecision(ValueError):
+	"""A model response that cannot safely become one executable decision.
+
+	The original provider/parser exception can contain arbitrary model text.  This
+	exception deliberately carries only a bounded, schema-derived diagnostic that
+	is safe to place in the next model prompt and durable artifacts.
+	"""
+
+	def __init__(self, diagnostic: str) -> None:
+		super().__init__(diagnostic)
+		self.diagnostic = diagnostic
+
+
+_KNOWN_ACTION_NAMES = frozenset(
+	{
+		'click',
+		'double_click',
+		'type',
+		'select',
+		'press',
+		'scroll',
+		'hover',
+		'click_xy',
+		'hover_xy',
+		'drag',
+		'back',
+		'navigate',
+		'wait',
+		'switch_tab',
+		'close_tab',
+		'read_element',
+		'find_text',
+		'inspect_network',
+		'find_chart_data_requests',
+		'call_data_analysis_assistant',
+		'calculate',
+		'finish',
+	}
+)
+_KNOWN_DECISION_FIELDS = frozenset(AgentDecision.model_fields)
+_SAFE_CONTRACT_DETAIL = re.compile(
+	r'\b(?P<action>[a-z_]{1,64})\s+(?P<verb>requires|does not accept):\s*'
+	r'(?P<fields>[a-z_]{1,64}(?:\s*,\s*[a-z_]{1,64})*)',
+	re.IGNORECASE,
+)
+
+
+def _safe_contract_diagnostic(message: str) -> str:
+	"""Turn an untrusted parser message into a small schema-only correction.
+
+	Provider validation errors often embed the complete rejected JSON under
+	``input_value``.  The model must learn *which contract rule failed*, but it
+	must never receive that arbitrary payload verbatim on the next turn.
+	"""
+
+	for match in _SAFE_CONTRACT_DETAIL.finditer(message):
+		action = match.group('action').casefold()
+		fields = [field.strip() for field in match.group('fields').split(',') if field.strip()]
+		if action not in _KNOWN_ACTION_NAMES or not fields or any(field not in _KNOWN_DECISION_FIELDS for field in fields):
+			continue
+		if match.group('verb').casefold() == 'requires':
+			return f'action {action!r} requires field(s): {", ".join(fields)}'
+		return f'action {action!r} does not accept field(s): {", ".join(fields)}'
+
+	lowered = message.casefold()
+	if 'field required' in lowered or 'missing' in lowered:
+		# Pydantic's common multiline representation places the field name on
+		# the preceding line.  Accept only known schema field names.
+		lines = [line.strip() for line in message.splitlines()]
+		for index, line in enumerate(lines):
+			if 'field required' not in line.casefold():
+				continue
+			for previous in reversed(lines[:index]):
+				candidate = previous.strip(' `.:')
+				if candidate in _KNOWN_DECISION_FIELDS:
+					return f'required decision field is missing: {candidate}'
+		return 'a required decision field is missing'
+	if 'extra_forbidden' in lowered or 'extra inputs are not permitted' in lowered:
+		return 'decision contains a field outside the supported schema'
+	if 'invalid json' in lowered or 'json decode' in lowered or 'failed to parse structured output' in lowered:
+		return 'decision is not valid structured JSON for AgentDecision'
+	if 'path_json_action' in lowered:
+		return 'path_json_action has an invalid structured shape'
+	if 'action' in lowered:
+		return 'action must be a supported browser action with its required fields'
+	return 'decision does not match the AgentDecision schema'
+
+
+def _validation_error_diagnostic(error: ValidationError) -> str:
+	"""Render Pydantic validation failure without inspecting rejected values."""
+
+	details = error.errors(include_url=False, include_context=False, include_input=False)
+	# Prefer a selected-action contract correction over a simultaneously emitted
+	# generic extra-field error.  It tells the model exactly why the proposed
+	# browser action could not run.
+	for detail in details:
+		message = str(detail.get('msg', ''))
+		contract = _safe_contract_diagnostic(message)
+		if contract.startswith('action '):
+			return contract
+
+	for detail in details:
+		location = detail.get('loc', ())
+		field_name = location[-1] if isinstance(location, tuple) and location else None
+		if isinstance(field_name, str) and field_name in _KNOWN_DECISION_FIELDS:
+			if detail.get('type') == 'missing':
+				return f'required decision field is missing: {field_name}'
+			if field_name == 'action':
+				return 'action must be a supported browser action'
+			return f'decision field {field_name!r} has an invalid type, value, or range'
+		if detail.get('type') == 'extra_forbidden':
+			return 'decision contains a field outside the supported schema'
+	for detail in details:
+		contract = _safe_contract_diagnostic(str(detail.get('msg', '')))
+		if contract != 'decision does not match the AgentDecision schema':
+			return contract
+	return 'decision does not match the AgentDecision schema'
+
+
+def _structured_output_error_diagnostic(error: Exception) -> str | None:
+	"""Classify only parser/schema failures; transport and auth errors stay fatal."""
+
+	if isinstance(error, ValidationError):
+		return _validation_error_diagnostic(error)
+
+	# Model adapters commonly wrap Pydantic failures in ModelProviderError.
+	# Do not classify arbitrary provider failures here: authentication, service,
+	# and connection failures retain their existing retry/failure semantics.
+	message = str(error)
+	lowered = message.casefold()
+	if isinstance(error, ModelProviderError) and (
+		error.status_code not in {401, 403}
+		and (
+			'validation error for agentdecision' in lowered
+			or 'failed to parse structured output' in lowered
+			or 'structured output validation' in lowered
+		)
+	):
+		return _safe_contract_diagnostic(message)
+	return None
+
+
+def _raw_completion_contract_diagnostic(completion: Any) -> str | None:
+	"""Recover a missing selected-action field even alongside unrelated extras.
+
+	Pydantic stops its model-level action validator when an unknown top-level
+	field is present.  We still want the repair prompt to explain that a
+	``click`` lacks ``element_id`` rather than merely mentioning the extra field.
+	Only action and known field *names* are examined; arbitrary values stay
+	unread and never enter diagnostics.
+	"""
+
+	if not isinstance(completion, Mapping):
+		return None
+	candidate = completion
+	action = candidate.get('action')
+	if isinstance(action, Mapping):
+		nested = action
+		action = nested.get('action')
+		candidate = {**candidate, **nested}
+	if not isinstance(action, str) or action not in _KNOWN_ACTION_NAMES:
+		return None
+	contract = ACTION_PARAMETER_CONTRACTS[action]
+	missing = sorted(field_name for field_name in contract.required if candidate.get(field_name) is None)
+	if not missing:
+		return None
+	return f'action {action!r} requires field(s): {", ".join(missing)}'
+
+
+def _coerce_agent_decision(completion: Any) -> AgentDecision:
+	"""Validate an adapter completion even when it bypassed its output parser."""
+
+	if isinstance(completion, AgentDecision):
+		return completion
+	try:
+		return AgentDecision.model_validate(completion)
+	except ValidationError as error:
+		diagnostic = _raw_completion_contract_diagnostic(completion) or _validation_error_diagnostic(error)
+		raise _InvalidStructuredDecision(diagnostic) from error
 
 
 @dataclass(slots=True)
@@ -83,8 +276,55 @@ def _decision_action_payload(decision: AgentDecision) -> dict[str, Any]:
 	return payload
 
 
+def _append_path_action_feedback(action_outcome: str, feedback: str) -> str:
+	"""Attach path-tree diagnostics without invalidating a structured action result."""
+
+	if not feedback:
+		return action_outcome
+	try:
+		payload = json.loads(action_outcome)
+	except (TypeError, json.JSONDecodeError):
+		payload = None
+	if isinstance(payload, dict):
+		payload['path_json_action_feedback'] = feedback
+		return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+	return f'{action_outcome}\nPath JSON action feedback: {feedback}'
+
+
+def _path_json_action_artifact_payload(decision: AgentDecision) -> dict[str, Any]:
+	"""Persist only declared path-operation fields, never arbitrary model extras.
+
+	``PathJsonOperation`` deliberately accepts extra fields so the executor can
+	ignore them. The execution report retains their names where useful; durable
+	step artifacts must not retain their untrusted values.
+	"""
+
+	return {
+		'operations': [
+			operation.model_dump(
+				mode='json',
+				exclude=set(operation.model_extra or {}),
+				exclude_none=True,
+			)
+			for operation in decision.path_json_action.operations
+		]
+	}
+
+
 def _action_string(decision: AgentDecision) -> str:
 	return json.dumps(_decision_action_payload(decision), ensure_ascii=False, separators=(',', ':'))
+
+
+def _format_runtime_action_result(result: WebRetrieverActionResult | str) -> tuple[str, dict[str, Any] | None, bool]:
+	"""Adapt the runtime seam to the prompt string and durable step payloads."""
+
+	if isinstance(result, WebRetrieverActionResult):
+		payload = result.model_dump(mode='json', exclude_none=True)
+		if result.state_changed is None:
+			payload['state_changed'] = None
+		return result.to_prompt_text(), payload, result.status == 'error'
+	text = str(result)
+	return text, None, text.startswith('ERROR:')
 
 
 def _observation_hash(rendered_observation: str) -> str:
@@ -121,6 +361,24 @@ def _action_intent(decision: AgentDecision) -> str:
 	for incidental in ('element_id', 'x', 'y', 'end_x', 'end_y'):
 		payload.pop(incidental, None)
 	return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+
+
+def _no_change_signature(decision: AgentDecision, observation_fingerprint: str) -> tuple[str, str, str]:
+	"""Identify one target/action on one observed page generation."""
+
+	payload = _decision_action_payload(decision)
+	target_fields = {
+		name: payload[name]
+		for name in ('element_id', 'selector', 'target', 'x', 'y', 'end_x', 'end_y', 'url')
+		if payload.get(name) is not None
+	}
+	target = json.dumps(
+		target_fields,
+		ensure_ascii=False,
+		sort_keys=True,
+		separators=(',', ':'),
+	)
+	return observation_fingerprint, _action_intent(decision), target
 
 
 def _detect_loop(
@@ -263,7 +521,7 @@ def _compact_checkpoint_observation(rendered_observation: str, *, limit: int = 9
 	return normalized[:head] + marker + (normalized[-tail:] if tail else '')
 
 
-def _checkpoint_trajectory_record(
+def _exploration_trajectory_record(
 	*,
 	step: int,
 	observation: Any,
@@ -271,7 +529,7 @@ def _checkpoint_trajectory_record(
 	decision: AgentDecision,
 	outcome: str,
 ) -> dict[str, Any]:
-	"""Build the browser-derived record consumed only by a future checkpoint."""
+	"""Build one durable trajectory record including model-declared progress."""
 
 	return {
 		'step': step + 1,
@@ -279,12 +537,15 @@ def _checkpoint_trajectory_record(
 		'title': str(getattr(observation, 'title', '')),
 		'page_observation': _compact_checkpoint_observation(rendered_observation),
 		'action': _decision_action_payload(decision),
+		'current_path_id': decision.current_path_id,
+		'progress': decision.progress,
+		'path_json_action': _path_json_action_artifact_payload(decision),
 		'outcome': _compact_checkpoint_observation(outcome, limit=1_200),
 	}
 
 
 def _record_exploration_decision(
-	tracker: ExplorationCheckpointTracker,
+	tracker: ExplorationPathTracker,
 	*,
 	step: int,
 	observation: Any,
@@ -292,17 +553,20 @@ def _record_exploration_decision(
 	decision: AgentDecision,
 	outcome: str,
 ) -> None:
-	"""Count every completed valid decision, including failed or locally blocked ones."""
+	"""Commit model progress after a completed action and retain its trajectory data."""
+	if tracker.answer_priority_mode:
+		return
 
-	tracker.record_decision(
-		_checkpoint_trajectory_record(
-			step=step,
-			observation=observation,
-			rendered_observation=rendered_observation,
-			decision=decision,
-			outcome=outcome,
-		)
+	# The caller owns ``outcome.steps``; this helper retains the same compact
+	# browser-grounded shape for code paths that need an independent record.
+	_exploration_trajectory_record(
+		step=step,
+		observation=observation,
+		rendered_observation=rendered_observation,
+		decision=decision,
+		outcome=outcome,
 	)
+	tracker.record_decision(current_path_id=decision.current_path_id, progress=decision.progress)
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -424,7 +688,7 @@ class ProtocolIIIAgent:
 		self.chart_network_inspector = chart_network_inspector or ChartNetworkInspector(
 			llm,
 			# Leave room inside the 300-second task watchdog for normalization,
-			# the 90-second analysis action, and the final grounded answer.
+			# the 90-second analysis action, and the final answer.
 			model_timeout_seconds=min(_FIND_CHART_MAX_SECONDS, model_timeout_seconds),
 		)
 		# Import the optional PandasAI runtime only if the model actually selects
@@ -811,7 +1075,7 @@ class ProtocolIIIAgent:
 		step: int,
 		prompt_document: PromptDocument,
 		screenshot_path: Path,
-	) -> None:
+	) -> int:
 		"""Atomically persist one model request before it is submitted.
 
 		The screenshot is already retained in ``trajectory``.  Referencing that
@@ -828,6 +1092,7 @@ class ProtocolIIIAgent:
 			'detail': 'high',
 			'path': str(screenshot_path.relative_to(self.task_dir)),
 		}
+		prompt_index = len(steps)
 		if not self.structured_prompt_log:
 			steps.append({'step': step + 1, 'prompt': prompt_text_lines(prompt_document.text), 'image': image})
 		else:
@@ -844,6 +1109,7 @@ class ProtocolIIIAgent:
 				}
 			)
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+		return prompt_index
 
 	def _record_strategy_review_prompt(
 		self,
@@ -883,6 +1149,7 @@ class ProtocolIIIAgent:
 		self,
 		*,
 		step: int,
+		prompt_index: int | None = None,
 		started_at: float,
 		usage: Mapping[str, int] | None = None,
 		error: str | None = None,
@@ -892,9 +1159,10 @@ class ProtocolIIIAgent:
 		if not self.structured_prompt_log:
 			return
 		steps = self._model_prompt_log.get('steps')
-		if not isinstance(steps, list) or step >= len(steps):
+		resolved_prompt_index = step if prompt_index is None else prompt_index
+		if not isinstance(steps, list) or resolved_prompt_index >= len(steps):
 			raise ValueError('model prompt result has no matching persisted input')
-		entry = steps[step]
+		entry = steps[resolved_prompt_index]
 		if not isinstance(entry, dict):
 			raise TypeError('structured model prompt step must be an object')
 		entry['model_call'] = {
@@ -903,6 +1171,100 @@ class ProtocolIIIAgent:
 			'error': error,
 		}
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
+
+	async def _request_model_decision(
+		self,
+		*,
+		step: int,
+		context: StepContext,
+		screenshot: bytes,
+		raw_path: Path,
+		outcome: AgentRunOutcome,
+	) -> tuple[AgentDecision, dict[str, int], int, float]:
+		"""Request one decision while allowing path-tree retries to reuse a step.
+
+		The caller may invoke this more than once for the same ``step`` when the
+		model's path-tree delta is not executable.  Prompt-log entries are therefore
+		indexed by their append position rather than by the competition step number.
+		"""
+
+		prompt_document = self.prompt_composer.compose_step(context)
+		messages = [
+			SystemMessage(content=self.system_prompt),
+			UserMessage(
+				content=[
+					ContentPartTextParam(text=prompt_document.text),
+					ContentPartImageParam(
+						image_url=ImageURL(
+							url=f'data:image/png;base64,{base64.b64encode(screenshot).decode("ascii")}',
+							detail='high',
+						)
+					),
+				]
+			),
+		]
+		model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
+		if model_call_timeout <= 0:
+			raise _DecisionTaskDeadline()
+		prompt_index = self._record_model_prompt(
+			step=step,
+			prompt_document=prompt_document,
+			screenshot_path=raw_path,
+		)
+		model_call_started_at = time.monotonic()
+		try:
+			response = await self._invoke_decision_with_retries(messages=messages, step=step, outcome=outcome)
+		except TimeoutError:
+			self._record_model_result(
+				step=step,
+				prompt_index=prompt_index,
+				started_at=model_call_started_at,
+				error=(
+					f'Model request exceeded {model_call_timeout:g} seconds after up to '
+					f'{MODEL_RETRY_MAX_ATTEMPTS} connection attempts'
+				),
+			)
+			raise
+		except Exception as exc:
+			diagnostic = _structured_output_error_diagnostic(exc)
+			if diagnostic is not None:
+				model_error = f'Model structured decision is invalid: {diagnostic}'
+				self._record_model_result(
+					step=step,
+					prompt_index=prompt_index,
+					started_at=model_call_started_at,
+					error=model_error,
+				)
+				raise _InvalidStructuredDecision(diagnostic) from exc
+			self._record_model_result(
+				step=step,
+				prompt_index=prompt_index,
+				started_at=model_call_started_at,
+				error=f'{type(exc).__name__}: {exc}',
+			)
+			raise
+
+		model_usage = _usage_dict(getattr(response, 'usage', None))
+		_merge_usage(outcome.usage, model_usage)
+		try:
+			decision = _coerce_agent_decision(getattr(response, 'completion', None))
+		except _InvalidStructuredDecision as exc:
+			model_error = f'Model structured decision is invalid: {exc.diagnostic}'
+			self._record_model_result(
+				step=step,
+				prompt_index=prompt_index,
+				started_at=model_call_started_at,
+				usage=model_usage,
+				error=model_error,
+			)
+			raise
+		self._record_model_result(
+			step=step,
+			prompt_index=prompt_index,
+			started_at=model_call_started_at,
+			usage=model_usage,
+		)
+		return decision, model_usage, prompt_index, model_call_started_at
 
 	async def run(self) -> AgentRunOutcome:
 		started_at = time.monotonic()
@@ -919,8 +1281,15 @@ class ProtocolIIIAgent:
 		# Rolling (intent, observation) window that survives parameter churn and
 		# action alternation, which the exact-repeat guard below cannot see.
 		recent_signatures: deque[tuple[str, str]] = deque(maxlen=16)
+		no_change_counts: dict[tuple[str, str, str], int] = {}
+		blocked_no_change_signatures: set[tuple[str, str, str]] = set()
 		blocked_loop_intents: set[str] = set()
-		exploration_tracker = ExplorationCheckpointTracker()
+		exploration_paths_path = self.task_dir / EXPLORATION_PATHS_FILENAME
+		exploration_tracker = ExplorationPathTracker(
+			task_id=self.task.task_id,
+			on_change=lambda payload: atomic_write_json(exploration_paths_path, payload),
+		)
+		atomic_write_json(exploration_paths_path, exploration_tracker.payload())
 		verification = VerificationController(target_url=self.task.website)
 
 		for step in range(self.max_steps):
@@ -946,6 +1315,7 @@ class ProtocolIIIAgent:
 					'url': observation.url,
 					'thought': '验证状态机：可见验证在有界等待后仍未完成。',
 					'action': {'action': 'verification_blocked'},
+					'path_json_action': {'operations': []},
 					'outcome': verification_decision.reason,
 				}
 				outcome.thoughts.append(step_record['thought'])
@@ -959,7 +1329,9 @@ class ProtocolIIIAgent:
 					payload = {'action': 'click', 'element_id': verification_decision.element_id}
 				else:
 					payload = {'action': 'wait', 'seconds': verification_decision.wait_seconds}
-				action_text = json.dumps({**payload, 'source': 'verification_controller'}, ensure_ascii=False, separators=(',', ':'))
+				action_text = json.dumps(
+					{**payload, 'source': 'verification_controller'}, ensure_ascii=False, separators=(',', ':')
+				)
 				thought = f'验证状态机：{verification_decision.reason}。'
 				_save_visual_screenshot(
 					screenshot,
@@ -970,21 +1342,34 @@ class ProtocolIIIAgent:
 				)
 				outcome.actions.append(action_text)
 				outcome.thoughts.append(thought)
-				step_record = {'step': step, 'url': observation.url, 'thought': thought, 'action': payload}
+				step_record = {
+					'step': step,
+					'url': observation.url,
+					'thought': thought,
+					'action': payload,
+					'path_json_action': {'operations': []},
+				}
 				try:
-					last_outcome = await self.runtime.execute(payload)
-					consecutive_errors = 0
+					runtime_result = await self.runtime.execute(payload)
+					last_outcome, action_result_payload, action_failed = _format_runtime_action_result(runtime_result)
 				except Exception as exc:
 					last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
-					consecutive_errors += 1
+					action_result_payload = None
+					action_failed = True
+				if action_result_payload is not None:
+					step_record['action_result'] = action_result_payload
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
+				if action_failed:
+					consecutive_errors += 1
+				else:
+					consecutive_errors = 0
 				if consecutive_errors >= self.max_consecutive_action_errors:
 					outcome.status = 'FAIL_ACTIONS'
 					outcome.error = f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
 					break
 				continue
-			if verification_decision.state.value == 'passed':
+			if verification_decision.state.value == 'passed' and not last_outcome.startswith(_FINISH_FALSE_RETRY_PREFIX):
 				last_outcome = 'Visible verification completed; continue in the same browser context.'
 
 			downloads = list(getattr(observation, 'downloads', []) or [])
@@ -994,122 +1379,157 @@ class ProtocolIIIAgent:
 			observation_fingerprint = _observation_hash(rendered_observation)
 			remaining = self._remaining_task_seconds()
 			remaining_task_seconds = None if remaining == float('inf') else remaining
-			strategy_review = exploration_tracker.review_request(current_page_url=observation.url)
-			try:
-				prompt_document = self.prompt_composer.compose_step(
-					StepContext(
-						step_index=step,
-						observation=observation,
-						history=tuple(outcome.steps),
-						memory=memory,
-						last_outcome=last_outcome,
-						remaining_task_seconds=remaining_task_seconds,
-					strategy_checkpoint=exploration_tracker.checkpoint,
-					strategy_review=strategy_review,
-					data_artifact_notice=data_artifact_notice,
-					download_recovery_notice=download_recovery_notice,
-				)
-				)
-			except PromptError as exc:
-				outcome.status = 'FAIL_PROMPT'
-				outcome.error = f'Prompt composition failed: {type(exc).__name__}: {exc}'
-				break
-			prompt = prompt_document.text
-			messages = [
-				SystemMessage(content=self.system_prompt),
-				UserMessage(
-					content=[
-						ContentPartTextParam(text=prompt),
-						ContentPartImageParam(
-							image_url=ImageURL(
-								url=f'data:image/png;base64,{base64.b64encode(screenshot).decode("ascii")}',
-								detail='high',
-							)
-						),
-					]
-				),
-			]
-
-			model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
-			if model_call_timeout <= 0:
-				outcome.status = 'FAIL_TASK_TIMEOUT'
-				outcome.error = 'Task deadline elapsed before the next model decision'
-				self._salvage_into(outcome, memory)
-				break
-			self._record_model_prompt(
-				step=step,
-				prompt_document=prompt_document,
-				screenshot_path=raw_path,
-			)
-			if strategy_review is not None:
-				self._record_strategy_review_prompt(
-					step=step,
-					strategy_review=strategy_review,
-					prompt_document=prompt_document,
-					screenshot_path=raw_path,
-				)
-			model_call_started_at = time.monotonic()
-			try:
-				response = await self._invoke_decision_with_retries(messages=messages, step=step, outcome=outcome)
-				decision = response.completion
-				model_usage = _usage_dict(response.usage)
-				_merge_usage(outcome.usage, model_usage)
-				self._record_model_result(step=step, started_at=model_call_started_at, usage=model_usage)
-			except TimeoutError:
-				model_error = (
-					f'Model request exceeded {model_call_timeout:g} seconds after up to '
-					f'{MODEL_RETRY_MAX_ATTEMPTS} connection attempts'
-				)
-				self._record_model_result(step=step, started_at=model_call_started_at, error=model_error)
-				_save_visual_screenshot(
-					screenshot,
-					self.task_dir / 'trajectory_visual' / f'{step}.png',
-					model_error,
-					observation,
-				)
-				last_outcome = (
-					f'ERROR: The decision model timed out after up to {MODEL_RETRY_MAX_ATTEMPTS} connection attempts; '
-					'no browser action was executed.'
-				)
-				outcome.steps.append(
-					{
-						'step': step,
-						'url': observation.url,
-						'thought': '',
-						'action': {},
-						'outcome': last_outcome,
-					}
-				)
-				outcome.status = 'FAIL_MODEL_TIMEOUT'
-				outcome.error = model_error
-				break
-			except Exception as exc:
-				model_error = f'Model request failed: {type(exc).__name__}: {exc}'
-				self._record_model_result(step=step, started_at=model_call_started_at, error=model_error)
-				_save_visual_screenshot(
-					screenshot,
-					self.task_dir / 'trajectory_visual' / f'{step}.png',
-					model_error,
-					observation,
-				)
-				outcome.status = 'FAIL_MODEL'
-				outcome.error = model_error
-				break
-
-			if strategy_review is not None:
+			answer_priority_mode = exploration_tracker.answer_priority_mode
+			exploration_review = exploration_tracker.review_request(current_page_url=observation.url)
+			path_tree_ready = False
+			while not path_tree_ready:
 				try:
-					exploration_tracker.accept_review(
-						strategy_catalog=decision.checkpoint_strategy_catalog,
-						active_strategy=decision.checkpoint_active_strategy,
-						confirmed_infeasible=decision.checkpoint_confirmed_infeasible,
-						next_strategies=decision.checkpoint_next_strategies,
+					decision, model_usage, prompt_index, model_call_started_at = await self._request_model_decision(
+						step=step,
+						context=StepContext(
+							step_index=step,
+							observation=observation,
+							history=tuple(outcome.steps),
+							memory=memory,
+							last_outcome=last_outcome,
+							remaining_task_seconds=remaining_task_seconds,
+							exploration_paths=None if answer_priority_mode else exploration_tracker.payload(),
+							exploration_review=exploration_review,
+							unseen_page_exploration=(
+								False if answer_priority_mode else exploration_tracker.current_observation_is_unseen_page
+							),
+							path_consecutive_no_progress=(
+								0 if answer_priority_mode else exploration_tracker.consecutive_no_progress
+							),
+							answer_priority_mode=answer_priority_mode,
+							data_artifact_notice=data_artifact_notice,
+							download_recovery_notice=download_recovery_notice,
+						),
+						screenshot=screenshot,
+						raw_path=raw_path,
+						outcome=outcome,
 					)
-				except StrategyCheckpointError as exc:
-					model_error = f'Model response omitted or invalidated the required strategy checkpoint: {exc}'
+				except PromptError as exc:
+					outcome.status = 'FAIL_PROMPT'
+					outcome.error = f'Prompt composition failed: {type(exc).__name__}: {exc}'
+					break
+				except _InvalidStructuredDecision as exc:
+					model_error = f'Model structured decision is invalid: {exc.diagnostic}'
+					_save_visual_screenshot(
+						screenshot,
+						self.task_dir / 'trajectory_visual' / f'{step}.png',
+						model_error,
+						observation,
+					)
+					consecutive_model_output_errors += 1
+					last_outcome = (
+						'ERROR: The previous structured decision was invalid; no browser action was executed. '
+						f'Diagnostic: {exc.diagnostic}. Correct the action and return one valid AgentDecision; '
+						'this retry does not consume a step.'
+					)
+					if consecutive_model_output_errors >= self.max_consecutive_model_output_errors:
+						outcome.status = 'FAIL_MODEL'
+						outcome.error = (
+							f'Model returned {consecutive_model_output_errors} consecutive invalid structured decisions; '
+							f'last diagnostic: {exc.diagnostic}'
+						)
+						break
+					continue
+				except _DecisionTaskDeadline:
+					outcome.status = 'FAIL_TASK_TIMEOUT'
+					outcome.error = 'Task deadline elapsed before the next model decision'
+					self._salvage_into(outcome, memory)
+					break
+				except TimeoutError:
+					model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
+					model_error = (
+						f'Model request exceeded {model_call_timeout:g} seconds after up to '
+						f'{MODEL_RETRY_MAX_ATTEMPTS} connection attempts'
+					)
+					_save_visual_screenshot(
+						screenshot,
+						self.task_dir / 'trajectory_visual' / f'{step}.png',
+						model_error,
+						observation,
+					)
+					last_outcome = (
+						f'ERROR: The decision model timed out after up to {MODEL_RETRY_MAX_ATTEMPTS} connection attempts; '
+						'no browser action was executed.'
+					)
+					outcome.steps.append(
+						{
+							'step': step,
+							'url': observation.url,
+							'thought': '',
+							'action': {},
+							'path_json_action': {'operations': []},
+							'outcome': last_outcome,
+						}
+					)
+					outcome.status = 'FAIL_MODEL_TIMEOUT'
+					outcome.error = model_error
+					break
+				except Exception as exc:
+					model_error = f'Model request failed: {type(exc).__name__}: {exc}'
+					_save_visual_screenshot(
+						screenshot,
+						self.task_dir / 'trajectory_visual' / f'{step}.png',
+						model_error,
+						observation,
+					)
+					last_outcome = 'ERROR: The decision model request failed; no browser action was executed.'
+					outcome.steps.append(
+						{
+							'step': step,
+							'url': observation.url,
+							'thought': '',
+							'action': {},
+							'path_json_action': {'operations': []},
+							'outcome': last_outcome,
+						}
+					)
+					outcome.status = 'FAIL_MODEL'
+					outcome.error = model_error
+					break
+				path_error: str | None = None
+				answer = (decision.answer or '').strip()
+				evidence = [item.strip() for item in (decision.evidence or []) if item.strip()]
+				is_successful_finish = decision.action == 'finish' and decision.success is True and bool(answer and evidence)
+				if is_successful_finish:
+					# Answer delivery is independent of route bookkeeping.  In particular,
+					# a first-page answer must not be rejected merely because the model did
+					# not create or update path.json first.
+					path_action_result = PathJsonActionResult(())
+				elif answer_priority_mode:
+					# Once a route succeeded, later decisions may do anything in the
+					# browser without emitting or validating path metadata.
+					path_action_result = PathJsonActionResult((), answer_priority_mode=True)
+				else:
+					try:
+						path_action_result = exploration_tracker.apply_path_json_action_and_activate(
+							decision.path_json_action,
+							start_url=observation.url,
+							current_path_id=decision.current_path_id,
+							progress=decision.progress,
+						)
+						if path_action_result.answer_priority_mode:
+							# The successful mutation itself is the mode switch.  Ignore any
+							# remaining same-batch path operations and execute this decision.
+							pass
+						elif path_action_result.blocked or path_action_result.has_unapplied_operations:
+							path_error = path_action_result.feedback() or 'one or more path JSON operations were not applied'
+						else:
+							exploration_tracker.accept_review(exploration_review)
+					except ExplorationPathError as exc:
+						path_action_result = PathJsonActionResult((), str(exc))
+						path_error = str(exc)
+
+				if path_error is not None:
+					model_error = f'Model response omitted or invalidated exploration-path state: {path_error}'
 					self._record_model_result(
 						step=step,
+						prompt_index=prompt_index,
 						started_at=model_call_started_at,
-						usage=model_usage,
 						error=model_error,
 					)
 					_save_visual_screenshot(
@@ -1120,26 +1540,20 @@ class ProtocolIIIAgent:
 					)
 					consecutive_model_output_errors += 1
 					last_outcome = (
-						'ERROR: The prior model response did not include one complete required strategy checkpoint, so no browser '
-						'action was executed. Return all four non-empty checkpoint_* fields and one normal action. '
-						f'Diagnostic: {str(exc)[:1000]}'
+						'ERROR: Exploration path JSON operation failed; no browser action was executed. '
+						f'Diagnostic: {path_error[:1_000]} Correct path_json_action and retry; this retry does not consume a step.'
 					)
-					outcome.steps.append(
-						{
-							'step': step,
-							'url': observation.url,
-							'thought': '',
-							'action': {},
-							'outcome': last_outcome,
-						}
-					)
-					if consecutive_model_output_errors < self.max_consecutive_model_output_errors:
-						continue
-					outcome.status = 'FAIL_MODEL'
-					outcome.error = model_error
-					break
+					if consecutive_model_output_errors >= self.max_consecutive_model_output_errors:
+						outcome.status = 'FAIL_MODEL'
+						outcome.error = model_error
+						break
+					continue
 
-			consecutive_model_output_errors = 0
+				consecutive_model_output_errors = 0
+				path_tree_ready = True
+
+			if not path_tree_ready:
+				break
 			action_text = _action_string(decision)
 			_save_visual_screenshot(
 				screenshot,
@@ -1156,28 +1570,27 @@ class ProtocolIIIAgent:
 				'url': observation.url,
 				'thought': decision.thought,
 				'action': _decision_action_payload(decision),
+				'current_path_id': decision.current_path_id,
+				'progress': decision.progress,
+				'path_json_action': _path_json_action_artifact_payload(decision),
+				'path_json_action_result': path_action_result.payload(),
 			}
 
 			if decision.action == 'finish':
-				answer = (decision.answer or '').strip()
-				evidence = [item.strip() for item in (decision.evidence or []) if item.strip()]
 				if decision.success is True and answer and evidence:
-					step_record['outcome'] = 'Task completed with browser-grounded evidence.'
+					step_record['outcome'] = 'Task completed with an answer and origin explanation.'
 					outcome.steps.append(step_record)
-					_record_exploration_decision(
-						exploration_tracker,
-						step=step,
-						observation=observation,
-						rendered_observation=rendered_observation,
-						decision=decision,
-						outcome=step_record['outcome'],
-					)
 					outcome.status = 'SUCCESS'
 					outcome.agent_answer = answer
 					outcome.evidence = evidence
 					break
 				if decision.success is False:
-					step_record['outcome'] = 'Agent declared the task unsuccessful.'
+					failure_reason = answer or 'Agent declared the task unsuccessful.'
+					# Keep the model's declaration in the durable trajectory, but treat
+					# ``finish(false)`` as recoverable.  The next decision receives an
+					# explicit authoritative continuation instruction instead of a
+					# terminal failure status.
+					step_record['outcome'] = failure_reason
 					outcome.steps.append(step_record)
 					_record_exploration_decision(
 						exploration_tracker,
@@ -1187,9 +1600,10 @@ class ProtocolIIIAgent:
 						decision=decision,
 						outcome=step_record['outcome'],
 					)
-					outcome.status = 'FAIL'
-					outcome.error = answer or 'Agent could not complete the task'
-					break
+					if decision.memory.strip():
+						memory = self._remember(decision.memory)
+					last_outcome = _finish_false_retry_message(self.task.task)
+					continue
 				last_outcome = 'ERROR: finish(success=true) requires a non-empty answer and at least one evidence item.'
 				step_record['outcome'] = last_outcome
 				outcome.steps.append(step_record)
@@ -1203,13 +1617,17 @@ class ProtocolIIIAgent:
 				)
 				continue
 
-			action_signature = (observation_fingerprint, action_text)
-			if action_signature == last_action_signature:
-				repeated_action_count += 1
-			else:
-				last_action_signature = action_signature
-				repeated_action_count = 1
-			if repeated_action_count >= 3:
+			action_intent = _action_intent(decision)
+			no_change_signature = _no_change_signature(decision, observation_fingerprint)
+			no_change_blocked = no_change_signature in blocked_no_change_signatures
+			if not no_change_blocked:
+				action_signature = (observation_fingerprint, action_text)
+				if action_signature == last_action_signature:
+					repeated_action_count += 1
+				else:
+					last_action_signature = action_signature
+					repeated_action_count = 1
+			if not no_change_blocked and repeated_action_count >= 3:
 				last_outcome = json.dumps(
 					{
 						'action': decision.action,
@@ -1238,15 +1656,22 @@ class ProtocolIIIAgent:
 					break
 				continue
 
-			action_intent = _action_intent(decision)
 			recent_signatures.append((action_intent, observation_fingerprint))
-			loop_report = _detect_loop(recent_signatures)
+			loop_report = (
+				{
+					'pattern': 'repeated_no_change',
+					'attempts': no_change_counts.get(no_change_signature, 0),
+					'error': 'the same page generation, action intent, and target produced no observable change twice',
+				}
+				if no_change_blocked
+				else _detect_loop(recent_signatures)
+			)
 			if loop_report is not None:
 				blocked_loop_intents.add(action_intent)
 				last_outcome = json.dumps(
 					{
 						'action': decision.action,
-						'status': 'loop_detected',
+						'status': 'repeated_no_change' if loop_report.get('pattern') == 'repeated_no_change' else 'loop_detected',
 						**loop_report,
 						'error': ('this action was not executed because the recent trajectory is repeating without progress'),
 						'required_change': (
@@ -1282,6 +1707,7 @@ class ProtocolIIIAgent:
 			step_record['outcome'] = 'Action started; browser result was not recorded yet.'
 			outcome.steps.append(step_record)
 			action_failed = False
+			action_result_payload: dict[str, Any] | None = None
 			try:
 				if decision.action == 'find_chart_data_requests':
 					budget = self._chart_action_budget(decision.action, cursor=decision.chart_cursor is not None)
@@ -1380,7 +1806,8 @@ class ProtocolIIIAgent:
 							analysis_payload = None
 						action_failed = not isinstance(analysis_payload, dict) or analysis_payload.get('status') != 'ok'
 				else:
-					last_outcome = await self.runtime.execute(decision)
+					runtime_result = await self.runtime.execute(decision)
+					last_outcome, action_result_payload, action_failed = _format_runtime_action_result(runtime_result)
 			except TimeoutError:
 				last_outcome = json.dumps(
 					{'action': decision.action, 'status': 'timeout', 'error': 'action exceeded its shared task budget'},
@@ -1390,6 +1817,19 @@ class ProtocolIIIAgent:
 			except Exception as exc:
 				last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
 				action_failed = True
+
+			path_action_feedback = path_action_result.feedback()
+			if path_action_feedback:
+				last_outcome = _append_path_action_feedback(last_outcome, path_action_feedback)
+
+			if action_result_payload is not None:
+				step_record['action_result'] = action_result_payload
+				if action_result_payload.get('status') == 'no_change':
+					no_change_counts[no_change_signature] = no_change_counts.get(no_change_signature, 0) + 1
+					if no_change_counts[no_change_signature] >= 2:
+						blocked_no_change_signatures.add(no_change_signature)
+				else:
+					no_change_counts.pop(no_change_signature, None)
 
 			step_record['outcome'] = (
 				last_outcome
@@ -1416,7 +1856,7 @@ class ProtocolIIIAgent:
 				break
 		else:
 			outcome.status = 'FAIL_MAX_STEPS'
-			outcome.error = f'Reached the competition limit of {self.max_steps} steps without a grounded final answer'
+			outcome.error = f'Reached the competition limit of {self.max_steps} steps without a final answer'
 			self._salvage_into(outcome, memory)
 
 		outcome.duration_seconds = round(time.monotonic() - started_at, 3)
