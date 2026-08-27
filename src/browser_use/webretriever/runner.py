@@ -15,6 +15,7 @@ from typing import Any, Callable, Literal, Mapping
 
 from playwright.async_api import Browser, BrowserContext, async_playwright
 
+from browser_use.llm.base import BaseChatModel
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json
@@ -29,6 +30,7 @@ from browser_use.webretriever.experiment import (
 	rebrowser_qualification_report_passes,
 	write_experiment_summary,
 )
+from browser_use.webretriever.model_services import ModelServiceConfig, ModelServiceRouter
 from browser_use.webretriever.models import CompetitionTask, load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, normalize_thought_language
 from browser_use.webretriever.verification import VerificationState
@@ -41,7 +43,6 @@ DEFAULT_TASK_TIMEOUT_SECONDS = 600.0
 TASK_FINALIZATION_GRACE_SECONDS = 60.0
 DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES = PATCHRIGHT_EXPERIMENT_TASK_INDICES
 DEFAULT_REBROWSER_EXPERIMENT_TASK_INDICES = REBROWSER_EXPERIMENT_TASK_INDICES
-MAX_OPENAI_MODEL_VERSION = (5, 4)
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
 
@@ -51,9 +52,8 @@ class RunnerConfig:
 	input_path: Path
 	output_dir: Path
 	model: str
-	api_key: str
-	api_base: str | None
 	cdp_urls: list[str]
+	model_services: list[ModelServiceConfig] = field(default_factory=list)
 	sec_user_agent: str | None = None
 	vlm_ports: list[int] = field(default_factory=list)
 	api_mode: ApiMode = 'auto'
@@ -83,10 +83,22 @@ class RunnerConfig:
 	def validate(self) -> None:
 		if not self.model.strip():
 			raise ValueError('model must not be empty')
-		if not self.api_key and not self.vlm_ports:
-			raise ValueError('an OpenAI-compatible API key is required')
-		if self.api_base and self.vlm_ports:
-			raise ValueError('api_base and vlm_ports are mutually exclusive')
+		if self.model_services and self.vlm_ports:
+			raise ValueError('model_services and vlm_ports are mutually exclusive')
+		if self.model_services:
+			seen_names: set[str] = set()
+			for service in self.model_services:
+				if not service.name.strip():
+					raise ValueError('model service names must not be empty')
+				if service.name in seen_names:
+					raise ValueError(f'duplicate model service name: {service.name}')
+				seen_names.add(service.name)
+				if not service.api_base.strip():
+					raise ValueError(f'model service {service.name} api_base must not be empty')
+				if not service.api_key.strip():
+					raise ValueError(f'model service {service.name} api_key must not be empty')
+		elif not self.vlm_ports:
+			raise ValueError('at least one model service is required')
 		if any(not 1 <= port <= 65535 for port in self.vlm_ports):
 			raise ValueError('vlm_ports must contain valid TCP ports')
 		if len(self.vlm_ports) > 8:
@@ -128,11 +140,6 @@ class RunnerConfig:
 				raise ValueError('Rebrowser qualification report is missing or did not pass the experiment gate')
 		self.sec_user_agent = normalize_sec_user_agent(self.sec_user_agent)
 		self.thought_language = normalize_thought_language(self.thought_language)
-		validate_model_policy(self.model)
-
-
-def _version_tuple(match: re.Match[str]) -> tuple[int, int]:
-	return int(match.group(1)), int(match.group(2) or 0)
 
 
 def normalize_sec_user_agent(value: str | None) -> str | None:
@@ -159,36 +166,6 @@ def normalize_sec_user_agent(value: str | None) -> str | None:
 	return normalized
 
 
-def validate_model_policy(model: str) -> None:
-	"""Reject only model versions that are unambiguously above published caps."""
-	name = model.lower()
-	checks: list[tuple[str, str, tuple[int, int]]] = [
-		('OpenAI', r'(?<![a-z])gpt-(\d+)(?:\.(\d+))?', MAX_OPENAI_MODEL_VERSION),
-		('Google', r'gemini-(\d+)(?:\.(\d+))?', (3, 1)),
-		('xAI', r'grok-(\d+)(?:\.(\d+))?', (4, 3)),
-	]
-	for provider, pattern, maximum in checks:
-		match = re.search(pattern, name)
-		if match and _version_tuple(match) > maximum:
-			raise ValueError(f'{provider} model {model!r} is above the challenge maximum version {maximum[0]}.{maximum[1]}')
-
-	# Anthropic names generally encode the version as claude-...-4-6.
-	claude_match = re.search(r'claude(?:-[a-z]+)*-(\d+)[.-](\d+)(?:\b|$)', name)
-	if claude_match and _version_tuple(claude_match) > (4, 6):
-		raise ValueError(f'Anthropic model {model!r} is above the challenge maximum version 4.6')
-	claude_major = re.search(r'claude(?:-[a-z]+)*-(\d+)(?:\b|$)', name)
-	if claude_major and int(claude_major.group(1)) > 4:
-		raise ValueError(f'Anthropic model {model!r} is above the challenge maximum version 4.6')
-
-	glm_match = re.search(r'(?<![a-z])glm-(\d+)', name)
-	if glm_match and int(glm_match.group(1)) > 5:
-		raise ValueError(f'Zhipu model {model!r} is above the challenge maximum GLM-5V-Turbo family')
-
-	kimi_match = re.search(r'kimi[-_]?k?(\d+)(?:\.(\d+))?', name)
-	if kimi_match and _version_tuple(kimi_match) > (2, 6):
-		raise ValueError(f'Moonshot model {model!r} is above the challenge maximum version Kimi-K2.6')
-
-
 def resolve_responses_api(mode: ApiMode) -> bool:
 	if mode == 'responses':
 		return True
@@ -200,27 +177,22 @@ def resolve_responses_api(mode: ApiMode) -> bool:
 	if configured in {'chat', 'chat-completions', 'chat_completions'}:
 		return False
 	# The local OpenAI-compatible gateways used by this workspace expose Responses.
-	return bool(
-		os.getenv('WEBRETRIEVER_API_BASE')
-		or os.getenv('LITELLM_BASE_URL')
-		or os.getenv('WEBRETRIEVER_API_KEY')
-		or os.getenv('LITELLM_MASTER_KEY')
-	)
+	return False
 
 
-def build_llm(config: RunnerConfig, worker_id: int = 0) -> ChatOpenAI:
-	base_url = config.api_base
-	api_key = config.api_key
-	use_responses_api = resolve_responses_api(config.api_mode)
-	if config.vlm_ports:
-		base_url = f'http://127.0.0.1:{config.vlm_ports[worker_id % len(config.vlm_ports)]}/v1'
-		api_key = api_key or 'not-required'
-		if config.api_mode == 'auto':
-			use_responses_api = False
+def _build_chat_model(
+	config: RunnerConfig,
+	*,
+	api_base: str | None,
+	api_key: str,
+	use_responses_api: bool | None = None,
+) -> ChatOpenAI:
+	if use_responses_api is None:
+		use_responses_api = resolve_responses_api(config.api_mode)
 	return ChatOpenAI(
 		model=config.model,
 		api_key=api_key,
-		base_url=base_url,
+		base_url=api_base or None,
 		use_responses_api=use_responses_api,
 		stream_responses_api=use_responses_api,
 		timeout=config.model_timeout_seconds,
@@ -228,7 +200,36 @@ def build_llm(config: RunnerConfig, worker_id: int = 0) -> ChatOpenAI:
 		temperature=0.1,
 		reasoning_effort=config.reasoning_effort,
 		max_completion_tokens=4096,
+		default_headers={'User-Agent': 'python-httpx/0.28.1'},
 	)
+
+
+def build_llm(config: RunnerConfig, worker_id: int = 0) -> BaseChatModel:
+	if config.model_services:
+		services = tuple(config.model_services)
+		clients = tuple(
+			_build_chat_model(config, api_base=service.api_base, api_key=service.api_key) for service in services
+		)
+		return ModelServiceRouter(
+			model=config.model,
+			services=services,
+			clients=clients,
+			model_timeout_seconds=config.model_timeout_seconds,
+		)
+
+	if config.vlm_ports:
+		base_url = f'http://127.0.0.1:{config.vlm_ports[worker_id % len(config.vlm_ports)]}/v1'
+		use_responses_api = resolve_responses_api(config.api_mode)
+		if config.api_mode == 'auto':
+			use_responses_api = False
+		return _build_chat_model(
+			config,
+			api_base=base_url,
+			api_key='not-required',
+			use_responses_api=use_responses_api,
+		)
+
+	raise ValueError('model_services must be configured for OpenAI-compatible model calls')
 
 
 def _load_existing_status(writer: TaskArtifactWriter) -> str | None:
@@ -383,19 +384,15 @@ def _task_timeout_outcome(agent: ProtocolIIIAgent | None, timeout_seconds: float
 		outcome = AgentRunOutcome(status='FAIL_TASK_TIMEOUT')
 	outcome.status = 'FAIL_TASK_TIMEOUT'
 	outcome.error = f'Task exceeded the {timeout_seconds:g}-second time limit'
-	# The watchdog can cancel the loop mid-action, so salvage here too: a partial
-	# answer built from browser-verified memory beats an empty one.
-	if agent is not None:
-		agent.salvage_partial_answer()
 	return outcome
 
 
 async def _run_task(
 	*,
-		context: BrowserContext,
+	context: BrowserContext,
 	task: CompetitionTask,
 	config: RunnerConfig,
-	llm: ChatOpenAI,
+	llm: BaseChatModel,
 	logger: logging.Logger,
 	browser_driver: BrowserDriver | None = None,
 	browser_driver_fallback_reason: str | None = None,
@@ -500,7 +497,7 @@ async def _run_task(
 		urls = list(runtime.visited_urls) if runtime is not None else []
 		capture = runtime.capture_payload() if runtime is not None else None
 		writer.write_capture(capture)
-		writer.write_model_call_timing(getattr(agent, 'model_call_timing_payload', None))
+		writer.write_model_call(getattr(agent, 'model_call_timing_payload', None))
 		writer.write_result(
 			_result_payload(
 				task,
@@ -522,7 +519,11 @@ async def _run_task(
 		logger.info('Finished task %s/%s with status %s', task.task_idx, task.task_id, outcome.status)
 		return outcome.status
 	finally:
-		writer.release_lock()
+		try:
+			if isinstance(llm, ModelServiceRouter):
+				await llm.clear_task_affinity(task.task_id)
+		finally:
+			writer.release_lock()
 
 
 async def _consume_tasks(
@@ -531,7 +532,7 @@ async def _consume_tasks(
 	context: BrowserContext | None,
 	queue: asyncio.Queue[CompetitionTask],
 	config: RunnerConfig,
-	llm: ChatOpenAI,
+	llm: BaseChatModel,
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
 	browser_driver: BrowserDriver | None = None,
@@ -605,9 +606,9 @@ async def _cdp_worker(
 	config: RunnerConfig,
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
+	llm: BaseChatModel,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
-	llm = build_llm(config, worker_id)
 	logger.info('Connecting to CDP browser %s', redact_cdp_url(cdp_url))
 	connection = None
 	try:
@@ -667,11 +668,11 @@ async def _local_worker(
 	config: RunnerConfig,
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
+	llm: BaseChatModel,
 ) -> None:
 	"""Run one isolated local browser context for each concurrent worker."""
 
 	logger = _worker_logger(config.output_dir, worker_id)
-	llm = build_llm(config, worker_id)
 	context: BrowserContext | None = None
 	try:
 		context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
@@ -717,6 +718,9 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	statuses: dict[str, str] = {}
 	sec_task_semaphore = asyncio.Semaphore(1)
 	worker_count = min(config.max_concurrency, len(tasks))
+	# Model-service clients and their state are shared by every worker in this
+	# run. Local VLM endpoints deliberately retain their worker-specific routing.
+	shared_model_router = build_llm(config) if config.model_services else None
 	if config.local_browser:
 		async with async_playwright() as playwright:
 			browser = await playwright.chromium.launch(headless=config.headless)
@@ -727,9 +731,12 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 							worker_id=worker_id,
 							browser=browser,
 							queue=queue,
-							config=config,
-							statuses=statuses,
-							sec_task_semaphore=sec_task_semaphore,
+						config=config,
+						statuses=statuses,
+						sec_task_semaphore=sec_task_semaphore,
+						llm=shared_model_router
+						if shared_model_router is not None
+						else build_llm(config, worker_id),
 						)
 						for worker_id in range(worker_count)
 					)
@@ -748,6 +755,9 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 					config=config,
 					statuses=statuses,
 					sec_task_semaphore=sec_task_semaphore,
+					llm=shared_model_router
+					if shared_model_router is not None
+					else build_llm(config, worker_id),
 				)
 				for worker_id, cdp_url in enumerate(worker_urls)
 			)
@@ -1021,5 +1031,4 @@ __all__ = [
 	'run',
 	'run_patchright_experiment',
 	'run_rebrowser_experiment',
-	'validate_model_policy',
 ]

@@ -10,11 +10,13 @@ class ModelProviderError(ModelError):
 		message: str,
 		status_code: int = 502,
 		model: str | None = None,
+		raw_completion: str | None = None,
 	):
 		super().__init__(message)
 		self.message = message
 		self.status_code = status_code
 		self.model = model
+		self.raw_completion = raw_completion
 
 
 class ModelRateLimitError(ModelProviderError):
@@ -39,5 +41,6 @@ class ModelOutputTruncatedError(ModelProviderError):
 		self,
 		message: str,
 		model: str | None = None,
+		raw_completion: str | None = None,
 	):
-		super().__init__(message, status_code=400, model=model)
+		super().__init__(message, status_code=400, model=model, raw_completion=raw_completion)

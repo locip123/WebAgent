@@ -2,12 +2,88 @@
 Utilities for creating optimized Pydantic schemas for LLM usage.
 """
 
-from typing import Any
+from copy import deepcopy
+from typing import Any, Mapping
 
 from pydantic import BaseModel
 
 
 class SchemaOptimizer:
+	@staticmethod
+	def _non_nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
+		"""Return the non-null member of a nullable strict-output property."""
+
+		result = deepcopy(schema)
+		options = result.get('anyOf')
+		if not isinstance(options, list):
+			result.pop('default', None)
+			return result
+		non_null_options = [option for option in options if option != {'type': 'null'}]
+		if len(non_null_options) != 1:
+			raise ValueError('required action parameter must have exactly one non-null schema variant')
+		return deepcopy(non_null_options[0])
+
+	@staticmethod
+	def _add_action_parameter_branches(
+		schema: dict[str, Any], contracts: Mapping[str, Any]
+	) -> dict[str, Any]:
+		"""Constrain a flat action schema without changing its wire shape.
+
+		OpenAI-compatible strict schemas require every root property to be present,
+		which is a poor fit for a flat ``{action, ...parameters}`` object: a model
+		can satisfy the transport schema while filling ``url`` on a ``click``
+		decision.  Keep every property at the root for compatibility, but add an
+		``anyOf`` branch for each action.  Each branch pins ``action`` to one value
+		and requires every unrelated action parameter to be JSON ``null``.
+
+		The caller attaches the resulting branches below a provider envelope rather
+		than placing ``anyOf`` at the provider root. This preserves compatibility
+		with strict Structured Outputs, whose root schema must remain an object.
+		"""
+
+		if schema.get('type') != 'object':
+			raise ValueError('action-branch schemas require an object root')
+		properties = schema.get('properties')
+		if not isinstance(properties, dict) or 'action' not in properties:
+			raise ValueError('action-branch schemas require an action property')
+
+		parameter_names = frozenset(
+			field_name
+			for contract in contracts.values()
+			for field_name in getattr(contract, 'required', frozenset())
+			| getattr(contract, 'optional', frozenset())
+		)
+		all_property_names = list(properties)
+		branches: list[dict[str, Any]] = []
+		for action, contract in contracts.items():
+			required = frozenset(getattr(contract, 'required', frozenset()))
+			allowed = frozenset(
+				required
+				| getattr(contract, 'optional', frozenset())
+			)
+			branch_properties: dict[str, Any] = {}
+			for field_name, field_schema in properties.items():
+				if field_name == 'action':
+					branch_properties[field_name] = {'enum': [action], 'type': 'string'}
+				elif field_name in required:
+					branch_properties[field_name] = SchemaOptimizer._non_nullable_schema(field_schema)
+				elif field_name in parameter_names and field_name not in allowed:
+					branch_properties[field_name] = {'type': 'null'}
+				else:
+					branch_properties[field_name] = deepcopy(field_schema)
+			branches.append(
+				{
+					'type': 'object',
+					'properties': branch_properties,
+					'required': all_property_names,
+					'additionalProperties': False,
+				}
+			)
+
+		result = deepcopy(schema)
+		result['anyOf'] = branches
+		return result
+
 	@staticmethod
 	def create_optimized_json_schema(
 		model: type[BaseModel],
@@ -137,6 +213,24 @@ class SchemaOptimizer:
 			raise ValueError('Optimized schema result is not a dictionary')
 
 		optimized_schema: dict[str, Any] = optimized_result
+
+		# A model may advertise flat action contracts through a named nested
+		# property. Responses rejects root-level combinators, so keep the output
+		# root a plain object and place the action branches below the envelope.
+		# This is intentionally opt-in so unrelated structured outputs keep the
+		# historical schema behavior.
+		action_contracts = getattr(model, '__structured_action_parameter_contracts__', None)
+		if action_contracts:
+			action_field = getattr(model, '__structured_action_parameter_field__', None)
+			if not isinstance(action_field, str) or not action_field:
+				raise ValueError('action-branch schemas require a non-empty action parameter field')
+			properties = optimized_schema.get('properties')
+			if not isinstance(properties, dict) or action_field not in properties:
+				raise ValueError(f'action-branch schema has no {action_field!r} envelope property')
+			field_schema = properties[action_field]
+			if not isinstance(field_schema, dict):
+				raise ValueError(f'action-branch envelope property {action_field!r} must be an object schema')
+			properties[action_field] = SchemaOptimizer._add_action_parameter_branches(field_schema, action_contracts)
 
 		# Additional pass to ensure ALL objects have additionalProperties: false
 		def ensure_additional_properties_false(obj: Any) -> None:

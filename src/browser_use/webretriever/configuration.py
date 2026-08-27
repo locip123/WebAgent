@@ -38,8 +38,6 @@ _STRING_FIELDS = frozenset(
 		'input_path',
 		'output_dir',
 		'model',
-		'api_key',
-		'api_base',
 		'sec_user_agent',
 		'thought_language',
 	}
@@ -69,7 +67,7 @@ _CONFIG_FIELDS = (
 	| _STRING_LIST_FIELDS
 	| _INTEGER_LIST_FIELDS
 	| frozenset(_CHOICE_FIELDS)
-	| frozenset({'task_indices'})
+	| frozenset({'task_indices', 'model_services'})
 )
 
 
@@ -109,6 +107,26 @@ def _validate_value(path: Path, key: str, value: Any) -> None:
 		if isinstance(value, list) and all(isinstance(item, (str, int)) and not isinstance(item, bool) for item in value):
 			return
 		raise ConfigurationError(f'{prefix} must be a task-index string or list of strings/integers')
+	if key == 'model_services':
+		if not isinstance(value, list) or not value:
+			raise ConfigurationError(f'{prefix} must be a non-empty list of tables')
+		for index, service in enumerate(value):
+			service_prefix = f'{prefix}[{index}]'
+			if not isinstance(service, dict):
+				raise ConfigurationError(f'{service_prefix} must be a table')
+			if set(service) != {'name', 'api_base', 'api_key'}:
+				missing = sorted({'name', 'api_base', 'api_key'} - set(service))
+				unknown = sorted(set(service) - {'name', 'api_base', 'api_key'})
+				details = []
+				if missing:
+					details.append(f'missing {", ".join(missing)}')
+				if unknown:
+					details.append(f'unsupported {", ".join(unknown)}')
+				raise ConfigurationError(f'{service_prefix} must contain name, api_base, and api_key ({"; ".join(details)})')
+			for field_name in ('name', 'api_base', 'api_key'):
+				if not isinstance(service[field_name], str):
+					raise ConfigurationError(f'{service_prefix}.{field_name} must be a string')
+		return
 	if key in _CHOICE_FIELDS:
 		if not isinstance(value, str) or value not in _CHOICE_FIELDS[key]:
 			choices = ', '.join(sorted(_CHOICE_FIELDS[key]))

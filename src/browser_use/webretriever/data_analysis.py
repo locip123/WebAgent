@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.webretriever.artifacts import atomic_write_json
-from browser_use.webretriever.model_retry import invoke_with_reconnect_retries
+from browser_use.webretriever.model_services import invoke_model_call
 
 _MANIFEST_SCHEMA_VERSION = 1
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
@@ -134,6 +134,7 @@ class AnalysisCodeBackend(Protocol):
 		analysis_query: str,
 		tables: Sequence[AnalysisTable],
 		timeout_seconds: float,
+		affinity_key: str | None,
 	) -> GeneratedAnalysisCode: ...
 
 
@@ -867,6 +868,7 @@ class PandasAICodeBackend:
 		analysis_query: str,
 		tables: Sequence[AnalysisTable],
 		timeout_seconds: float,
+		affinity_key: str | None,
 	) -> GeneratedAnalysisCode:
 		if timeout_seconds <= 0:
 			raise TimeoutError
@@ -887,9 +889,13 @@ class PandasAICodeBackend:
 					prompt = instruction.to_string() if hasattr(instruction, 'to_string') else str(instruction)
 
 					async def invoke() -> Any:
-						return await invoke_with_reconnect_retries(
-							lambda: llm.ainvoke([SystemMessage(content=_PANDASAI_SYSTEM_PROMPT), UserMessage(content=prompt)]),
+						return await invoke_model_call(
+							llm,
+							lambda client: client.ainvoke(
+								[SystemMessage(content=_PANDASAI_SYSTEM_PROMPT), UserMessage(content=prompt)]
+							),
 							timeout_seconds=lambda: deadline - time.monotonic(),
+							affinity_key=affinity_key,
 						)
 
 					future = asyncio.run_coroutine_threadsafe(invoke(), loop)
@@ -1249,6 +1255,7 @@ class DataAnalysisAssistant:
 		*,
 		task_dir: Path,
 		task_identity: Mapping[str, Any],
+		affinity_key: str | None = None,
 		model_timeout_seconds: float = 90.0,
 		max_output_chars: int = _DEFAULT_OUTPUT_CHARS,
 		code_backend: AnalysisCodeBackend | None = None,
@@ -1265,6 +1272,7 @@ class DataAnalysisAssistant:
 		self.llm = llm
 		self.task_dir = Path(task_dir)
 		self.task_identity = dict(task_identity)
+		self.affinity_key = affinity_key
 		self.model_timeout_seconds = model_timeout_seconds
 		self.max_output_chars = max_output_chars
 		self.code_backend = code_backend or PandasAICodeBackend()
@@ -1348,6 +1356,7 @@ class DataAnalysisAssistant:
 					analysis_query=generation_query,
 					tables=tables,
 					timeout_seconds=remaining,
+					affinity_key=self.affinity_key,
 				)
 				_merge_usage(usage, generated.usage)
 				sql = _extract_literal_sql(generated.code)
@@ -1397,8 +1406,9 @@ class DataAnalysisAssistant:
 			'sql_result': _answer_result(query_result),
 		}
 		try:
-			response = await invoke_with_reconnect_retries(
-				lambda: self.llm.ainvoke(
+			response = await invoke_model_call(
+				self.llm,
+				lambda client: client.ainvoke(
 					[
 						SystemMessage(content=_ANSWER_SYSTEM_PROMPT),
 						UserMessage(content=json.dumps(answer_prompt, ensure_ascii=False, separators=(',', ':'), default=str)),
@@ -1406,6 +1416,7 @@ class DataAnalysisAssistant:
 					output_format=AnalysisAnswer,
 				),
 				timeout_seconds=lambda: deadline - time.monotonic(),
+				affinity_key=self.affinity_key,
 			)
 			_merge_usage(usage, _usage_dict(getattr(response, 'usage', None)))
 			answer = getattr(response, 'completion', None)

@@ -18,10 +18,11 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from browser_use.webretriever.connection import BrowserDriver
+from browser_use.webretriever.model_services import ModelServiceConfig
 from browser_use.webretriever.runner import MAX_CONCURRENCY, RunnerConfig, run
 
 _CDP_ACCESS_TOKEN_KEY = 'access_token'
-_DEFAULT_TASK_TIMEOUT_SECONDS = 600.0
+_DEFAULT_TASK_TIMEOUT_SECONDS = 7300.0
 
 
 def _template_root() -> Path:
@@ -30,8 +31,45 @@ def _template_root() -> Path:
 	return Path(__file__).resolve().parents[3]
 
 
-def _load_model_configuration(path: Path) -> dict[str, str]:
-	"""Read the template's simple model configuration without leaking its key."""
+def _required_configuration_string(payload: Mapping[str, object], key: str, *, prefix: str = 'config.json') -> str:
+	value = payload.get(key)
+	if not isinstance(value, str) or not value.strip():
+		raise ValueError(f'{prefix} field {key!r} must be a non-empty string')
+	return value.strip()
+
+
+def _load_model_services(payload: Mapping[str, object]) -> list[ModelServiceConfig]:
+	"""Load ordered failover services, retaining the template's legacy schema."""
+
+	raw_services = payload.get('model_services')
+	if raw_services is None:
+		return [
+			ModelServiceConfig(
+				'submission',
+				_required_configuration_string(payload, 'api_base'),
+				_required_configuration_string(payload, 'api_key'),
+			)
+		]
+	if not isinstance(raw_services, list) or not raw_services:
+		raise ValueError("config.json field 'model_services' must be a non-empty list")
+
+	services: list[ModelServiceConfig] = []
+	for index, raw_service in enumerate(raw_services):
+		prefix = f'config.json model_services[{index}]'
+		if not isinstance(raw_service, Mapping):
+			raise ValueError(f'{prefix} must be an object')
+		services.append(
+			ModelServiceConfig(
+				_required_configuration_string(raw_service, 'name', prefix=prefix),
+				_required_configuration_string(raw_service, 'api_base', prefix=prefix),
+				_required_configuration_string(raw_service, 'api_key', prefix=prefix),
+			)
+		)
+	return services
+
+
+def _load_model_configuration(path: Path) -> tuple[str, list[ModelServiceConfig], str, str]:
+	"""Read model configuration without leaking API credentials."""
 
 	try:
 		with path.open(encoding='utf-8') as config_file:
@@ -43,12 +81,7 @@ def _load_model_configuration(path: Path) -> dict[str, str]:
 	if not isinstance(payload, Mapping):
 		raise ValueError('model configuration must be a JSON object')
 
-	values: dict[str, str] = {}
-	for source_key, target_key in (('api_base', 'api_base'), ('api_key', 'api_key'), ('api_model', 'model')):
-		value = payload.get(source_key)
-		if not isinstance(value, str) or not value.strip():
-			raise ValueError(f'config.json field {source_key!r} must be a non-empty string')
-		values[target_key] = value.strip()
+	model = _required_configuration_string(payload, 'api_model')
 	for source_key, allowed, default in (
 		('api_mode', {'auto', 'responses', 'chat-completions'}, 'responses'),
 		('reasoning_effort', {'low', 'medium', 'high'}, 'low'),
@@ -57,8 +90,11 @@ def _load_model_configuration(path: Path) -> dict[str, str]:
 		if not isinstance(value, str) or value not in allowed:
 			choices = ', '.join(sorted(allowed))
 			raise ValueError(f'config.json field {source_key!r} must be one of: {choices}')
-		values[source_key] = value
-	return values
+		if source_key == 'api_mode':
+			api_mode = value
+		else:
+			reasoning_effort = value
+	return model, _load_model_services(payload), api_mode, reasoning_effort
 
 
 def _header_from_template(cdp_url: str) -> dict[str, str]:
@@ -103,20 +139,19 @@ def build_submission_config(
 		raise ValueError('the evaluator must provide at least one CDP URL')
 	if len(cdp_urls) > MAX_CONCURRENCY:
 		raise ValueError(f'the competition permits at most {MAX_CONCURRENCY} CDP URLs')
-	model = _load_model_configuration(config_path or _template_root() / 'config.json')
+	model, model_services, api_mode, reasoning_effort = _load_model_configuration(config_path or _template_root() / 'config.json')
 	return RunnerConfig(
 		input_path=task_file,
 		output_dir=output_dir,
-		model=model['model'],
-		api_key=model['api_key'],
-		api_base=model['api_base'],
+		model=model,
 		cdp_urls=list(cdp_urls),
+		model_services=model_services,
 		max_steps=100,
 		model_timeout_seconds=180.0,
 		task_timeout_seconds=_DEFAULT_TASK_TIMEOUT_SECONDS,
 		max_concurrency=len(cdp_urls),
-		api_mode=model['api_mode'],  # type: ignore[arg-type]
-		reasoning_effort=model['reasoning_effort'],  # type: ignore[arg-type]
+		api_mode=api_mode,  # type: ignore[arg-type]
+		reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
 		browser_driver=BrowserDriver.PLAYWRIGHT,
 		rerun_failed=False,
 		cdp_headers_provider=header_provider,

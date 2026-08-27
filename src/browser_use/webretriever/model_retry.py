@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
+
+import httpx
+from openai import APIError
 
 from browser_use.llm.exceptions import ModelProviderError
 
@@ -13,7 +17,6 @@ T = TypeVar('T')
 
 MODEL_RETRY_MAX_ATTEMPTS = 5
 MODEL_RETRY_DELAY_SECONDS = 8.0
-_RETRYABLE_MODEL_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def _consume_detached_task_result(task: asyncio.Future[object]) -> None:
@@ -48,24 +51,36 @@ async def await_with_hard_timeout(awaitable: Awaitable[T], timeout_seconds: floa
 
 
 def is_retryable_model_error(exc: Exception) -> bool:
-	"""Identify transient connection, service, and timeout failures only."""
+	"""Identify provider-call failures that another service can recover.
+
+	OpenAI-compatible gateways report upstream failures with inconsistent status
+	codes, so a curated HTTP-status list makes healthy configured services
+	unreachable. All wrapped provider failures are recoverable unless they
+	describe a local structured-output validation failure.
+	"""
 
 	if isinstance(exc, TimeoutError):
 		return True
 	if isinstance(exc, ConnectionError):
 		return True
+	# ChatOpenAI wraps these as ModelProviderError, but retaining the raw SDK
+	# classes here keeps custom or future model clients inside the same recovery
+	# boundary.
+	if isinstance(exc, (httpx.HTTPError, APIError, json.JSONDecodeError)):
+		return True
 	if not isinstance(exc, ModelProviderError):
 		return False
 	message = str(exc)
-	if 'validation error for ' in message or 'Failed to parse structured output' in message:
+	if 'validation error for ' in message or 'failed to parse structured output' in message.lower():
 		return False
-	return exc.status_code in _RETRYABLE_MODEL_STATUS_CODES
+	return True
 
 
 async def invoke_with_reconnect_retries(
 	invoke: Callable[[], Awaitable[T]],
 	*,
 	timeout_seconds: float | Callable[[], float],
+	on_attempt_started: Callable[[int], None] | None = None,
 	on_attempt_finished: Callable[[int, str, float, Exception | None], None] | None = None,
 	on_retry_wait_finished: Callable[[int, float], None] | None = None,
 ) -> T:
@@ -79,6 +94,8 @@ async def invoke_with_reconnect_retries(
 		per_attempt_timeout = timeout_seconds() if callable(timeout_seconds) else timeout_seconds
 		if per_attempt_timeout <= 0:
 			raise TimeoutError
+		if on_attempt_started is not None:
+			on_attempt_started(attempt)
 		started_at = time.monotonic()
 		try:
 			result = await await_with_hard_timeout(invoke(), per_attempt_timeout)

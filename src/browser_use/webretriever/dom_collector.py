@@ -64,6 +64,7 @@ _INTERACTIVE_ROLES = frozenset(
 		'option',
 		'radio',
 		'checkbox',
+		'switch',
 		'tab',
 		'textbox',
 		'combobox',
@@ -77,6 +78,8 @@ _INTERACTIVE_ROLES = frozenset(
 		'gridcell',
 	}
 )
+_SELECTION_INPUT_TYPES = frozenset({'checkbox', 'radio'})
+_SELECTION_ROLES = frozenset({'checkbox', 'radio', 'switch'})
 _AX_INTERACTIVE_PROPERTIES = frozenset(
 	{
 		'focusable',
@@ -234,6 +237,7 @@ class CollectedElement:
 	placeholder: str
 	href: str
 	input_type: str
+	checked: str
 	x: float
 	y: float
 	width: float
@@ -700,9 +704,12 @@ def _is_opaque(meta: _SnapshotMeta | None) -> bool:
 def _paint_filtered(nodes: Sequence[_DomNode]) -> set[int]:
 	"""Return candidates completely hidden by later opaque paint rectangles.
 
-	This intentionally mirrors browser-use's conservative paint-order filter.  A
-	union cap inside ``RectUnionPure`` prevents pathological pages from turning
-	this visibility hint into an unbounded computation.
+	Only rectangles with a *strictly later* paint order can cover a candidate.
+	Nodes sharing one paint order are part of the same paint phase: a table or
+	cell background must not cause its own descendant link to disappear merely
+	because it was visited first. A union cap inside ``RectUnionPure`` prevents
+	pathological pages from turning this visibility hint into an unbounded
+	computation.
 	"""
 	ignored: set[int] = set()
 	by_frame: dict[str, list[_DomNode]] = {}
@@ -711,14 +718,23 @@ def _paint_filtered(nodes: Sequence[_DomNode]) -> set[int]:
 			by_frame.setdefault(node.frame_id, []).append(node)
 	for frame_nodes in by_frame.values():
 		union = RectUnionPure()
-		for node in sorted(frame_nodes, key=lambda item: int(item.snapshot.paint_order or 0), reverse=True):
-			bounds = node.snapshot.bounds if node.snapshot else None
-			if bounds is None:
-				continue
-			rect = Rect(bounds.x, bounds.y, bounds.right, bounds.bottom)
-			if node.signals and union.contains(rect):
-				ignored.add(node.backend_node_id)
-			if _is_opaque(node.snapshot):
+		by_paint_order: dict[int, list[_DomNode]] = {}
+		for node in frame_nodes:
+			paint_order = node.snapshot.paint_order if node.snapshot is not None else None
+			if paint_order is not None:
+				by_paint_order.setdefault(int(paint_order), []).append(node)
+		for paint_order in sorted(by_paint_order, reverse=True):
+			rects_to_add: list[Rect] = []
+			for node in by_paint_order[paint_order]:
+				bounds = node.snapshot.bounds if node.snapshot else None
+				if bounds is None:
+					continue
+				rect = Rect(bounds.x, bounds.y, bounds.right, bounds.bottom)
+				if node.signals and union.contains(rect):
+					ignored.add(node.backend_node_id)
+				if _is_opaque(node.snapshot):
+					rects_to_add.append(rect)
+			for rect in rects_to_add:
 				union.add(rect)
 	return ignored
 
@@ -756,10 +772,117 @@ def _dedupe_nested_candidates(candidates: Sequence[_DomNode], by_backend_id: Map
 	return result
 
 
-def _candidate_text(node: _DomNode) -> tuple[str, str, str]:
+def _selection_kind(node: _DomNode) -> str:
+	"""Return the semantic selection-control kind, if this node has one."""
+
+	input_type = node.attributes.get('type', '').casefold()
+	if node.tag == 'input' and input_type in _SELECTION_INPUT_TYPES:
+		return input_type
+	role = node.attributes.get('role', '').casefold()
+	if role in _SELECTION_ROLES:
+		return role
+	if node.ax is not None and node.ax.role in _SELECTION_ROLES:
+		return node.ax.role
+	return ''
+
+
+def _is_selection_control(node: _DomNode) -> bool:
+	return bool(_selection_kind(node))
+
+
+def _checked_state(value: Any) -> str:
+	"""Normalise the DOM/AX checked state without guessing an absent value."""
+
+	state = _as_string(value).strip().casefold()
+	if state in {'true', '1', 'checked'}:
+		return 'true'
+	if state in {'false', '0', 'unchecked'}:
+		return 'false'
+	if state == 'mixed':
+		return 'mixed'
+	return ''
+
+
+def _selection_checked_state(node: _DomNode) -> str:
+	"""Return the current selection state supplied by AX or ARIA semantics."""
+
+	if node.ax is not None:
+		state = _checked_state(node.ax.properties.get('checked'))
+		if state:
+			return state
+	return _checked_state(node.attributes.get('aria-checked'))
+
+
+def _label_text(node: _DomNode) -> str:
+	"""Return the visible textual contribution of a labeling node."""
+
+	return (_text_from_raw(node.raw) or node.attributes.get('aria-label', '')).strip()[:_MAX_TEXT]
+
+
+def _selection_label(node: _DomNode, by_backend_id: Mapping[int, _DomNode]) -> str:
+	"""Resolve a selection-control label in the documented deterministic order."""
+
+	attributes = node.attributes
+	aria_label = attributes.get('aria-label', '').strip()
+	if aria_label:
+		return aria_label[:_MAX_TEXT]
+
+	by_dom_id = {
+		candidate.attributes['id']: candidate
+		for candidate in by_backend_id.values()
+		if candidate.attributes.get('id')
+	}
+	labelledby = [by_dom_id.get(item) for item in attributes.get('aria-labelledby', '').split()]
+	labelledby_parts: list[str] = []
+	for item in labelledby:
+		if item is None:
+			continue
+		text = _label_text(item)
+		if text:
+			labelledby_parts.append(text)
+	labelledby_text = ' '.join(labelledby_parts)
+	if labelledby_text:
+		return re.sub(r'\s+', ' ', labelledby_text).strip()[:_MAX_TEXT]
+
+	control_id = attributes.get('id', '')
+	if control_id:
+		explicit_labels = [
+			candidate
+			for candidate in by_backend_id.values()
+			if candidate.tag == 'label' and candidate.attributes.get('for') == control_id
+		]
+		for label in sorted(explicit_labels, key=lambda candidate: candidate.dom_order):
+			text = _label_text(label)
+			if text:
+				return text
+
+	seen: set[int] = set()
+	parent_id = node.parent_backend_node_id
+	while parent_id is not None and parent_id not in seen:
+		seen.add(parent_id)
+		parent = by_backend_id.get(parent_id)
+		if parent is None:
+			break
+		if parent.tag == 'label':
+			text = _label_text(parent)
+			if text:
+				return text
+		parent_id = parent.parent_backend_node_id
+
+	return (_text_from_raw(node.raw) or attributes.get('value', '')).strip()[:_MAX_TEXT]
+
+
+def _candidate_text(node: _DomNode, by_backend_id: Mapping[int, _DomNode]) -> tuple[str, str, str]:
 	attributes = node.attributes
 	ax = node.ax
 	text = _text_from_raw(node.raw)
+	selection_kind = _selection_kind(node)
+	if selection_kind:
+		name = _selection_label(node, by_backend_id)
+		if not text and not name:
+			text = attributes.get('value', '')
+		role = attributes.get('role') or (ax.role if ax is not None else '') or selection_kind
+		return text[:_MAX_TEXT], name[:_MAX_TEXT], role[:_MAX_TEXT]
 	name = (
 		attributes.get('aria-label')
 		or attributes.get('title')
@@ -1156,7 +1279,7 @@ async def _collect_scope(
 			for node in nodes
 			if node.visible
 			and node.signals
-			and node.backend_node_id not in paint_hidden
+			and (node.backend_node_id not in paint_hidden or _is_selection_control(node))
 			and node.global_bounds is not None
 			and node.frame_id in geometries
 			and geometries[node.frame_id].frame is not None
@@ -1178,7 +1301,7 @@ async def _collect_scope(
 			bounds = node.global_bounds
 			if frame is None or bounds is None:
 				continue
-			text, name, role = _candidate_text(node)
+			text, name, role = _candidate_text(node, by_backend_id)
 			attributes = node.attributes
 			href = attributes.get('href', '')
 			if href:
@@ -1199,6 +1322,7 @@ async def _collect_scope(
 					placeholder=attributes.get('placeholder', '')[:_MAX_TEXT],
 					href=href[:2000],
 					input_type=attributes.get('type', ''),
+					checked=_selection_checked_state(node) if _is_selection_control(node) else '',
 					x=bounds.x,
 					y=bounds.y,
 					width=bounds.width,

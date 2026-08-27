@@ -17,21 +17,27 @@ from browser_use.webretriever.exploration_paths import EXPLORATION_PATH_FILENAME
 from browser_use.webretriever.models import CompetitionTask
 
 MODEL_PROMPT_LOG_FILENAME = 'model_prompts.json'
-MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-lines'
-STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v2-structured'
-STRATEGY_REVIEW_PROMPT_LOG_FILENAME = 'strategy_review_prompts.json'
-STRATEGY_REVIEW_PROMPT_LOG_FORMAT = 'webretriever-strategy-review-prompts/v1-lines'
+MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v5-lines'
+STRUCTURED_MODEL_PROMPT_LOG_FORMAT = 'webretriever-model-prompts/v5-structured'
 EXPLORATION_PATHS_FILENAME = EXPLORATION_PATH_FILENAME
-MODEL_CALL_TIMING_FILENAME = 'model_call_timing.json'
-MODEL_CALL_TIMING_FORMAT = 'webretriever-model-call-timing/v1'
+MODEL_CALL_FILENAME = 'model_call.json'
+LEGACY_MODEL_CALL_TIMING_FILENAME = 'model_call_timing.json'
+# Keep the old symbol importable for integrations that only use the constant;
+# new writes always target MODEL_CALL_FILENAME.
+MODEL_CALL_TIMING_FILENAME = MODEL_CALL_FILENAME
+MODEL_CALL_TIMING_FORMAT = 'webretriever-model-call/v2'
 
 
 def model_prompt_log_metadata() -> dict[str, Any]:
 	"""Describe the optional detailed developer-facing model prompt trace."""
 
 	return {
-		'description': 'Structured trace of the exact multimodal messages submitted to the decision model.',
+		'description': (
+			'Complete trace of exact multimodal inputs, the structured output protocol, '
+			'and raw model text for each decision request.'
+		),
 		'message_order': ['system_prompt', 'steps[].prompt', 'steps[].image'],
+		'output_protocol_location': 'output_protocol',
 	}
 
 
@@ -47,7 +53,7 @@ def prompt_text_lines(text: str) -> list[str]:
 
 
 def empty_model_call_timing_payload() -> dict[str, Any]:
-	"""Return the durable empty timing table for one browser task."""
+	"""Return the durable empty model-call table for one browser task."""
 
 	return {
 		'format': MODEL_CALL_TIMING_FORMAT,
@@ -63,6 +69,10 @@ def empty_model_call_timing_payload() -> dict[str, Any]:
 			'total_wait_seconds': 0.0,
 		},
 		'steps': [],
+		'service_routing': {
+			'attempts': [],
+			'services': [],
+		},
 	}
 
 try:
@@ -224,9 +234,9 @@ class TaskArtifactWriter:
 		self.result_path = self.task_dir / 'result.json'
 		self.capture_path = self.task_dir / 'capture.json'
 		self.model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
-		self.strategy_review_prompt_log_path = self.task_dir / STRATEGY_REVIEW_PROMPT_LOG_FILENAME
 		self.exploration_paths_path = self.task_dir / EXPLORATION_PATHS_FILENAME
 		self.model_call_timing_path = self.task_dir / MODEL_CALL_TIMING_FILENAME
+		self.legacy_model_call_timing_path = self.task_dir / LEGACY_MODEL_CALL_TIMING_FILENAME
 		self.logs_dir = self.output_dir / 'logs'
 		self.lock_path = self.output_dir / 'locks' / f'{task.directory_name}.lock'
 		self.lock = TaskLock(self.lock_path)
@@ -258,16 +268,6 @@ class TaskArtifactWriter:
 			'steps': [],
 		}
 
-	@staticmethod
-	def _empty_strategy_review_prompt_log() -> dict[str, Any]:
-		"""Return the independent strategy-review input trace for a new task."""
-
-		return {
-			'format': STRATEGY_REVIEW_PROMPT_LOG_FORMAT,
-			'system_prompt': [],
-			'reviews': [],
-		}
-
 	def _empty_exploration_paths(self) -> dict[str, Any]:
 		return {
 			'schema_version': EXPLORATION_PATH_SCHEMA_VERSION,
@@ -294,11 +294,9 @@ class TaskArtifactWriter:
 				atomic_write_json(self.capture_path, self._empty_capture())
 			if not self.model_prompt_log_path.exists():
 				atomic_write_json(self.model_prompt_log_path, self._empty_model_prompt_log())
-			if not self.strategy_review_prompt_log_path.exists():
-				atomic_write_json(self.strategy_review_prompt_log_path, self._empty_strategy_review_prompt_log())
 			if not self.exploration_paths_path.exists():
 				atomic_write_json(self.exploration_paths_path, self._empty_exploration_paths())
-			if not self.model_call_timing_path.exists():
+			if not self.model_call_timing_path.exists() and not self.legacy_model_call_timing_path.exists():
 				atomic_write_json(self.model_call_timing_path, empty_model_call_timing_payload())
 		finally:
 			if not already_acquired:
@@ -371,11 +369,29 @@ class TaskArtifactWriter:
 			}
 		return atomic_write_json(self.capture_path, capture)
 
-	def write_model_call_timing(self, payload: Mapping[str, Any] | None = None) -> Path:
-		"""Atomically save Agent decision-model timing for this task."""
+	def write_model_call(self, payload: Mapping[str, Any] | None = None) -> Path:
+		"""Atomically save the model-call table for this task."""
 
 		self.prepare()
 		return atomic_write_json(self.model_call_timing_path, payload or empty_model_call_timing_payload())
+
+	def write_model_call_timing(self, payload: Mapping[str, Any] | None = None) -> Path:
+		"""Backward-compatible alias for integrations using the old method name."""
+
+		return self.write_model_call(payload)
+
+	def read_model_call(self) -> dict[str, Any]:
+		"""Read the renamed model-call artifact, falling back to its old name."""
+
+		for path in (self.model_call_timing_path, self.legacy_model_call_timing_path):
+			try:
+				with path.open(encoding='utf-8') as model_call_file:
+					payload = json.load(model_call_file)
+			except (FileNotFoundError, OSError, json.JSONDecodeError):
+				continue
+			if isinstance(payload, dict):
+				return payload
+		return empty_model_call_timing_payload()
 
 
 def prepare_task_directory(output_dir: Path | str, task: CompetitionTask) -> Path:
@@ -389,8 +405,8 @@ __all__ = [
 	'MODEL_PROMPT_LOG_FORMAT',
 	'MODEL_CALL_TIMING_FILENAME',
 	'MODEL_CALL_TIMING_FORMAT',
-	'STRATEGY_REVIEW_PROMPT_LOG_FILENAME',
-	'STRATEGY_REVIEW_PROMPT_LOG_FORMAT',
+	'MODEL_CALL_FILENAME',
+	'LEGACY_MODEL_CALL_TIMING_FILENAME',
 	'STRUCTURED_MODEL_PROMPT_LOG_FORMAT',
 	'TaskArtifactWriter',
 	'TaskLock',

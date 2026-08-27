@@ -24,7 +24,7 @@ from browser_use.webretriever.chart_data import (
 	sanitize_packet_metadata,
 	sanitize_url,
 )
-from browser_use.webretriever.model_retry import invoke_with_reconnect_retries
+from browser_use.webretriever.model_services import invoke_model_call
 
 _FILTERED_RESOURCE_TYPES = frozenset({'image', 'font', 'stylesheet', 'media', 'manifest'})
 _FILTERED_METHODS = frozenset({'OPTIONS', 'HEAD'})
@@ -518,9 +518,16 @@ Return exactly one structured decision for every request_id shown. Set contains_
 class ChartNetworkInspector:
 	"""Classify current-document network traffic and page exact matches losslessly."""
 
-	def __init__(self, llm: BaseChatModel, *, model_timeout_seconds: float = 180.0) -> None:
+	def __init__(
+		self,
+		llm: BaseChatModel,
+		*,
+		model_timeout_seconds: float = 180.0,
+		affinity_key: str | None = None,
+	) -> None:
 		self.llm = llm
 		self.model_timeout_seconds = model_timeout_seconds
+		self.affinity_key = affinity_key
 		self._scans: dict[str, _NetworkScan] = {}
 		self._scan_order: list[str] = []
 		self.last_filtered_requests: list[dict[str, Any]] = []
@@ -740,12 +747,14 @@ class ChartNetworkInspector:
 				'===== END AUTHORITATIVE CONTEXT =====\n\n'
 				f'{packet_text}'
 			)
-			response = await invoke_with_reconnect_retries(
-				lambda: self.llm.ainvoke(
+			response = await invoke_model_call(
+				self.llm,
+				lambda client: client.ainvoke(
 					[SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT), UserMessage(content=prompt)],
 					output_format=ChartRequestBatchDecision,
 				),
 				timeout_seconds=self.model_timeout_seconds,
+				affinity_key=self.affinity_key,
 			)
 			_merge_usage(usage, _usage_dict(response.usage))
 			for decision in response.completion.decisions:

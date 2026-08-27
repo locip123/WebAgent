@@ -41,7 +41,6 @@ from pydantic import BaseModel, ConfigDict
 
 from browser_use.webretriever.dom_collector import CdpCollectionError, collect_interactive_elements
 from browser_use.webretriever.models import WebRetrieverActionResult
-from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELDS
 
 if TYPE_CHECKING:
 	from browser_use.webretriever.models import AgentDecision
@@ -77,6 +76,15 @@ _DOWNLOAD_PREVIEW_TAIL_CHARS = 600
 _DEFAULT_RUNTIME_CLEANUP_TIMEOUT_SECONDS = 60.0
 _NAVIGATION_FIRST_OBSERVATION_TIMEOUT_MS = 10_000
 _NAVIGATION_HARD_TIMEOUT_MS = 120_000
+_INITIAL_NAVIGATION_RETRY_DELAY_SECONDS = 0.25
+_TRANSIENT_INITIAL_NAVIGATION_ERROR_CODES = frozenset(
+	{
+		'net::err_connection_closed',
+		'net::err_connection_reset',
+		'net::err_connection_timed_out',
+		'net::err_network_changed',
+	}
+)
 _DOWNLOAD_HARD_TIMEOUT_MS = 10 * 60 * 1000
 _MAX_ARCHIVE_FILES = 1_000
 _DOWNLOAD_PLACEHOLDER_URL = ':'
@@ -86,6 +94,7 @@ _MAX_ARCHIVE_WARNINGS = 100
 _MAX_RECENT_DIALOGS = 8
 _MAX_DIALOG_MESSAGE = 2_000
 _MAX_ACTION_RESULT_OUTPUT = 20_000
+_SCREENSHOT_RETRY_DELAY_SECONDS = 3 * 60
 _STATE_CHANGING_ACTIONS = frozenset(
 	{
 		'click',
@@ -301,6 +310,7 @@ class ElementRef:
 	placeholder: str = ''
 	href: str = ''
 	input_type: str = ''
+	checked: str = ''
 	frame_index: int = 0
 	frame_url: str = ''
 	x: float = 0.0
@@ -318,6 +328,8 @@ class ElementRef:
 			parts.append(f'role={self.role}')
 		if self.input_type:
 			parts.append(f'type={self.input_type}')
+		if self.checked:
+			parts.append(f'checked={self.checked}')
 		if self.name:
 			parts.append(f'name={json.dumps(self.name, ensure_ascii=False)}')
 		if self.text and self.text != self.name:
@@ -490,8 +502,21 @@ _MARK_ELEMENTS_JS = r"""
     if (typeof element.checkVisibility === 'function' && !element.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
     const index = next++;
     element.setAttribute(markerAttribute, String(index));
+    const isSelection = element.matches('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]');
+    const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map(id => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+      .join(' ');
+    const explicitLabel = element.id
+      ? Array.from(document.querySelectorAll('label[for]')).find(label => label.getAttribute('for') === element.id)?.innerText || ''
+      : '';
+    const wrappingLabel = element.closest('label')?.innerText || '';
     const text = (element.innerText || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-    const name = (element.getAttribute('aria-label') || element.getAttribute('title') || text).replace(/\s+/g, ' ').trim();
+    const name = (isSelection
+      ? (element.getAttribute('aria-label') || labelledBy || explicitLabel || wrappingLabel || text || element.value || '')
+      : (element.getAttribute('aria-label') || element.getAttribute('title') || text)).replace(/\s+/g, ' ').trim();
+    const checked = isSelection
+      ? ('checked' in element ? (element.checked ? 'true' : 'false') : (element.getAttribute('aria-checked') || ''))
+      : '';
     const overlay = document.createElement('div');
     overlay.className = overlayClass;
     Object.assign(overlay.style, {
@@ -511,9 +536,9 @@ _MARK_ELEMENTS_JS = r"""
     (document.documentElement || document.body).appendChild(overlay);
     results.push({
       index, tag: element.tagName.toLowerCase(), text: text.slice(0, maxText),
-      role: element.getAttribute('role') || '', name: name.slice(0, maxText),
+      role: element.getAttribute('role') || (isSelection ? (element.getAttribute('type') || '') : ''), name: name.slice(0, maxText),
       placeholder: (element.getAttribute('placeholder') || '').slice(0, maxText),
-      href: String(element.href || '').slice(0, 2000), input_type: element.getAttribute('type') || '', frame_index: frameIndex,
+      href: String(element.href || '').slice(0, 2000), input_type: element.getAttribute('type') || '', checked, frame_index: frameIndex,
       x: rect.x, y: rect.y, width: rect.width, height: rect.height
     });
   }
@@ -584,6 +609,37 @@ _CLEAR_MARKERS_JS = r"""
 }
 """
 
+_TARGET_STATE_JS = r"""
+function(element) {
+  const target = element || this;
+  const rect = target.getBoundingClientRect();
+  const text = (target.innerText || target.textContent || '').replace(/\s+/g, ' ').trim();
+  const ariaChecked = target.getAttribute('aria-checked');
+  return {
+    tag: target.tagName.toLowerCase(),
+    value: 'value' in target ? String(target.value ?? '') : null,
+    checked: 'checked' in target ? Boolean(target.checked) : ariaChecked,
+    selected: target.getAttribute('aria-selected'),
+    expanded: target.getAttribute('aria-expanded'),
+    disabled: 'disabled' in target ? Boolean(target.disabled) : null,
+    text: text.slice(0, 500),
+    visible: rect.bottom > 0 && rect.right > 0
+      && rect.top < window.innerHeight && rect.left < window.innerWidth
+  };
+}
+"""
+
+_SELECT_OPTIONS_JS = r"""
+function(element) {
+  const target = element || this;
+  if (!target || target.tagName.toLowerCase() !== 'select') return null;
+  return Array.from(target.options || []).map(option => ({
+    value: String(option.value ?? ''),
+    label: String(option.label ?? option.textContent ?? '').replace(/\s+/g, ' ').trim(),
+  }));
+}
+"""
+
 
 class BrowserRuntime:
 	"""A small async runtime that performs every browser operation with Playwright."""
@@ -600,6 +656,7 @@ class BrowserRuntime:
 		action_timeout_ms: int = 30_000,
 		screenshot_timeout_ms: int = 20_000,
 		cdp_screenshot_timeout_ms: int = 20_000,
+		screenshot_retry_delay_seconds: float = _SCREENSHOT_RETRY_DELAY_SECONDS,
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
 		declared_user_agent: str | None = None,
 		task_identity: Mapping[str, Any] | None = None,
@@ -608,6 +665,8 @@ class BrowserRuntime:
 			raise ValueError('navigation_first_observation_timeout_ms must be in (0, navigation_timeout_ms]')
 		if download_timeout_ms <= 0:
 			raise ValueError('download_timeout_ms must be greater than 0')
+		if screenshot_retry_delay_seconds < 0:
+			raise ValueError('screenshot_retry_delay_seconds must be non-negative')
 		self.context = context
 		self.task_dir = Path(task_dir)
 		self.logger = logger
@@ -617,6 +676,7 @@ class BrowserRuntime:
 		self.action_timeout_ms = action_timeout_ms
 		self.screenshot_timeout_ms = screenshot_timeout_ms
 		self.cdp_screenshot_timeout_ms = cdp_screenshot_timeout_ms
+		self.screenshot_retry_delay_seconds = screenshot_retry_delay_seconds
 		self.max_response_body_bytes = max(0, max_response_body_bytes)
 		self.declared_user_agent = declared_user_agent
 		self.task_identity = dict(task_identity) if isinstance(task_identity, Mapping) else None
@@ -700,7 +760,18 @@ class BrowserRuntime:
 		await self._configure_owned_page(page)
 		self._started = True
 		self.logger.info('Opening exact task start URL: %s', redact_cdp_url(website))
-		download_started = await self._goto_exact(page, website)
+		try:
+			download_started = await self._goto_exact(page, website)
+		except PlaywrightError as exc:
+			if page.is_closed() or not self._is_transient_initial_navigation_error(exc):
+				raise
+			self._record_navigation_notice(page, website, 'initial_navigation_retry', str(exc))
+			self.logger.warning(
+				'Initial navigation failed with a transient transport error; retrying once: %s',
+				redact_cdp_url(str(exc)),
+			)
+			await asyncio.sleep(_INITIAL_NAVIGATION_RETRY_DELAY_SECONDS)
+			download_started = await self._goto_exact(page, website)
 		self._record_url(website if download_started or id(page) in self._pending_navigations else page.url, unless_last=True)
 		if not is_forbidden_search_url(page.url):
 			self._last_safe_urls[id(page)] = page.url
@@ -722,23 +793,51 @@ class BrowserRuntime:
 		step_name = self._safe_step_name(step)
 		raw_path = self.trajectory_dir / f'{step_name}.png'
 		visual_path = self.trajectory_visual_dir / f'{step_name}.png'
-		page, raw_screenshot = await self._capture_observation_screenshot(page, raw_path)
+		raw_screenshot: bytes | None = None
+		try:
+			page, raw_screenshot = await self._capture_observation_screenshot(page, raw_path)
+		except asyncio.CancelledError:
+			raise
+		except Exception as first_capture_error:
+			self.logger.warning(
+				'Observation screenshot failed for step %s; retrying the full capture chain after %gs: %s',
+				step_name,
+				self.screenshot_retry_delay_seconds,
+				first_capture_error,
+			)
+			if self.screenshot_retry_delay_seconds:
+				await asyncio.sleep(self.screenshot_retry_delay_seconds)
+			try:
+				page, raw_screenshot = await self._capture_observation_screenshot(page, raw_path)
+			except asyncio.CancelledError:
+				raise
+			except Exception as retry_capture_error:
+				raw_path.unlink(missing_ok=True)
+				visual_path.unlink(missing_ok=True)
+				self.logger.warning(
+					'Observation screenshot retry failed for step %s; continuing this step without a screenshot: %s',
+					step_name,
+					retry_capture_error,
+				)
 
 		page_text = (
 			self._dialog_observation_text() + self._navigation_observation_text(page) + await self._collect_page_text(page)
 		)
 		elements = await self._collect_elements(page)
 		viewport = await self._viewport(page)
-		try:
-			visual_screenshot = await self._capture_screenshot(page, visual_path)
-			screenshot = visual_screenshot
-			if not self._legacy_marker_bindings_active:
-				screenshot = self._annotate_element_screenshot(visual_screenshot, elements, viewport)
-				if screenshot != visual_screenshot:
-					visual_path.write_bytes(screenshot)
-		except Exception:
-			self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
-			screenshot = raw_screenshot
+		if raw_screenshot is None:
+			screenshot = b''
+		else:
+			try:
+				visual_screenshot = await self._capture_screenshot(page, visual_path)
+				screenshot = visual_screenshot
+				if not self._legacy_marker_bindings_active:
+					screenshot = self._annotate_element_screenshot(visual_screenshot, elements, viewport)
+					if screenshot != visual_screenshot:
+						visual_path.write_bytes(screenshot)
+			except Exception:
+				self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
+				screenshot = raw_screenshot
 
 		tabs = await self._tabs()
 		title = await self._page_title(page)
@@ -1838,31 +1937,83 @@ class BrowserRuntime:
 		if not self._has_explicit_selector(params) and not self._has_target(params):
 			return {}
 		try:
-			locator = (
-				self._target_locator(params)
-				if self._has_explicit_selector(params)
-				else self._locator_for_index(self._target_index(params))
-			)
-			value = await locator.evaluate(
-				"""element => {
-					const rect = element.getBoundingClientRect();
-					const text = (element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim();
-					return {
-						tag: element.tagName.toLowerCase(),
-						value: 'value' in element ? String(element.value ?? '') : null,
-						checked: 'checked' in element ? Boolean(element.checked) : null,
-						selected: element.getAttribute('aria-selected'),
-						expanded: element.getAttribute('aria-expanded'),
-						disabled: 'disabled' in element ? Boolean(element.disabled) : null,
-						text: text.slice(0, 500),
-						visible: rect.bottom > 0 && rect.right > 0
-							&& rect.top < window.innerHeight && rect.left < window.innerWidth
-					};
-				}"""
-			)
+			if self._has_explicit_selector(params):
+				locator = self._target_locator(params)
+				value = await locator.evaluate(_TARGET_STATE_JS)
+			else:
+				index = self._target_index(params)
+				binding = self._binding_for_index(index)
+				if self._is_backend_binding(binding):
+					return await self._capture_backend_target_state(binding, index)
+				locator = self._locator_for_index(index)
+				value = await locator.evaluate(_TARGET_STATE_JS)
 			return dict(value) if isinstance(value, Mapping) else {'value': str(value)}
 		except Exception as exc:
 			return {'probe_error': f'{type(exc).__name__}: {exc}'[:500]}
+
+	async def _capture_backend_target_state(self, binding: _ElementBinding, index: int) -> dict[str, Any]:
+		"""Read target state from a CDP backend node without requiring a selector."""
+
+		async with self._backend_session(binding, index) as session:
+			resolved = await session.send('DOM.resolveNode', {'backendNodeId': binding.backend_node_id})
+			remote_object = resolved.get('object') if isinstance(resolved, Mapping) else None
+			object_id = remote_object.get('objectId') if isinstance(remote_object, Mapping) else None
+			if not isinstance(object_id, str) or not object_id:
+				raise ValueError(f'Could not resolve backend-bound element {index} for state probing')
+			try:
+				result = await session.send(
+					'Runtime.callFunctionOn',
+					{
+						'objectId': object_id,
+						'functionDeclaration': _TARGET_STATE_JS,
+						'returnByValue': True,
+						'awaitPromise': False,
+					},
+				)
+				remote_result = result.get('result') if isinstance(result, Mapping) else None
+				value = remote_result.get('value') if isinstance(remote_result, Mapping) else None
+				if not isinstance(value, Mapping):
+					raise ValueError(f'Could not read backend-bound element {index} state')
+				return dict(value)
+			finally:
+				with contextlib.suppress(Exception):
+					await session.send('Runtime.releaseObject', {'objectId': object_id})
+
+	async def _capture_backend_select_options(
+		self,
+		binding: _ElementBinding,
+		index: int,
+	) -> tuple[tuple[str, str], ...]:
+		"""Read the current native-select options without changing browser state."""
+
+		async with self._backend_session(binding, index) as session:
+			resolved = await session.send('DOM.resolveNode', {'backendNodeId': binding.backend_node_id})
+			remote_object = resolved.get('object') if isinstance(resolved, Mapping) else None
+			object_id = remote_object.get('objectId') if isinstance(remote_object, Mapping) else None
+			if not isinstance(object_id, str) or not object_id:
+				raise ValueError(f'Could not resolve backend-bound select {index}')
+			try:
+				result = await session.send(
+					'Runtime.callFunctionOn',
+					{
+						'objectId': object_id,
+						'functionDeclaration': _SELECT_OPTIONS_JS,
+						'returnByValue': True,
+						'awaitPromise': False,
+					},
+				)
+				remote_result = result.get('result') if isinstance(result, Mapping) else None
+				options = remote_result.get('value') if isinstance(remote_result, Mapping) else None
+				if not isinstance(options, list):
+					raise ValueError(f'Element {index} is not a native select control')
+				return tuple(
+					(str(option.get('value', '')), str(option.get('label', '')))
+					for option in options
+					if isinstance(option, Mapping)
+				)
+			finally:
+				with contextlib.suppress(Exception):
+					await session.send('Runtime.releaseObject', {'objectId': object_id})
 
 	@staticmethod
 	def _action_state_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
@@ -1898,7 +2049,13 @@ class BrowserRuntime:
 	def _bounded_action_output(value: str) -> str:
 		if len(value) <= _MAX_ACTION_RESULT_OUTPUT:
 			return value
-		return value[:14_000] + '\n...[action result truncated]...\n' + value[-6_000:]
+		marker = '\n...[action result truncated]...\n'
+		available = _MAX_ACTION_RESULT_OUTPUT - len(marker)
+		if available <= 0:
+			return marker[:_MAX_ACTION_RESULT_OUTPUT]
+		head = min(14_000, available)
+		tail = available - head
+		return value[:head] + marker + (value[-tail:] if tail else '')
 
 	@staticmethod
 	def _error_metadata(exc: Exception) -> tuple[str, str]:
@@ -2256,11 +2413,25 @@ class BrowserRuntime:
 		start_y = float(self._first(params, 'start_y', 'from_y', 'y1', 'y'))
 		end_x = float(self._first(params, 'end_x', 'to_x', 'x2'))
 		end_y = float(self._first(params, 'end_y', 'to_y', 'y2'))
+		profile = str(self._first(params, 'profile', default='') or '').casefold()
 		mouse = self._active_page().mouse
-		await mouse.move(start_x, start_y)
-		await mouse.down()
-		await mouse.move(end_x, end_y, steps=12)
-		await mouse.up()
+		if profile == 'human':
+			from browser_use.webretriever.verification_vision import human_drag_waypoints
+
+			await mouse.move(start_x, start_y)
+			await asyncio.sleep(0.08)
+			await mouse.down()
+			for point_x, point_y, delay_ms in human_drag_waypoints(start_x, start_y, end_x, end_y):
+				await mouse.move(point_x, point_y, steps=1)
+				if delay_ms > 0:
+					await asyncio.sleep(delay_ms / 1000)
+			await asyncio.sleep(0.05)
+			await mouse.up()
+		else:
+			await mouse.move(start_x, start_y)
+			await mouse.down()
+			await mouse.move(end_x, end_y, steps=12)
+			await mouse.up()
 		return f'dragged ({start_x:g}, {start_y:g}) to ({end_x:g}, {end_y:g})'
 
 	async def _tab_action(self, params: dict[str, Any]) -> str:
@@ -3071,6 +3242,7 @@ class BrowserRuntime:
 				placeholder=item.placeholder,
 				href=item.href,
 				input_type=item.input_type,
+				checked=item.checked,
 				frame_index=item.frame_index,
 				frame_url=item.frame_url,
 				x=item.x,
@@ -3128,6 +3300,7 @@ class BrowserRuntime:
 					placeholder=str(item.get('placeholder', '')),
 					href=str(item.get('href', '')),
 					input_type=str(item.get('input_type', '')),
+					checked=str(item.get('checked', '')),
 					frame_index=frame_index,
 					frame_url=frame.url,
 					x=float(item.get('x', 0)),
@@ -3428,6 +3601,24 @@ class BrowserRuntime:
 			),
 			None,
 		)
+		if matched is None:
+			# The page text and the CDP snapshot are independent observations. A
+			# dynamic/native select can therefore have a complete live option list
+			# even when the snapshot captured for this binding omitted an option.
+			# Refresh only on cache miss, then retain the exact value/label contract.
+			try:
+				binding.options = await self._capture_backend_select_options(binding, index)
+			except Exception as exc:
+				self.logger.debug('Could not refresh live options for element %s: %s', index, exc)
+			else:
+				matched = next(
+					(
+						(position, option_value)
+						for position, (option_value, label) in enumerate(binding.options)
+						if value in {option_value, label}
+					),
+					None,
+				)
 		if matched is None:
 			raise ValueError(f'No option matching {value!r} exists on element {index}; observe again if choices changed')
 		position, selected_value = matched
@@ -3737,12 +3928,16 @@ class BrowserRuntime:
 		return status == 'download'
 
 	@staticmethod
+	def _is_transient_initial_navigation_error(error: PlaywrightError) -> bool:
+		"""Whether the initial document request can safely receive one retry."""
+
+		message = str(error).casefold()
+		return any(code in message for code in _TRANSIENT_INITIAL_NAVIGATION_ERROR_CODES)
+
+	@staticmethod
 	def _decision_dict(decision: AgentDecision | Mapping[str, Any]) -> dict[str, Any]:
 		if isinstance(decision, Mapping):
-			data = dict(decision)
-			for field_name in CHECKPOINT_DECISION_FIELDS:
-				data.pop(field_name, None)
-			return data
+			return dict(decision)
 		action_payload = getattr(decision, 'action_payload', None)
 		if callable(action_payload):
 			dumped = action_payload()

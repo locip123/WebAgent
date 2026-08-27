@@ -13,13 +13,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeAlias, get_args
+from typing import Any, ClassVar, Literal, TypeAlias, get_args
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from browser_use.webretriever.exploration_paths import PathJsonAction
-from browser_use.webretriever.strategy import CHECKPOINT_DECISION_FIELD_LIMITS, CHECKPOINT_DECISION_FIELDS
 
 ActionName: TypeAlias = Literal[
 	'click',
@@ -292,49 +291,12 @@ class AgentDecision(BaseModel):
 
 	action: ActionName
 	thought: str = ''
-	memory: str = ''
 	# Path-tree metadata is deliberately separate from browser action parameters.
 	# Empty defaults preserve construction compatibility for local callers; the
 	# Protocol III agent requires these fields only while exploration mode is active.
 	current_path_id: str = Field(default='', max_length=128)
 	progress: str = Field(default='无', min_length=1, max_length=4_000)
 	path_json_action: PathJsonAction = Field(default_factory=PathJsonAction)
-	# Strict structured-output providers require every flat property on every
-	# turn.  These values are therefore null outside a prompted checkpoint and
-	# all non-empty when a checkpoint is due; they are never action parameters.
-	checkpoint_strategy_catalog: str | None = Field(
-		default=None,
-		max_length=CHECKPOINT_DECISION_FIELD_LIMITS['checkpoint_strategy_catalog'],
-		description=(
-			'Checkpoint only: all legal, materially distinct viable strategy classes. '
-			'When populated, use a multi-line Markdown list value: one class per line, each beginning "- "; '
-			'do not use inline numbering or combine classes on one line.'
-		),
-	)
-	checkpoint_active_strategy: str | None = Field(
-		default=None,
-		max_length=CHECKPOINT_DECISION_FIELD_LIMITS['checkpoint_active_strategy'],
-		description=(
-			'Checkpoint only: the strategy currently being attempted. When populated, use a Markdown list with exactly one '
-			'item beginning "- ".'
-		),
-	)
-	checkpoint_confirmed_infeasible: str | None = Field(
-		default=None,
-		max_length=CHECKPOINT_DECISION_FIELD_LIMITS['checkpoint_confirmed_infeasible'],
-		description=(
-			'Checkpoint only: strategies ruled out by browser-grounded evidence. When populated, use a Markdown list: '
-			'one item per line, each beginning "- ".'
-		),
-	)
-	checkpoint_next_strategies: str | None = Field(
-		default=None,
-		max_length=CHECKPOINT_DECISION_FIELD_LIMITS['checkpoint_next_strategies'],
-		description=(
-			'Checkpoint only: remaining legal strategies worth attempting next. When populated, use a Markdown list: '
-			'one item per line, each beginning "- ".'
-		),
-	)
 	element_id: int | None = Field(default=None, ge=0)
 	text: str | None = None
 	url: str | None = None
@@ -418,10 +380,6 @@ class AgentDecision(BaseModel):
 		'chart_cursor',
 		'analysis_query',
 		'data_dir',
-		'checkpoint_strategy_catalog',
-		'checkpoint_active_strategy',
-		'checkpoint_confirmed_infeasible',
-		'checkpoint_next_strategies',
 	)
 	@classmethod
 	def _non_empty_optional_string(cls, value: str | None) -> str | None:
@@ -474,11 +432,24 @@ class AgentDecision(BaseModel):
 		"""Serialize browser-action fields without null placeholders or planning metadata."""
 
 		payload = self.model_dump(exclude_none=True)
-		for field_name in CHECKPOINT_DECISION_FIELDS:
-			payload.pop(field_name, None)
 		for field_name in ('current_path_id', 'progress', 'path_json_action'):
 			payload.pop(field_name, None)
 		return payload
+
+
+class AgentDecisionEnvelope(BaseModel):
+	"""Provider-only wrapper that keeps action branches below the JSON-schema root.
+
+		Responses Structured Outputs rejects a root-level ``anyOf``. The nested
+		``decision`` value still uses the flat AgentDecision wire shape, and the
+		agent unwraps it before any browser action, trajectory, or artifact work.
+	"""
+
+	model_config = ConfigDict(extra='forbid', strict=True)
+	__structured_action_parameter_contracts__: ClassVar[dict[str, ActionParameterContract]] = ACTION_PARAMETER_CONTRACTS
+	__structured_action_parameter_field__: ClassVar[str] = 'decision'
+
+	decision: AgentDecision
 
 
 def _decode_task_document(path: Path, source: str) -> list[Any]:
@@ -557,6 +528,7 @@ def load_tasks(path: Path | str) -> list[CompetitionTask]:
 __all__ = [
 	'ActionName',
 	'AgentDecision',
+	'AgentDecisionEnvelope',
 	'CalculationOperation',
 	'CompetitionTask',
 	'Evidence',

@@ -1,20 +1,27 @@
-#!/usr/bin/env bash
-# Official interface: bash scripts/run.sh <task_file> <output_dir> <cdp_url_1> ...
+#!/bin/bash
+# ============================================================
+# WebRetriever Challenge 固定评测入口
+# 用法: bash scripts/run.sh <task_file> <output_dir> <cdp_url1> [cdp_url2] ...
+# ============================================================
 set -euo pipefail
 
-if [ "$#" -lt 3 ]; then
-  echo "Usage: bash scripts/run.sh <task_file> <output_dir> <cdp_url_1> [cdp_url_2 ...]" >&2
-  exit 2
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ $# -lt 3 ]; then
+    echo "参数不足：bash scripts/run.sh <task_file> <output_dir> <cdp_url1> [cdp_url2] ..." >&2
+    exit 2
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_dir="$(cd "$script_dir/.." && pwd)"
-
-if [ ! -f "$1" ]; then
-  echo "Task file does not exist: $1" >&2
-  exit 2
+TASK_FILE="$1"
+if [ ! -f "$TASK_FILE" ]; then
+    echo "任务文件不存在: $TASK_FILE" >&2
+    exit 2
 fi
 
-# Keep vendored code self-contained and never echo evaluator CDP URLs or tokens.
-export PYTHONPATH="$project_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+cd "$PROJECT_DIR"
+export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# 提交运行不需要 Browser Use 的全局日志配置；避免向工作区外写入日志。
+export BROWSER_USE_SETUP_LOGGING=false
+
 exec python3 -m browser_use.webretriever.submission "$@"

@@ -46,6 +46,9 @@ class ChatInvokeCompletion(BaseModel, Generic[T]):
 	completion: T
 	"""The completion of the response."""
 
+	raw_completion: str | None = None
+	"""The exact generated text before structured-output parsing, when available."""
+
 	# Thinking stuff
 	thinking: str | None = None
 	redacted_thinking: str | None = None

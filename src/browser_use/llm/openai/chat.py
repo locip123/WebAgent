@@ -378,17 +378,34 @@ class ChatOpenAI(BaseChatModel):
 			stop_reason = self._get_responses_stop_reason(response)
 
 			if output_format is None:
-				return ChatInvokeCompletion(completion=response_text, usage=usage, stop_reason=stop_reason)
+				return ChatInvokeCompletion(
+					completion=response_text,
+					raw_completion=response_text,
+					usage=usage,
+					stop_reason=stop_reason,
+				)
 
 			if not response_text:
 				raise ModelProviderError(
 					message='Failed to parse structured output from Responses API response',
 					status_code=500,
 					model=self.name,
+					raw_completion=response_text,
 				)
 
+			try:
+				parsed = self._parse_responses_structured_text(response_text, output_format)
+			except Exception as exc:
+				raise ModelProviderError(
+					message=str(exc),
+					status_code=500,
+					model=self.name,
+					raw_completion=response_text,
+				) from exc
+
 			return ChatInvokeCompletion(
-				completion=self._parse_responses_structured_text(response_text, output_format),
+				completion=parsed,
+				raw_completion=response_text,
 				usage=usage,
 				stop_reason=stop_reason,
 			)
@@ -480,8 +497,10 @@ class ChatOpenAI(BaseChatModel):
 					)
 
 				usage = self._get_usage(response)
+				raw_completion = choice.message.content or ''
 				return ChatInvokeCompletion(
-					completion=choice.message.content or '',
+					completion=raw_completion,
+					raw_completion=raw_completion,
 					usage=usage,
 					stop_reason=choice.finish_reason,
 				)
@@ -552,6 +571,7 @@ class ChatOpenAI(BaseChatModel):
 							' shorter output.'
 						),
 						model=self.name,
+						raw_completion=choice.message.content,
 					)
 
 				if choice.message.content is None:
@@ -559,14 +579,25 @@ class ChatOpenAI(BaseChatModel):
 						message='Failed to parse structured output from model response',
 						status_code=500,
 						model=self.name,
+						raw_completion=choice.message.content,
 					)
 
 				usage = self._get_usage(response)
 
-				parsed = output_format.model_validate_json(choice.message.content)
+				raw_completion = choice.message.content
+				try:
+					parsed = output_format.model_validate_json(raw_completion)
+				except Exception as exc:
+					raise ModelProviderError(
+						message=str(exc),
+						status_code=500,
+						model=self.name,
+						raw_completion=raw_completion,
+					) from exc
 
 				return ChatInvokeCompletion(
 					completion=parsed,
+					raw_completion=raw_completion,
 					usage=usage,
 					stop_reason=choice.finish_reason,
 				)

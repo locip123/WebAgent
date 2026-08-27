@@ -14,6 +14,7 @@ from typing import Any, Sequence
 from dotenv import load_dotenv
 
 from browser_use.webretriever.configuration import ConfigurationError, FileConfiguration, load_file_configuration
+from browser_use.webretriever.model_services import ModelServiceConfig
 from browser_use.webretriever.models import load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
 from browser_use.webretriever.runner import (
@@ -141,20 +142,7 @@ def build_parser(configuration: FileConfiguration | None = None) -> argparse.Arg
 	)
 
 	parser.add_argument('--model', default=_setting(configuration, 'model', None), help='OpenAI-compatible model name')
-	parser.add_argument(
-		'--api_base',
-		'--api-base',
-		dest='api_base',
-		default=_setting(configuration, 'api_base', None),
-		help='OpenAI-compatible API base URL',
-	)
-	parser.add_argument(
-		'--api_key',
-		'--api-key',
-		dest='api_key',
-		default=_setting(configuration, 'api_key', None),
-		help='OpenAI-compatible API key',
-	)
+	parser.set_defaults(model_services=_setting(configuration, 'model_services', None))
 	parser.add_argument(
 		'--sec-user-agent',
 		default=_setting(configuration, 'sec_user_agent', None),
@@ -307,24 +295,35 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 	if args.output_dir is None:
 		parser.error('provide --output or set output_dir in the TOML configuration file')
 	model = args.model or _first_env('WEBRETRIEVER_MODEL', 'LITELLM_MODEL', 'OPENAI_MODEL')
-	if args.vlm_ports and args.api_base:
-		parser.error('--vlm_ports and --api-base are mutually exclusive')
-	api_key = args.api_key or _first_env('WEBRETRIEVER_API_KEY', 'LITELLM_MASTER_KEY', 'OPENAI_API_KEY')
-	api_base = (
-		None if args.vlm_ports else args.api_base or _first_env('WEBRETRIEVER_API_BASE', 'LITELLM_BASE_URL', 'OPENAI_BASE_URL')
-	)
+	raw_model_services = getattr(args, 'model_services', None)
+	model_services: list[ModelServiceConfig] = []
+	if raw_model_services is not None:
+		if not isinstance(raw_model_services, list) or not raw_model_services:
+			parser.error('model_services must be a non-empty list')
+		for index, service in enumerate(raw_model_services):
+			if not isinstance(service, dict):
+				parser.error(f'model_services[{index}] must be a table')
+			try:
+				model_services.append(
+					ModelServiceConfig(
+						name=str(service['name']),
+						api_base=str(service['api_base']),
+						api_key=str(service['api_key']),
+					)
+				)
+			except (KeyError, TypeError) as exc:
+				parser.error(f'model_services[{index}] must contain name, api_base, and api_key: {exc}')
+	if model_services and args.vlm_ports:
+		parser.error('model_services and --vlm_ports are mutually exclusive')
 	if not model:
 		parser.error('provide --model or WEBRETRIEVER_MODEL/LITELLM_MODEL/OPENAI_MODEL')
-	if not api_key and not args.vlm_ports:
-		parser.error('provide --api-key or WEBRETRIEVER_API_KEY/LITELLM_MASTER_KEY/OPENAI_API_KEY')
 
 	config = RunnerConfig(
 		input_path=args.input_path,
 		output_dir=args.output_dir,
 		model=model,
-		api_key=api_key or '',
-		api_base=api_base,
 		cdp_urls=_split_cdp_urls(args.cdp_urls),
+		model_services=model_services,
 		sec_user_agent=args.sec_user_agent or _sec_user_agent_from_env(),
 		vlm_ports=args.vlm_ports,
 		api_mode=args.api_mode,
