@@ -17,3 +17,7 @@ __pycache__/
 # 评测输出（不要提交）
 test_results/
 logs/
+outputs/
+docs/
+tests/
+CONTEXT.md
