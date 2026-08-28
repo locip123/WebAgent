@@ -443,6 +443,10 @@ async def _run_task(
 				runtime.start(task.website),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
+			# Checkpoint genuine browser traffic before model work begins.  A slow or
+			# cancelled decision loop must not erase evidence that this task reached
+			# its evaluator-provided browser and start URL.
+			writer.write_capture(runtime.capture_payload())
 			agent = ProtocolIIIAgent(
 				task=task,
 				llm=llm,
