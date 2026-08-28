@@ -39,21 +39,6 @@
       "api_key": "sk-ozW26xoMiaEkipDQojvC7FRSIndYkJgW6iIWQ01c0RM5QpDs"
     },
     {
-      "name": "runapi-1",
-      "api_base": "https://runapi.co/v1",
-      "api_key": "sk-fLL2HxiqxGDEE7bhAQFV0vmfOWYKvIgcNruJpRLgswfg259H"
-    },
-    {
-      "name": "runapi-2",
-      "api_base": "https://runapi.co/v1",
-      "api_key": "sk-2C6eIO36rMB6iqqKNUalGuJhKde4ypAe88LdzZe3Yxz7NKb5"
-    },
-    {
-      "name": "runapi-3",
-      "api_base": "https://runapi.co/v1",
-      "api_key": "sk-QcyTaZkBpe8yoThrd9wcdLDO45leD2pGddJMe129cBt0Baam"
-    },
-    {
       "name": "fastapi-1",
       "api_base": "https://www.fastaitoken.com/v1",
       "api_key": "sk-c24bb4c36c242187484c48e71f112a54c892598b7cc852d4e9e8190602ab2bfe"

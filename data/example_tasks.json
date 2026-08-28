@@ -1,14 +1,16 @@
 [
   {
-    "task_idx": 0,
-    "task_id": "cdfae1f0087e45c3bf72788cf8d5b81f",
-    "website": "https://piaofang.maoyan.com",
-    "task": "查询中国市场2025年中秋节当天电影分账票房排名第二的电影是哪部"
-  },
-  {
     "task_idx": 1,
     "task_id": "330dcf5ea8084f328316f90f0eeac040",
     "website": "https://data.worldbank.org/",
-    "task": "中国2000年至今青少年生育率（每1000名15-19岁女性的生育子女数）增速最快的年份是哪一年"
+    "task": "中国2000年至今青少年生育率（每1000名15-19岁女性的生育子女数）增速最快的年份是哪一年",
+    "answer": "2006年"
+  },
+  {
+    "task_idx": 7,
+    "task_id": "61aca5f22fc84a7c8cab5448d16aad1a",
+    "website": "https://clinicaltrials.gov/",
+    "task": "请找出2018年1月1日至2018年12月31日期间首次发布（First Posted）的，针对‘Glioblastoma’（胶质母细胞瘤）的，且处于‘Phase 3’（III期）的干预性（Interventional）临床试验，在已经终止招募的项目中找出NCT编号（NCT Number）最小的试验，并提供该试验的Actual Enrollment（实际入组人数），数据接口：https://clinicaltrials.gov/api/int/studies?cond=Glioblastoma%20Multiforme%20of%20Brain&aggFilters=&checkSpell=true&from=0&limit=1000&fields=OverallStatus%2CLastKnownStatus%2CStatusVerifiedDate%2CHasResults%2CBriefTitle%2CCondition%2CInterventionType%2CInterventionName%2CLocationFacility%2CLocationCity%2CLocationState%2CLocationCountry%2CLocationStatus%2CLocationZip%2CLocationGeoPoint%2CLocationContactName%2CLocationContactRole%2CLocationContactPhone%2CLocationContactPhoneExt%2CLocationContactEMail%2CCentralContactName%2CCentralContactRole%2CCentralContactPhone%2CCentralContactPhoneExt%2CCentralContactEMail%2CGender%2CMinimumAge%2CMaximumAge%2CStdAge%2CNCTId%2CStudyType%2CLeadSponsorName%2CAcronym%2CEnrollmentCount%2CStartDate%2CPrimaryCompletionDate%2CCompletionDate%2CStudyFirstPostDate%2CResultsFirstPostDate%2CLastUpdatePostDate%2COrgStudyId%2CSecondaryId%2CPhase%2CLargeDocLabel%2CLargeDocFilename%2CPrimaryOutcomeMeasure%2CSecondaryOutcomeMeasure%2CDesignAllocation%2CDesignInterventionModel%2CDesignMasking%2CDesignWhoMasked%2CDesignPrimaryPurpose%2CDesignObservationalModel%2CDesignTimePerspective%2CLeadSponsorClass%2CCollaboratorClass&columns=conditions%2Cinterventions%2Ccollaborators&highlight=true&sort=%40relevance",
+    "answer": "NCT03393000，实际入组人数为19"
   }
 ]

@@ -19,5 +19,8 @@ test_results/
 logs/
 outputs/
 docs/
-tests/
+tests/*
+!tests/analyze_model_calls.py
 CONTEXT.md
+聊天记录.md
+data/example_tasks.json

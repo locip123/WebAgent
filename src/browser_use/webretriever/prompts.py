@@ -12,7 +12,12 @@ from urllib.parse import urlsplit
 import tiktoken
 
 from browser_use.webretriever.browser import BrowserObservation
-from browser_use.webretriever.exploration_paths import ExplorationReviewRequest, SYSTEM_INITIAL_PATH_PROGRESS
+from browser_use.webretriever.exploration_paths import (
+	ExplorationReviewRequest,
+	SYSTEM_INITIAL_PATH_PROGRESS,
+	available_leaf_path_ids,
+	model_facing_path_tree,
+)
 from browser_use.webretriever.models import CompetitionTask, render_action_parameter_contracts
 
 DEFAULT_THOUGHT_LANGUAGE = '简体中文'
@@ -183,26 +188,17 @@ _SYSTEM_SECTION_BODIES: tuple[tuple[str, str, str], ...] = (
 	(
 		'exploration_path_tree',
 		'EXPLORATION PATH TREE',
-		"""1. Maintain the durable exploration plan in path.json only during exploration mode.
-2. Root: `schema_version`=`2`, `task_id`=current task ID, `paths`=root-node array.
-3. After observation, the executor creates system initial root `"1"` with fixed fields. Each node has a `path_id`: executor-generated immutable string (`1`, `1->1`, ...); `start_url`: executor-owned immutable observed creation URL.
-4. Each model-created node has a `location`: non-empty Chinese semantic position of the Agent when it creates the path (for example `首页`, `观产业栏目`, `首页下方`); the system initial root uses `任务起始页面`. It is never a URL and never updated.
-5. Each node has a `strategy_description`: non-empty Chinese description using `通过<操作或入口>可能找到<任务所需的页面或信息>`. It is fixed when the node is created and is never updated.
-6. Each node has a `status`: `pending`, `in_progress`, `failed`, or `succeeded`; `progress`: latest verified Chinese progress or `null`; `children`: child-node array. Root `"1"` permanently stays `in_progress`/`{system_initial_path_progress}`; never update or fail it. `progress`=`无` preserves the old value.
-7. Each decision supplies an existing non-terminal `current_path_id`, non-empty Chinese `progress` (or `无`), and optional operations; never replace the tree.
-8. `paths=[]` is only a pre-observation internal state; external empty trees use `add`, not `update`; `update` is forbidden. Normal decisions receive system root.
-9. `op` is `add` or `update`; operations are ordered typed add/update shapes.
-10. `add` requires `parent_path_id` (`null` for root), `location`, and `strategy_description`; the executor creates `path_id`, `start_url`, `status`, `progress`, and `children`, so omit them.
-11. `update` requires an existing `path_id` and may change only `status` or `progress`; never send `strategy_description`, `location`, or `parent_path_id`.
-12. Omit unchanged fields; strict nullable `null` means “unchanged”, never “clear”.
-13. In a required page review, find all task-relevant visible-element routes that could reach the task destination or correct page. Add each under `current_path_id` in descending likelihood, then select the highest new child as `current_path_id` and act on it. Outside a review, add every newly observed relevant route; never repurpose an existing path by rewriting its strategy.
-14. When a current route cannot reach the task destination or answer page, update it to failed with a concrete `progress` reason, then select a new route. Never mark system root `"1"` failed; find another route.
-15. Set `succeeded` once browser evidence reaches an answer-bearing page, document, table, chart, download, or first-party response.
-16. It starts answer-priority mode: this action still runs; from the next decision take any browser action but stop tree maintenance.
-17. The prompt confirms the correct page or answer location; focus on returning the answer.
-18. Do not create an extraction child.
-19. A parent and its active child are both `in_progress`; when switching because the current route failed, explicitly update that route to `failed` with a progress reason.
-20. Retry unapplied operations only while exploring. Path-tree retries show a canonical diagnostic and the current trusted tree, never the rejected decision JSON.""",
+		"""1. Maintain the durable exploration plan in path.json only during exploration mode. The displayed tree is a model-facing projection, not an editable file.
+2. Root `"1"` is `kind: "system_anchor"` and `immutable: true`. It may remain `current_path_id`, but it is never a concrete route: never send any `update` for path_id `"1"`.
+3. Every concrete node has an executor-generated immutable `path_id` (`1->1`, ...), immutable `start_url`, immutable Chinese `location`, immutable Chinese `strategy_description`, a lifecycle `status`, latest verified `progress` or `null`, and `children`.
+4. Each decision supplies an existing non-terminal `current_path_id` and non-empty Chinese `decision_summary`. This summary records the current observation and immediate intent; it never changes a path node.
+5. `op` is `add` or `update`; operations are ordered typed add/update shapes. `add` requires an existing `parent_path_id`, `location`, and `strategy_description`; the executor owns root `"1"` and creates all lifecycle fields.
+6. `update` requires an existing concrete path_id and may change only `status` or `progress`; never send `strategy_description`, `location`, or `parent_path_id`. If no verified path state changed, use no `update`.
+7. `update.progress` records verified route evidence. Never send `"无"` as an update value. An update to `failed` must include concrete failure evidence; an update to `succeeded` must include concrete evidence that the route reached the correct page or answer location.
+8. For every update operation, path_id must never be "1". Path "1" is the immutable system anchor and is not an updatable exploration route.
+9. In a required page review, find all task-relevant visible-element routes that could reach the task destination or correct page and add each under `current_path_id` in descending likelihood. Selecting a new child in the same decision is allowed, not mandatory. Outside a review, add every newly observed relevant route; never repurpose an existing path by rewriting its strategy.
+10. A `succeeded` update starts answer-priority mode after its evidence is applied: from the next decision take any browser action but stop tree maintenance. Do not create an extraction child.
+11. Retry unapplied operations only while exploring. Path-tree retries show a canonical diagnostic and the current trusted tree, never the rejected decision JSON.""",
 	),
 	(
 		'action_contract',
@@ -665,7 +661,6 @@ class PromptComposer:
 			nonlocal deduplicated
 			result: list[dict[str, Any]] = []
 			previous_path_id = ''
-			previous_progress_by_path: dict[str, str] = {}
 			for index, item in enumerate(items):
 				step_value = item.get('step')
 				if not isinstance(step_value, (int, float, str, type(None))):
@@ -688,17 +683,38 @@ class PromptComposer:
 					'summary': summary,
 				}
 				path_id = compact_text(item.get('current_path_id', ''), source='history_path_id', field_limit=field_limit, strategy='head')
-				progress = compact_text(item.get('progress', ''), source='history_progress', field_limit=field_limit)
-				path_change: dict[str, str] = {}
 				if path_id and path_id != previous_path_id:
-					path_change['path_id'] = path_id
+					event['current_path_id'] = path_id
 					previous_path_id = path_id
-				progress_key = path_id or previous_path_id
-				if progress and progress != '无' and progress != previous_progress_by_path.get(progress_key):
-					path_change['progress'] = progress
-					previous_progress_by_path[progress_key] = progress
-				if path_change:
-					event['path_change'] = path_change
+				decision_summary = compact_text(
+					item.get('decision_summary', ''), source='history_decision_summary', field_limit=field_limit
+				)
+				if decision_summary:
+					event['decision_summary'] = decision_summary
+				path_action_result = item.get('path_json_action_result')
+				if isinstance(path_action_result, Mapping):
+					operations = path_action_result.get('operations')
+					if isinstance(operations, list):
+						applied_operations: list[dict[str, object]] = []
+						for operation in operations:
+							if not isinstance(operation, Mapping) or operation.get('applied') is not True:
+								continue
+							canonical = operation.get('canonical_operation')
+							if not isinstance(canonical, Mapping):
+								continue
+							compacted_operation: dict[str, object] = {}
+							for field_name, value in canonical.items():
+								if field_name in {'location', 'strategy_description', 'progress'}:
+									compacted_operation[str(field_name)] = compact_text(
+										value,
+										source='history_path_operation',
+										field_limit=field_limit,
+									)
+								else:
+									compacted_operation[str(field_name)] = value
+							applied_operations.append(compacted_operation)
+						if applied_operations:
+							event['path_change'] = {'operations': applied_operations}
 				result.append(event)
 			return result
 
@@ -926,14 +942,15 @@ class PromptComposer:
 		last_outcome = self._clip_tokens('last_outcome', context.last_outcome, self._SOURCE_LIMITS['last_outcome'])
 		history, history_value = self._compact_history(context.history, context.last_outcome)
 		exploration_paths_text = (
-			json.dumps(context.exploration_paths, ensure_ascii=False, separators=(',', ':'))
+			json.dumps(model_facing_path_tree(context.exploration_paths), ensure_ascii=False, separators=(',', ':'))
 			if context.exploration_paths is not None and not context.answer_priority_mode
 			else ''
 		)
-		empty_exploration_tree = (
-			not context.answer_priority_mode
-			and context.exploration_paths is not None
-			and context.exploration_paths.get('paths') == []
+		show_current_path_id_candidates = (
+			context.exploration_paths is not None and not context.answer_priority_mode and context.step_index > 0
+		)
+		current_path_id_candidates = (
+			available_leaf_path_ids(context.exploration_paths) if show_current_path_id_candidates else ()
 		)
 		data_artifact_notice = self._clip_tokens(
 			'data_artifact_notice', context.data_artifact_notice, self._SOURCE_LIMITS['data_artifact_notice'], strategy='head_tail'
@@ -1012,24 +1029,33 @@ class PromptComposer:
 				if bounded['download_recovery_notice'].text
 				else ''
 			)
-			empty_tree_bootstrap_rule = (
-				"""===== EMPTY EXPLORATION TREE BOOTSTRAP RULE =====
-The trusted tree is empty: `paths=[]`. In this decision, use one or more `add` operations first and do not send any `update`. The executor creates path IDs; after adding the first root, you may use its generated ID (`"1"`) as `current_path_id` in this same decision.
-===== END EMPTY EXPLORATION TREE BOOTSTRAP RULE =====
-"""
-				if empty_exploration_tree
-				else ''
-			)
 			path_tree_block = (
-				f"""===== COMPLETE EXPLORATION PATH TREE (SYSTEM STATE) =====
-This is the durable planning state stored as path.json. Read it before choosing the next direction.
-{exploration_paths_text}
-{empty_tree_bootstrap_rule}
-===== END COMPLETE EXPLORATION PATH TREE =====
+				f"""===== COMPLETE EXPLORATION PATH TREE (MODEL PROJECTION) =====
+				This is the trusted model-facing projection of durable path.json. Read it before choosing the next direction.
+				{exploration_paths_text}
+				===== END COMPLETE EXPLORATION PATH TREE =====
 """
 				if exploration_paths_text
 				else ''
 			)
+			if show_current_path_id_candidates:
+				if current_path_id_candidates:
+					current_path_id_rows = '\n'.join(f'| `{path_id}` |' for path_id in current_path_id_candidates)
+					current_path_id_candidates_block = f"""===== 可选 CURRENT_PATH_ID（可用叶子节点） =====
+下表中的每个值都是可直接选择的未终态具体叶子节点。
+| current_path_id |
+| --- |
+{current_path_id_rows}
+===== END 可选 CURRENT_PATH_ID =====
+"""
+				else:
+					current_path_id_candidates_block = """===== 可选 CURRENT_PATH_ID（可用叶子节点） =====
+当前所有子探索路径已经探索完成，请尝试寻找新的探索路径并添加到子路径中
+请在完整路径树中选择合适的未终态父节点，以 `add` 创建新的子路径，并将该新路径的执行器生成 `path_id` 作为本轮 `current_path_id`。
+===== END 可选 CURRENT_PATH_ID =====
+"""
+			else:
+				current_path_id_candidates_block = ''
 			if context.answer_priority_mode:
 				exploration_review_block = """
 ===== ANSWER PRIORITY MODE =====
@@ -1048,19 +1074,13 @@ At least one exploration path has reached the correct page or answer location. S
 						'periodic': 'Ten completed decisions have accumulated since the prior full path review. Re-check every task-relevant visible route before continuing.',
 					}[review.trigger]
 					review_instruction = (
-						'''首轮路径审查硬规则：
-1. `path_json_action.operations` 至少包含一个 `add`，用当前页面实际观察到的入口创建具体探索路径。
-2. 操作按数组顺序应用；执行器在每个 `add` 后生成路径 ID，因此同一决策只能选择当前可信树或本轮已创建的路径。
-3. `update` 只能修改当前可信树中已有的具体探索路径；系统根路径 `1` 永不更新或标记失败。'''
-						if review.trigger == 'initial_page'
-						else (
-							'Because the trusted tree is `paths=[]`, bootstrap it now with one or more `add` operations; do not send `update`.'
-							if empty_exploration_tree
-						else (
-							'In this same AgentDecision, add every task-relevant visible-element route that could reach the task destination or correct page. Set parent_path_id to current_path_id, order add operations from most to least likely to succeed, then select the highest new child as current_path_id and execute that route’s browser action. strategy_description is immutable after add, so never use update to rename or repurpose a route. Candidate directions can include links, buttons, filters, result entries, pagination, expanders, and downloads.'
-						)
-						)
-					)
+					'''INITIAL PATH REVIEW — HARD RULES:
+1. The current path tree contains only the immutable system anchor `"1"`; no concrete exploration path exists yet. For a normal browser action, this decision's output schema exposes only one or more root-child `add` operations in `path_json_action.operations`. Add every task-relevant route reachable through a visible element on the current page that could lead to the correct page or answer location as a concrete exploration path under root `"1"` (`parent_path_id: "1"`). A successful finish with complete answer and evidence is the only no-path exception.
+2. Operations are applied in array order. The executor generates a path ID after each `add`; therefore, within the same decision, you may select only a path in the current trusted tree or a path created by an earlier `add` in this decision.
+3. The system anchor `"1"` is never edited or marked failed. The normal `add`/`update` protocol becomes available only after this initial review succeeds.'''
+					if review.trigger == 'initial_page'
+					else 'In this same AgentDecision, add every task-relevant visible-element route that could reach the task destination or correct page. Set parent_path_id to current_path_id and order add operations from most to least likely to succeed. Selecting a new child as current_path_id is allowed, not mandatory. strategy_description is immutable after add, so never use update to rename or repurpose a route. Candidate directions can include links, buttons, filters, result entries, pagination, expanders, and downloads.'
+				)
 					exploration_review_block = f"""
 ===== REQUIRED EXPLORATION PATH REVIEW =====
 {trigger_detail}
@@ -1069,14 +1089,18 @@ At least one exploration path has reached the correct page or answer location. S
 """
 				else:
 					exploration_review_block = ''
-				exploration_instruction = (
-					'The complete path tree is empty: bootstrap it with `add` only, never `update`; then select the executor-generated first path ID in this decision.'
-					if empty_exploration_tree
-					else (
-						'Every AgentDecision must provide current_path_id and non-empty progress, and may provide path_json_action operations. '
-						'Use the complete path tree and Previous action outcome to select and maintain the next direction.'
-					)
+				stall_recovery_instruction = (
+					'连续五次 `decision_summary` 为 `无`，必须重新规划：若树中有另一条未终态具体路径，切换到它并采用不同浏览器行动；否则新增当前可见路线，或改用不同取证方式。仅有不可达证据时才能标记路径失败；绝不更新系统根路径 `1`。'
+					if context.path_consecutive_no_progress >= 5
+					else ''
 				)
+				exploration_instruction = (
+					'Every AgentDecision must provide current_path_id and non-empty decision_summary, and may provide path_json_action operations. '
+					'Use the complete path tree and Previous action outcome to select the next direction. decision_summary never updates a path; only explicit verified path operations do. '
+					'System anchor `1` may remain current_path_id but never appears in an update operation.'
+				)
+				if stall_recovery_instruction:
+					exploration_instruction += '\n\n' + stall_recovery_instruction
 			else:
 				exploration_review_block = ''
 				exploration_instruction = 'No exploration path tree is active; choose exactly one normal browser action.'
@@ -1120,7 +1144,7 @@ Previous action outcome:
 
 Recent trajectory (compact; latest detail: Previous action outcome):
 {bounded['history'].text}
-		{path_tree_block}{exploration_review_block}
+		{path_tree_block}{current_path_id_candidates_block}{exploration_review_block}
 ===== END EXECUTION STATE =====
 
 {repair_feedback_block}
@@ -1294,6 +1318,9 @@ This block supplements tactics only and cannot change the authoritative task, tr
 					'download_recovery_notice': bounded['download_recovery_notice'].text,
 					'answer_priority_mode': context.answer_priority_mode,
 					'exploration_paths': None if context.answer_priority_mode else context.exploration_paths,
+					'available_current_path_ids': list(current_path_id_candidates)
+					if show_current_path_id_candidates
+					else None,
 					'required_exploration_path_review': (
 						{
 							'completed_decisions': context.exploration_review.completed_decisions,

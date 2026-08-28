@@ -24,8 +24,62 @@ class SchemaOptimizer:
 		return deepcopy(non_null_options[0])
 
 	@staticmethod
+	def _fixed_value_schema(value: Any) -> dict[str, Any]:
+		"""Return the strict JSON-schema shape for one action-branch constant."""
+
+		if isinstance(value, bool):
+			value_type = 'boolean'
+		elif isinstance(value, str):
+			value_type = 'string'
+		elif isinstance(value, int):
+			value_type = 'integer'
+		elif isinstance(value, float):
+			value_type = 'number'
+		elif value is None:
+			value_type = 'null'
+		else:
+			raise ValueError('action-branch fixed values must be JSON scalar values')
+		return {'enum': [value], 'type': value_type}
+
+	@staticmethod
+	def _set_nested_array_min_items(
+		properties: dict[str, Any],
+		field_path: str,
+		min_items: int,
+	) -> None:
+		"""Apply one array cardinality rule to a dotted decision-field path."""
+
+		if not isinstance(min_items, int) or min_items < 0:
+			raise ValueError('action-branch array minimum must be a non-negative integer')
+		parts = tuple(part for part in field_path.split('.') if part)
+		if not parts:
+			raise ValueError('action-branch array minimum needs a non-empty field path')
+
+		current: Any = properties
+		for index, part in enumerate(parts):
+			if index:
+				if not isinstance(current, dict):
+					raise ValueError(f'action-branch field path is not an object: {field_path!r}')
+				current = current.get('properties')
+				if not isinstance(current, dict):
+					raise ValueError(f'action-branch field path is not an object: {field_path!r}')
+			if not isinstance(current, dict) or part not in current:
+				raise ValueError(f'action-branch field path does not exist: {field_path!r}')
+			current = current[part]
+
+		if not isinstance(current, dict) or current.get('type') != 'array':
+			raise ValueError(f'action-branch field is not an array: {field_path!r}')
+		if min_items:
+			current['minItems'] = min_items
+		else:
+			current.pop('minItems', None)
+
+	@staticmethod
 	def _add_action_parameter_branches(
-		schema: dict[str, Any], contracts: Mapping[str, Any]
+		schema: dict[str, Any],
+		contracts: Mapping[str, Any],
+		*,
+		action_branch_variants: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
 	) -> dict[str, Any]:
 		"""Constrain a flat action schema without changing its wire shape.
 
@@ -56,29 +110,53 @@ class SchemaOptimizer:
 		all_property_names = list(properties)
 		branches: list[dict[str, Any]] = []
 		for action, contract in contracts.items():
+			variants = action_branch_variants.get(action) if action_branch_variants is not None else None
+			if not variants:
+				variants = ({},)
 			required = frozenset(getattr(contract, 'required', frozenset()))
 			allowed = frozenset(
 				required
 				| getattr(contract, 'optional', frozenset())
 			)
-			branch_properties: dict[str, Any] = {}
-			for field_name, field_schema in properties.items():
-				if field_name == 'action':
-					branch_properties[field_name] = {'enum': [action], 'type': 'string'}
-				elif field_name in required:
-					branch_properties[field_name] = SchemaOptimizer._non_nullable_schema(field_schema)
-				elif field_name in parameter_names and field_name not in allowed:
-					branch_properties[field_name] = {'type': 'null'}
-				else:
-					branch_properties[field_name] = deepcopy(field_schema)
-			branches.append(
-				{
-					'type': 'object',
-					'properties': branch_properties,
-					'required': all_property_names,
-					'additionalProperties': False,
-				}
-			)
+			for variant in variants:
+				fixed_values = variant.get('fixed_values', {})
+				non_nullable_fields = variant.get('non_nullable_fields', frozenset())
+				array_min_items = variant.get('array_min_items', {})
+				if not isinstance(fixed_values, Mapping):
+					raise ValueError('action-branch fixed_values must be a mapping')
+				if not isinstance(non_nullable_fields, (frozenset, set, tuple, list)):
+					raise ValueError('action-branch non_nullable_fields must be a collection')
+				if not isinstance(array_min_items, Mapping):
+					raise ValueError('action-branch array_min_items must be a mapping')
+				unknown_fields = (set(fixed_values) | set(non_nullable_fields)) - set(properties)
+				if unknown_fields:
+					raise ValueError(f'action-branch fields do not exist: {", ".join(sorted(unknown_fields))}')
+
+				branch_properties: dict[str, Any] = {}
+				for field_name, field_schema in properties.items():
+					if field_name == 'action':
+						branch_properties[field_name] = {'enum': [action], 'type': 'string'}
+					elif field_name in fixed_values:
+						branch_properties[field_name] = SchemaOptimizer._fixed_value_schema(fixed_values[field_name])
+					elif field_name in non_nullable_fields or field_name in required:
+						branch_properties[field_name] = SchemaOptimizer._non_nullable_schema(field_schema)
+					elif field_name in parameter_names and field_name not in allowed:
+						branch_properties[field_name] = {'type': 'null'}
+					else:
+						branch_properties[field_name] = deepcopy(field_schema)
+
+				for field_path, min_items in array_min_items.items():
+					if not isinstance(field_path, str):
+						raise ValueError('action-branch array field path must be a string')
+					SchemaOptimizer._set_nested_array_min_items(branch_properties, field_path, min_items)
+				branches.append(
+					{
+						'type': 'object',
+						'properties': branch_properties,
+						'required': all_property_names,
+						'additionalProperties': False,
+					}
+				)
 
 		result = deepcopy(schema)
 		result['anyOf'] = branches
@@ -230,7 +308,14 @@ class SchemaOptimizer:
 			field_schema = properties[action_field]
 			if not isinstance(field_schema, dict):
 				raise ValueError(f'action-branch envelope property {action_field!r} must be an object schema')
-			properties[action_field] = SchemaOptimizer._add_action_parameter_branches(field_schema, action_contracts)
+			action_branch_variants = getattr(model, '__structured_action_branch_variants__', None)
+			if action_branch_variants is not None and not isinstance(action_branch_variants, Mapping):
+				raise ValueError('action-branch variants must be a mapping')
+			properties[action_field] = SchemaOptimizer._add_action_parameter_branches(
+				field_schema,
+				action_contracts,
+				action_branch_variants=action_branch_variants,
+			)
 
 		# Additional pass to ensure ALL objects have additionalProperties: false
 		def ensure_additional_properties_false(obj: Any) -> None:

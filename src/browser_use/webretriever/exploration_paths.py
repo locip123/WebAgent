@@ -25,7 +25,7 @@ EXPLORATION_REVIEW_MAX_IN_WINDOW = 3
 EXPLORATION_PATH_STATUSES = frozenset({'pending', 'in_progress', 'failed', 'succeeded'})
 SYSTEM_INITIAL_PATH_ID = '1'
 SYSTEM_INITIAL_PATH_LOCATION = '任务起始页面'
-SYSTEM_INITIAL_PATH_STRATEGY = '任务起始，准备分析任务起始页面寻找所有可到达任务目的地或正确页面的路线,并将其添加到子路径中'
+SYSTEM_INITIAL_PATH_STRATEGY = '这是探索路径树的根节点，你没有任何权限修改根节点的任何值，你的任务是添加子路径，构建路径探索树'
 SYSTEM_INITIAL_PATH_PROGRESS = '准备分析任务起始页面寻找所有可到达任务目的地或正确页面的路线,并将其添加到子路径中'
 
 ExplorationPathStatus = Literal['pending', 'in_progress', 'failed', 'succeeded']
@@ -258,7 +258,6 @@ class ExplorationDecisionRecord:
     completed_decisions: int
     consecutive_no_progress: int
     consider_switch: bool
-    path_failed: bool
 
 
 def page_identity(value: object) -> str | None:
@@ -279,6 +278,78 @@ def page_identity(value: object) -> str | None:
     if fragment.startswith(('/', '!')) or '?' in fragment or '=' in fragment:
         return parts.geturl()
     return parts._replace(fragment='').geturl()
+
+
+def model_facing_path_tree(tree: Mapping[str, Any]) -> dict[str, Any]:
+    """Project durable path state into the model's smaller semantic contract.
+
+    The system initial root is an executor-owned anchor, not a concrete route.
+    Its durable bookkeeping fields must therefore never resemble model-editable
+    path state. Concrete child paths retain their full model-facing lifecycle
+    state so they can still be selected and explicitly updated.
+    """
+
+    projected = deepcopy(dict(tree))
+    paths = projected.get('paths')
+    if not isinstance(paths, list):
+        return projected
+    for index, node in enumerate(paths):
+        if not isinstance(node, Mapping) or not _is_system_initial_path_node(node):
+            continue
+        paths[index] = {
+            'path_id': SYSTEM_INITIAL_PATH_ID,
+            'kind': 'system_anchor',
+            'immutable': True,
+            'children': deepcopy(node.get('children', [])),
+        }
+    return projected
+
+
+def available_leaf_path_ids(tree: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return selectable concrete leaf paths in stable depth-first order.
+
+    A selectable path is a concrete node with no children whose lifecycle has
+    not reached a terminal state.  The executor-owned system anchor is never a
+    route choice, including before the first concrete route has been created.
+    Malformed nodes are ignored so this display-only helper cannot make prompt
+    composition fail when inspecting a historical artifact.
+    """
+
+    paths = tree.get('paths')
+    if not isinstance(paths, list):
+        return ()
+
+    path_ids: list[str] = []
+
+    def visit(node: object) -> None:
+        if not isinstance(node, Mapping):
+            return
+        children = node.get('children')
+        if not isinstance(children, list):
+            return
+        if children:
+            for child in children:
+                visit(child)
+            return
+        path_id = node.get('path_id')
+        if (
+            isinstance(path_id, str)
+            and path_id != SYSTEM_INITIAL_PATH_ID
+            and node.get('status') in {'pending', 'in_progress'}
+        ):
+            path_ids.append(path_id)
+
+    for path in paths:
+        visit(path)
+    return tuple(path_ids)
+
+
+def _is_system_initial_path_node(node: Mapping[str, Any]) -> bool:
+    return (
+        node.get('path_id') == SYSTEM_INITIAL_PATH_ID
+        and node.get('location') == SYSTEM_INITIAL_PATH_LOCATION
+        and node.get('strategy_description') == SYSTEM_INITIAL_PATH_STRATEGY
+    )
 
 
 class ExplorationPathTracker:
@@ -342,12 +413,17 @@ class ExplorationPathTracker:
 
         return deepcopy(self._tree)
 
+    def model_payload(self) -> dict[str, Any]:
+        """Return the model-facing projection without changing durable state."""
+
+        return model_facing_path_tree(self._tree)
+
     def ensure_system_initial_path(self, *, start_url: object) -> bool:
         """Create the executor-owned first root after an observed initial page.
 
         The first root removes an otherwise model-dependent bootstrap condition:
-        the first AgentDecision always receives an existing path ``"1"`` to select
-        or update. It is a permanent in-progress task anchor; concrete route
+        the first AgentDecision always receives an existing path ``"1"`` to select.
+        It is a permanent in-progress task anchor; concrete route
         progress belongs to its child paths. Calling this method again is a no-op
         so callers may safely invoke it for every observation.
 
@@ -414,16 +490,24 @@ class ExplorationPathTracker:
         review: ExplorationReviewRequest | None,
         action: PathJsonAction,
     ) -> PathJsonActionResult | None:
-        """Require one concrete route when completing the first-page review.
+        """Enforce the add-only initial-page contract for non-provider callers.
 
-        This deliberately adds only the agreed minimum invariant.  Other path
-        mutations remain subject to the ordinary per-operation validation below.
+        The model normally receives an add-only provider schema at this state.  This
+        check intentionally remains a complete state-machine backstop for direct
+        callers and providers that fail to enforce a JSON schema.
         """
 
         if review is None or review.trigger != 'initial_page':
             return None
+        if any(operation.op != 'add' for operation in action.operations):
+            return PathJsonActionResult((), 'initial page exploration review accepts add operations only')
         if any(operation.op == 'add' for operation in action.operations):
-            return None
+            if all(operation.parent_path_id == SYSTEM_INITIAL_PATH_ID for operation in action.operations):
+                return None
+            return PathJsonActionResult(
+                (),
+                'initial page exploration review adds must use system initial root "1" as parent_path_id',
+            )
         return PathJsonActionResult((), 'initial page exploration review requires at least one add operation')
 
     def apply_path_json_action_and_activate(
@@ -432,12 +516,13 @@ class ExplorationPathTracker:
         *,
         start_url: object,
         current_path_id: str,
-        progress: str,
+        decision_summary: str,
+        decision_summary_provided: bool = True,
     ) -> PathJsonActionResult:
         """Apply safe operations once, then activate a trustworthy current path.
 
         A malformed individual operation is reported and skipped. Conditions that
-        make the active path or reported progress untrustworthy block the browser
+        make the active path or decision summary untrustworthy block the browser
         action and leave the durable tree unchanged.
         """
 
@@ -447,9 +532,10 @@ class ExplorationPathTracker:
         observed_start_url = page_identity(start_url)
         if observed_start_url is None:
             return self._blocked_result(action, 'path JSON actions require an observed non-placeholder start_url')
+        if not self._tree['paths']:
+            return self._blocked_result(action, 'exploration path tree is missing required system initial root "1"')
 
         candidate = deepcopy(self._tree)
-        tree_was_empty = not self._tree['paths']
         results: list[PathJsonOperationResult] = []
         entered_answer_priority = False
         for index, operation in enumerate(action.operations):
@@ -466,19 +552,6 @@ class ExplorationPathTracker:
             canonical, result = self._canonicalize_operation(index, operation)
             if canonical is None:
                 results.append(result)
-                continue
-            if tree_was_empty and canonical.op == 'update':
-                results.append(
-                    PathJsonOperationResult(
-                        index=index,
-                        requested_op=result.requested_op,
-                        applied=False,
-                        canonical_operation=canonical.payload(),
-                        ignored_fields=result.ignored_fields,
-                        normalized_fields=result.normalized_fields,
-                        reason='empty exploration tree accepts add operations only; update is forbidden until a later decision',
-                    )
-                )
                 continue
             try:
                 if canonical.op == 'add':
@@ -545,10 +618,12 @@ class ExplorationPathTracker:
             self._changed()
             return PathJsonActionResult(tuple(results), answer_priority_mode=True)
 
-        if not isinstance(progress, str) or not progress.strip():
-            return self._blocked_result(action, 'progress must be a non-empty string')
-        if self._current_observation_is_unseen_page and progress.strip() == '无':
-            return self._blocked_result(action, 'a previously unseen page must be recorded as progress, not "无"')
+        if not decision_summary_provided:
+            return self._blocked_result(action, 'decision_summary must be provided during exploration')
+        if not isinstance(decision_summary, str) or not decision_summary.strip():
+            return self._blocked_result(action, 'decision_summary must be a non-empty string')
+        if self._current_observation_is_unseen_page and decision_summary.strip() == '无':
+            return self._blocked_result(action, 'a previously unseen page must be recorded in decision_summary, not "无"')
         if not isinstance(current_path_id, str) or not current_path_id.strip():
             return self._blocked_result(action, 'current_path_id must be a non-empty string')
 
@@ -602,40 +677,31 @@ class ExplorationPathTracker:
         self._active_path_id = path_id
         self._changed()
 
-    def record_decision(self, *, current_path_id: str, progress: str) -> ExplorationDecisionRecord:
-        """Commit one completed model decision and update node-local progress."""
+    def record_decision(self, *, current_path_id: str, decision_summary: str) -> ExplorationDecisionRecord:
+        """Record a completed decision without mutating node-local route state."""
 
         if current_path_id != self._active_path_id:
             raise ExplorationPathError('recorded current_path_id is not active')
         node = self._find_path(current_path_id)
         if node is None:
             raise ExplorationPathError(f'current_path_id does not exist: {current_path_id!r}')
-        if not isinstance(progress, str) or not progress.strip():
-            raise ExplorationPathError('progress must be a non-empty string')
-        normalized_progress = progress.strip()
+        if not isinstance(decision_summary, str) or not decision_summary.strip():
+            raise ExplorationPathError('decision_summary must be a non-empty string')
+        normalized_summary = decision_summary.strip()
 
         if self._stagnation_path_id != current_path_id:
             self._stagnation_path_id = current_path_id
             self._consecutive_no_progress = 0
-        if normalized_progress == '无':
+        if normalized_summary == '无':
             self._consecutive_no_progress += 1
         else:
-            if not self._is_system_initial_path(node):
-                node['progress'] = normalized_progress
             self._consecutive_no_progress = 0
 
         self._completed_decisions += 1
-        path_failed = False
-        if self._consecutive_no_progress >= 10 and not self._is_system_initial_path(node):
-            node['status'] = 'failed'
-            node['progress'] = '连续十次决策没有有效进展，判定该探索路径无法继续。'
-            path_failed = True
-        self._changed()
         return ExplorationDecisionRecord(
             completed_decisions=self._completed_decisions,
             consecutive_no_progress=self._consecutive_no_progress,
             consider_switch=self._consecutive_no_progress >= 5,
-            path_failed=path_failed,
         )
 
     def _blocked_result(self, action: PathJsonAction, reason: str) -> PathJsonActionResult:
@@ -766,6 +832,14 @@ class ExplorationPathTracker:
                     return None, self._invalid_operation_result(
                         index, requested_op, ignored, normalized, f'{field_name} must be a non-empty string or omitted'
                     )
+                if value == '无':
+                    return None, self._invalid_operation_result(
+                        index,
+                        requested_op,
+                        ignored,
+                        normalized,
+                        'update progress must contain verified route evidence; omit it when the route has not changed',
+                    )
                 changes[field_name] = value
             if 'status' in operation.model_fields_set:
                 if operation.status is None:
@@ -796,7 +870,7 @@ class ExplorationPathTracker:
                     index, requested_op, ignored, normalized, 'update requires at least one mutable path property'
                 )
             existing_node = self._find_path(path_id)
-            if changes.get('status') == 'failed' and existing_node is not None and self._is_system_initial_path(existing_node):
+            if existing_node is not None and self._is_system_initial_path(existing_node):
                 return None, self._invalid_operation_result(
                     index,
                     requested_op,
@@ -804,15 +878,15 @@ class ExplorationPathTracker:
                     normalized,
                     f'system initial root "1" is immutable: status must remain in_progress and progress must remain "{SYSTEM_INITIAL_PATH_PROGRESS}"; find another exploration path instead',
                 )
-            if changes.get('status') == 'failed':
-                failure_progress = changes.get('progress')
-                if not isinstance(failure_progress, str) or not failure_progress.strip() or failure_progress.strip() == '无':
+            if changes.get('status') in {'failed', 'succeeded'}:
+                status_progress = changes.get('progress')
+                if not isinstance(status_progress, str) or not status_progress.strip():
                     return None, self._invalid_operation_result(
                         index,
                         requested_op,
                         ignored,
                         normalized,
-                        'marking a path failed requires a non-empty progress reason other than "无"',
+                        f'marking a path {changes["status"]} requires non-empty progress evidence',
                     )
             canonical = CanonicalPathJsonOperation(
                 op='update',
@@ -949,7 +1023,7 @@ class ExplorationPathTracker:
             return
         for field_name in operation.mutable_fields:
             value = getattr(operation, field_name)
-            if field_name == 'progress' and value in {None, '无'}:
+            if field_name == 'progress' and value is None:
                 continue
             if field_name == 'status':
                 self._validate_status_transition(node, value)
@@ -1010,11 +1084,7 @@ class ExplorationPathTracker:
 
     @staticmethod
     def _is_system_initial_path(node: Mapping[str, Any]) -> bool:
-        return (
-            node.get('path_id') == SYSTEM_INITIAL_PATH_ID
-            and node.get('location') == SYSTEM_INITIAL_PATH_LOCATION
-            and node.get('strategy_description') == SYSTEM_INITIAL_PATH_STRATEGY
-        )
+        return _is_system_initial_path_node(node)
 
     @staticmethod
     def _validate_status_transition(node: Mapping[str, Any], next_status: str | None) -> None:
@@ -1064,6 +1134,8 @@ __all__ = [
     'ExplorationPathError',
     'ExplorationPathStatus',
     'ExplorationPathTracker',
+    'available_leaf_path_ids',
+    'model_facing_path_tree',
     'ExplorationReviewRequest',
     'ExplorationReviewTrigger',
     'PathJsonAction',

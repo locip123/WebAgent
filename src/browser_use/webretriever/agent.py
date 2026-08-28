@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError
@@ -33,7 +33,6 @@ from browser_use.webretriever.artifacts import (
 	prompt_text_lines,
 )
 from browser_use.webretriever.exploration_paths import (
-	SYSTEM_INITIAL_PATH_PROGRESS,
 	ExplorationPathError,
 	ExplorationPathTracker,
 	PathJsonActionResult,
@@ -51,6 +50,7 @@ from browser_use.webretriever.models import (
 	AgentDecision,
 	AgentDecisionEnvelope,
 	CompetitionTask,
+	InitialPageAgentDecisionEnvelope,
 	WebRetrieverActionResult,
 )
 from browser_use.webretriever.network import ChartNetworkInspector
@@ -71,11 +71,15 @@ _ANALYSIS_MAX_SECONDS = 90.0
 _FINISH_RESERVE_SECONDS = 30.0
 _FINISH_FALSE_RETRY_PREFIX = '你拥有强大的浏览器操作能力，你的任务是：'
 _FINISH_FALSE_RETRY_SUFFIX = '这个任务是一定可以完成的，当前尚未完成，如果当前方法不可行，请寻找其他解决方案或途径，继续完成任务。'
+_NON_RETRYABLE_ANALYSIS_STATUSES = frozenset({'analysis_unavailable', 'invalid_manifest', 'no_tabular_data'})
 _INVALID_DECISION_SNAPSHOT_MAX_CHARACTERS = 8_000
 _INVALID_DECISION_SNAPSHOT_TRUNCATION_MARKER = '\n...[previous_invalid_decision truncated]...\n'
 
 
-def _model_output_protocol(llm: BaseChatModel) -> dict[str, Any]:
+def _model_output_protocol(
+	llm: BaseChatModel,
+	output_format: type[BaseModel] = AgentDecisionEnvelope,
+) -> dict[str, Any]:
 	"""Describe the exact structured-output contract sent with decision calls.
 
 	The decision schema is transported separately from the text messages by most
@@ -87,7 +91,7 @@ def _model_output_protocol(llm: BaseChatModel) -> dict[str, Any]:
 	remove_min_items = bool(getattr(llm, 'remove_min_items_from_schema', False))
 	remove_defaults = bool(getattr(llm, 'remove_defaults_from_schema', False))
 	provider_schema = SchemaOptimizer.create_optimized_json_schema(
-		AgentDecisionEnvelope,
+		output_format,
 		remove_min_items=remove_min_items,
 		remove_defaults=remove_defaults,
 	)
@@ -126,10 +130,13 @@ def _model_output_protocol(llm: BaseChatModel) -> dict[str, Any]:
 			return None
 		return str(value) if value is not None else None
 
+	decision_model = getattr(output_format, '__structured_decision_model__', AgentDecision)
+	if not isinstance(decision_model, type) or not issubclass(decision_model, BaseModel):
+		raise TypeError('structured decision output format must declare a Pydantic decision model')
 	return {
-		'source_model': f'{AgentDecision.__module__}.{AgentDecision.__qualname__}',
-		'source_json_schema': AgentDecision.model_json_schema(),
-		'provider_output_model': f'{AgentDecisionEnvelope.__module__}.{AgentDecisionEnvelope.__qualname__}',
+		'source_model': f'{decision_model.__module__}.{decision_model.__qualname__}',
+		'source_json_schema': decision_model.model_json_schema(),
+		'provider_output_model': f'{output_format.__module__}.{output_format.__qualname__}',
 		'provider_schema': json_schema,
 		'provider_request': provider_request,
 		'transport': transport,
@@ -499,6 +506,8 @@ def _coerce_agent_decision(completion: Any) -> AgentDecision:
 		return completion
 	if isinstance(completion, AgentDecisionEnvelope):
 		return completion.decision
+	if isinstance(completion, InitialPageAgentDecisionEnvelope):
+		return completion.decision
 	try:
 		return AgentDecision.model_validate(completion)
 	except ValidationError as error:
@@ -561,22 +570,18 @@ def _normalized_path_repair_diagnostic(
 	reasons = tuple(operation.reason or '' for operation in path_action_result.operations)
 	if path_action_result.blocked_reason == 'initial page exploration review requires at least one add operation':
 		return '首轮路径审查必须在 `path_json_action.operations` 中至少包含一个 `add`，以创建具体探索路径后再继续。'
+	if path_action_result.blocked_reason == 'initial page exploration review accepts add operations only':
+		return '首轮路径审查的 `path_json_action.operations` 只能包含 `add`；删除所有 `update` 后重试。'
+	if path_action_result.blocked_reason == 'initial page exploration review adds must use system initial root "1" as parent_path_id':
+		return '首轮创建的每条路径必须使用 `parent_path_id="1"`，以作为系统根的直接子路径。'
 	if any('system initial root "1" is immutable' in reason for reason in reasons):
-		return f'系统根路径 `1` 永远保持 `in_progress` 且进展固定为“{SYSTEM_INITIAL_PATH_PROGRESS}”，不能标记为 `failed` 或改写进展；请保留根路径并寻找其他探索路径。'
+		return '删除所有 `path_id="1"` 的 `update`；首轮至少保留一个 `add`。'
 	if any('marking a path failed requires' in reason for reason in reasons):
-		return '将路径标记为 `failed` 时必须在同一个 `update` 中用 `progress` 写明该路径无法到达任务目的地或答案页面的具体原因，然后再切换到新的探索路径。'
-	if any(reason.startswith('empty exploration tree accepts add operations only') for reason in reasons):
-		return (
-			'空探索路径树（`paths=[]`）的初始化决策只能使用 `add`，禁止 `update`。'
-			'请以当前可信路径树为准，重新提交本轮增量。'
-		)
-
-	paths = path_tree.get('paths')
-	if isinstance(paths, list) and not paths:
-		return (
-			'当前探索路径树为空（`paths=[]`）：本轮必须先用一个或多个 `add` 创建路径，'
-			'禁止 `update`；然后可在同一决策中选择执行器生成的首个路径 ID。'
-		)
+		return '将路径标记为 `failed` 时必须在同一个 `update` 中用 `progress` 写明该路径无法到达任务目的地或答案页面的具体证据，然后再切换到新的探索路径。'
+	if any('marking a path succeeded requires' in reason for reason in reasons):
+		return '将路径标记为 `succeeded` 时必须在同一个 `update` 中用 `progress` 写明已到达正确页面或答案位置的具体证据。'
+	if path_action_result.blocked_reason == 'exploration path tree is missing required system initial root "1"':
+		return '探索路径树缺少执行器创建的系统根路径 `1`，本轮决策未执行。'
 	if any('path_id does not exist' in reason for reason in reasons):
 		return '路径更新引用了当前可信路径树中不存在的路径。`update` 只能使用树中已有的 `path_id`；新路径请使用 `add`。'
 	if path_action_result.blocked and (path_action_result.blocked_reason or '').startswith('current_path_id does not exist'):
@@ -752,10 +757,10 @@ def _record_exploration_decision(
 	*,
 	decision: AgentDecision,
 ) -> None:
-	"""Commit model-declared progress after a completed action."""
+	"""Record a decision summary after a completed action."""
 	if tracker.answer_priority_mode:
 		return
-	tracker.record_decision(current_path_id=decision.current_path_id, progress=decision.progress)
+	tracker.record_decision(current_path_id=decision.current_path_id, decision_summary=decision.decision_summary)
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -766,6 +771,10 @@ def _usage_dict(usage: Any) -> dict[str, int]:
 	else:
 		raw = vars(usage) if hasattr(usage, '__dict__') else {}
 	return {str(key): int(value) for key, value in raw.items() if isinstance(value, int)}
+
+
+def _is_non_retryable_analysis_status(payload: Any) -> bool:
+	return isinstance(payload, Mapping) and payload.get('status') in _NON_RETRYABLE_ANALYSIS_STATUSES
 
 
 def _merge_usage(total: dict[str, int], current: dict[str, int]) -> None:
@@ -864,7 +873,13 @@ class ProtocolIIIAgent:
 		)
 		self.system_document = self.prompt_composer.system
 		self.system_prompt = self.system_document.text
-		self._model_output_protocol = _model_output_protocol(llm)
+		self._model_output_protocol_variants = {
+			'standard': _model_output_protocol(llm, AgentDecisionEnvelope),
+			'initial_page_add_only': _model_output_protocol(llm, InitialPageAgentDecisionEnvelope),
+		}
+		# Preserve the long-standing top-level protocol entry for downstream log
+		# readers; each request records the chosen variant below.
+		self._model_output_protocol = self._model_output_protocol_variants['standard']
 		self._model_prompt_log_path = self.task_dir / MODEL_PROMPT_LOG_FILENAME
 		self._model_prompt_log: dict[str, Any] = {}
 		self._model_call_timing_path = self.task_dir / MODEL_CALL_TIMING_FILENAME
@@ -873,6 +888,7 @@ class ProtocolIIIAgent:
 		self.task_deadline_monotonic = task_deadline_monotonic
 		self._trusted_data_manifests: dict[str, str] = {}
 		self._ready_data_dirs: set[str] = set()
+		self._unavailable_analysis_data_dirs: set[str] = set()
 		self._data_artifact_filters: dict[str, dict[str, Any]] = {}
 		self._announced_data_artifact_ids: set[str] = set()
 		self._announced_download_timeout_keys: set[str] = set()
@@ -1036,13 +1052,17 @@ class ProtocolIIIAgent:
 			'first-party route, such as visible page content, an official table/export, or a previously observed request.'
 		)
 
-	def _is_ready_data_dir(self, data_dir: str | None) -> bool:
+	def _ready_data_dir_key(self, data_dir: str | None) -> str | None:
 		if not isinstance(data_dir, str):
-			return False
+			return None
 		try:
-			return str(Path(data_dir).resolve(strict=True)) in self._ready_data_dirs
+			key = str(Path(data_dir).resolve(strict=True))
 		except (FileNotFoundError, OSError):
-			return False
+			return None
+		return key if key in self._ready_data_dirs else None
+
+	def _is_ready_data_dir(self, data_dir: str | None) -> bool:
+		return self._ready_data_dir_key(data_dir) is not None
 
 	def _data_filter_mismatch(self, data_dir: str | None, analysis_query: str | None) -> str | None:
 		if not isinstance(data_dir, str):
@@ -1075,6 +1095,7 @@ class ProtocolIIIAgent:
 				'format': MODEL_PROMPT_LOG_FORMAT,
 				'system_prompt': prompt_text_lines(self.system_prompt),
 				'output_protocol': self._model_output_protocol,
+				'output_protocol_variants': self._model_output_protocol_variants,
 				'steps': [],
 			}
 			atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
@@ -1085,6 +1106,7 @@ class ProtocolIIIAgent:
 			'metadata': model_prompt_log_metadata(),
 			'task': self.task.prompt_payload(),
 			'output_protocol': self._model_output_protocol,
+			'output_protocol_variants': self._model_output_protocol_variants,
 			# The system message is identical for every step, so storing it once
 			# avoids duplicating a large prompt while retaining the complete input.
 			'system_prompt': {
@@ -1237,6 +1259,7 @@ class ProtocolIIIAgent:
 		messages: list[Any],
 		step: int,
 		outcome: AgentRunOutcome,
+		output_format: type[BaseModel],
 	) -> Any:
 		"""Call the decision model through the configured service strategy.
 
@@ -1289,7 +1312,7 @@ class ProtocolIIIAgent:
 		if isinstance(self.llm, ModelServiceRouter):
 			return await invoke_with_service_failover(
 				self.llm,
-				lambda client: client.ainvoke(messages, output_format=AgentDecisionEnvelope),
+				lambda client: client.ainvoke(messages, output_format=output_format),
 				timeout_seconds=lambda: min(self.model_timeout_seconds, self._remaining_task_seconds()),
 				on_attempt_started=record_service_attempt_started,
 				on_attempt_finished=record_service_attempt,
@@ -1297,7 +1320,7 @@ class ProtocolIIIAgent:
 			)
 
 		return await invoke_with_reconnect_retries(
-			lambda: self.llm.ainvoke(messages, output_format=AgentDecisionEnvelope),
+			lambda: self.llm.ainvoke(messages, output_format=output_format),
 			timeout_seconds=lambda: min(self.model_timeout_seconds, self._remaining_task_seconds()),
 			on_attempt_started=record_attempt_started,
 			on_attempt_finished=record_attempt,
@@ -1310,6 +1333,7 @@ class ProtocolIIIAgent:
 		step: int,
 		prompt_document: PromptDocument,
 		screenshot_path: Path | None,
+		output_protocol_variant: str,
 	) -> int:
 		"""Atomically persist one model request before it is submitted.
 
@@ -1332,11 +1356,19 @@ class ProtocolIIIAgent:
 		)
 		prompt_index = len(steps)
 		if not self.structured_prompt_log:
-			steps.append({'step': step + 1, 'prompt': prompt_text_lines(prompt_document.text), 'image': image})
+			steps.append(
+				{
+					'step': step + 1,
+					'prompt': prompt_text_lines(prompt_document.text),
+					'image': image,
+					'output_protocol_variant': output_protocol_variant,
+				}
+			)
 		else:
 			steps.append(
 				{
 					'step': step + 1,
+					'output_protocol_variant': output_protocol_variant,
 					'prompt': {
 						'role': prompt_document.role,
 						'rendered_text': prompt_document.text,
@@ -1348,6 +1380,21 @@ class ProtocolIIIAgent:
 			)
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
 		return prompt_index
+
+	@staticmethod
+	def _decision_output_format(context: StepContext) -> type[BaseModel]:
+		"""Select the provider schema matching this observation's path state."""
+
+		review = context.exploration_review
+		if not context.answer_priority_mode and review is not None and review.trigger == 'initial_page':
+			return InitialPageAgentDecisionEnvelope
+		return AgentDecisionEnvelope
+
+	@staticmethod
+	def _output_protocol_variant(output_format: type[BaseModel]) -> str:
+		if output_format is InitialPageAgentDecisionEnvelope:
+			return 'initial_page_add_only'
+		return 'standard'
 
 	def _record_model_result(
 		self,
@@ -1416,14 +1463,21 @@ class ProtocolIIIAgent:
 		model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
 		if model_call_timeout <= 0:
 			raise _DecisionTaskDeadline()
+		output_format = self._decision_output_format(context)
 		prompt_index = self._record_model_prompt(
 			step=step,
 			prompt_document=prompt_document,
 			screenshot_path=raw_path,
+			output_protocol_variant=self._output_protocol_variant(output_format),
 		)
 		model_call_started_at = time.monotonic()
 		try:
-			response = await self._invoke_decision_with_retries(messages=messages, step=step, outcome=outcome)
+			response = await self._invoke_decision_with_retries(
+				messages=messages,
+				step=step,
+				outcome=outcome,
+				output_format=output_format,
+			)
 		except TimeoutError as exc:
 			if isinstance(self.llm, ModelServiceRouter) and str(exc):
 				timeout_error = str(exc)
@@ -1764,7 +1818,8 @@ class ProtocolIIIAgent:
 							decision.path_json_action,
 							start_url=observation.url,
 							current_path_id=decision.current_path_id,
-							progress=decision.progress,
+							decision_summary=decision.decision_summary,
+							decision_summary_provided='decision_summary' in decision.model_fields_set,
 						)
 						if path_action_result.answer_priority_mode:
 							# The successful mutation itself is the mode switch.  Ignore any
@@ -1832,7 +1887,7 @@ class ProtocolIIIAgent:
 				'thought': decision.thought,
 				'action': _decision_action_payload(decision),
 				'current_path_id': decision.current_path_id,
-				'progress': decision.progress,
+				'decision_summary': decision.decision_summary,
 				'path_json_action': _path_json_action_artifact_payload(decision),
 				'path_json_action_result': path_action_result.payload(),
 			}
@@ -1999,8 +2054,9 @@ class ProtocolIIIAgent:
 							}
 				elif decision.action == 'call_data_analysis_assistant':
 					budget = self._chart_action_budget(decision.action)
+					ready_data_dir = self._ready_data_dir_key(decision.data_dir)
 					filter_mismatch = self._data_filter_mismatch(decision.data_dir, decision.analysis_query)
-					if not self._is_ready_data_dir(decision.data_dir):
+					if ready_data_dir is None:
 						last_outcome = json.dumps(
 							{
 								'action': decision.action,
@@ -2010,6 +2066,20 @@ class ProtocolIIIAgent:
 							separators=(',', ':'),
 						)
 						action_failed = True
+					elif ready_data_dir in self._unavailable_analysis_data_dirs:
+						last_outcome = json.dumps(
+							{
+								'action': decision.action,
+								'status': 'analysis_unavailable',
+								'error': 'this data_dir was previously rejected as statically unavailable for analysis',
+								'recovery': (
+									'do not retry this data_dir with call_data_analysis_assistant; use page content, '
+									'an official export, or a different first-party source'
+								),
+							},
+							separators=(',', ':'),
+						)
+						action_failed = False
 					elif filter_mismatch is not None:
 						last_outcome = json.dumps(
 							{
@@ -2045,7 +2115,17 @@ class ProtocolIIIAgent:
 							analysis_payload: Any = json.loads(last_outcome)
 						except (TypeError, json.JSONDecodeError):
 							analysis_payload = None
-						action_failed = not isinstance(analysis_payload, dict) or analysis_payload.get('status') != 'ok'
+						if _is_non_retryable_analysis_status(analysis_payload):
+							self._unavailable_analysis_data_dirs.add(ready_data_dir)
+							analysis_payload = dict(analysis_payload)
+							analysis_payload['recovery'] = (
+								'do not retry this data_dir with call_data_analysis_assistant; use page content, '
+								'an official export, or a different first-party source'
+							)
+							last_outcome = json.dumps(analysis_payload, ensure_ascii=False, separators=(',', ':'))
+							action_failed = False
+						else:
+							action_failed = not isinstance(analysis_payload, dict) or analysis_payload.get('status') != 'ok'
 				else:
 					runtime_result = await self.runtime.execute(decision)
 					last_outcome, action_result_payload, action_failed = _format_runtime_action_result(runtime_result)

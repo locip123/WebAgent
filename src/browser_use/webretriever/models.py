@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from browser_use.webretriever.exploration_paths import PathJsonAction
+from browser_use.webretriever.exploration_paths import PathJsonAction, PathJsonAddOperation
 
 ActionName: TypeAlias = Literal[
 	'click',
@@ -295,7 +295,7 @@ class AgentDecision(BaseModel):
 	# Empty defaults preserve construction compatibility for local callers; the
 	# Protocol III agent requires these fields only while exploration mode is active.
 	current_path_id: str = Field(default='', max_length=128)
-	progress: str = Field(default='无', min_length=1, max_length=4_000)
+	decision_summary: str = Field(default='无', min_length=1, max_length=4_000)
 	path_json_action: PathJsonAction = Field(default_factory=PathJsonAction)
 	element_id: int | None = Field(default=None, ge=0)
 	text: str | None = None
@@ -432,9 +432,61 @@ class AgentDecision(BaseModel):
 		"""Serialize browser-action fields without null placeholders or planning metadata."""
 
 		payload = self.model_dump(exclude_none=True)
-		for field_name in ('current_path_id', 'progress', 'path_json_action'):
+		for field_name in ('current_path_id', 'decision_summary', 'path_json_action'):
 			payload.pop(field_name, None)
 		return payload
+
+
+class InitialPathJsonAddOperation(PathJsonAddOperation):
+	"""The only path mutation exposed during the initial page review.
+
+	The system initial root is executor-owned, but all first-review discoveries
+	are necessarily its direct children.  Giving that fact a distinct wire model
+	removes both ``update`` and an arbitrary parent ID from the model's output
+	space instead of merely describing those restrictions in prose.
+	"""
+
+	parent_path_id: Literal['1'] = '1'
+
+
+class InitialPathJsonAction(PathJsonAction):
+	"""Add-only path delta for an initial-page decision.
+
+	The array intentionally permits emptiness in this parser model.  The
+	provider schema makes it non-empty for browser actions, while a successful
+	first-screen ``finish`` is the deliberate no-path exception.  The executor
+	retains the corresponding state-dependent checks for non-provider callers.
+	"""
+
+	operations: list[InitialPathJsonAddOperation] = Field(default_factory=list)
+
+
+class InitialPageAgentDecision(AgentDecision):
+	"""An ``AgentDecision`` whose initial-page path delta cannot update paths."""
+
+	path_json_action: InitialPathJsonAction = Field(default_factory=InitialPathJsonAction)
+
+
+_INITIAL_PAGE_ACTION_BRANCH_VARIANTS: dict[str, tuple[dict[str, Any], ...]] = {
+	action: (
+		{
+			'array_min_items': {'path_json_action.operations': 1},
+		},
+	)
+	for action in ACTION_PARAMETER_CONTRACTS
+	if action != 'finish'
+}
+_INITIAL_PAGE_ACTION_BRANCH_VARIANTS['finish'] = (
+	{
+		'fixed_values': {'success': True},
+		'non_nullable_fields': frozenset({'answer', 'evidence'}),
+		'array_min_items': {'path_json_action.operations': 0},
+	},
+	{
+		'fixed_values': {'success': False},
+		'array_min_items': {'path_json_action.operations': 1},
+	},
+)
 
 
 class AgentDecisionEnvelope(BaseModel):
@@ -448,8 +500,28 @@ class AgentDecisionEnvelope(BaseModel):
 	model_config = ConfigDict(extra='forbid', strict=True)
 	__structured_action_parameter_contracts__: ClassVar[dict[str, ActionParameterContract]] = ACTION_PARAMETER_CONTRACTS
 	__structured_action_parameter_field__: ClassVar[str] = 'decision'
+	__structured_decision_model__: ClassVar[type[AgentDecision]] = AgentDecision
 
 	decision: AgentDecision
+
+
+class InitialPageAgentDecisionEnvelope(BaseModel):
+	"""Provider envelope for the add-only initial page-review protocol.
+
+	``SchemaOptimizer`` combines these per-action variants with the normal flat
+	action contract.  That makes browser actions require at least one add while
+	keeping the existing first-screen successful-finish exception representable.
+	"""
+
+	model_config = ConfigDict(extra='forbid', strict=True)
+	__structured_action_parameter_contracts__: ClassVar[dict[str, ActionParameterContract]] = ACTION_PARAMETER_CONTRACTS
+	__structured_action_parameter_field__: ClassVar[str] = 'decision'
+	__structured_action_branch_variants__: ClassVar[dict[str, tuple[dict[str, Any], ...]]] = (
+		_INITIAL_PAGE_ACTION_BRANCH_VARIANTS
+	)
+	__structured_decision_model__: ClassVar[type[AgentDecision]] = InitialPageAgentDecision
+
+	decision: InitialPageAgentDecision
 
 
 def _decode_task_document(path: Path, source: str) -> list[Any]:

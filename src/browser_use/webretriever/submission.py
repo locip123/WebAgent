@@ -22,7 +22,7 @@ from browser_use.webretriever.model_services import ModelServiceConfig
 from browser_use.webretriever.runner import MAX_CONCURRENCY, RunnerConfig, run
 
 _CDP_ACCESS_TOKEN_KEY = 'access_token'
-_DEFAULT_TASK_TIMEOUT_SECONDS = 7300.0
+_DEFAULT_TASK_TIMEOUT_SECONDS = 7200.0
 
 
 def _template_root() -> Path:
