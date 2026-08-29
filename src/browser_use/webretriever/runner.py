@@ -416,6 +416,50 @@ def _log_diagnostic_task_failure(
 	)
 
 
+_BROWSER_DISCONNECT_MARKERS = (
+	'targetclosederror',
+	'target closed',
+	'context or browser has been closed',
+	'browser context has been closed',
+	'browser has been closed',
+	'browser closed',
+	'cdp session closed',
+	'websocket is not open',
+)
+
+
+def _is_browser_disconnect_error(error: BaseException | str | None) -> bool:
+	"""Recognize worker-level CDP loss without treating a page error as fatal.
+
+	A formal CDP worker must not reconnect and claim another task after a task has
+	started and the browser connection disappears.  Playwright exposes this as a
+	``TargetClosedError`` in some versions and as a plain ``Error`` with one of the
+	messages below in others, so inspect both the exception chain and persisted
+	status text.  Deliberately avoid the broad ``page closed`` wording: closing a
+	user-visible tab is a valid WebRetriever action.
+	"""
+	to_visit: list[BaseException | str] = [error] if error is not None else []
+	seen: set[int] = set()
+	while to_visit:
+		current = to_visit.pop(0)
+		if isinstance(current, str):
+			text = current.casefold()
+			if any(marker in text for marker in _BROWSER_DISCONNECT_MARKERS):
+				return True
+			continue
+		if id(current) in seen:
+			continue
+		seen.add(id(current))
+		type_name = type(current).__name__.casefold()
+		text = f'{type_name}: {current}'.casefold()
+		if type_name == 'targetclosederror' or any(marker in text for marker in _BROWSER_DISCONNECT_MARKERS):
+			return True
+		for related in (current.__cause__, current.__context__):
+			if related is not None and id(related) not in seen:
+				to_visit.append(related)
+	return False
+
+
 async def _run_task(
 	*,
 	context: BrowserContext | None,
@@ -507,6 +551,12 @@ async def _run_task(
 				agent.run(),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
+			if (
+				browser_session is not None
+				and outcome.status in {'FAIL_BROWSER', 'FAIL_ACTIONS', 'FAIL_RUNTIME'}
+				and _is_browser_disconnect_error(outcome.error)
+			):
+				retire_worker = True
 		except BrowserRecoveryDeadlineExceeded:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 			outcome.error = 'Browser recovery exhausted the task deadline'
@@ -514,6 +564,8 @@ async def _run_task(
 		except TimeoutError:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 		except Exception as exc:
+			if browser_session is not None and _is_browser_disconnect_error(exc):
+				retire_worker = True
 			logger.exception('Task %s/%s crashed', task.task_idx, task.task_id)
 			outcome = AgentRunOutcome(
 				status='FAIL_RUNTIME',
@@ -542,6 +594,8 @@ async def _run_task(
 						task.task_id,
 					)
 				except Exception as exc:
+					if browser_session is not None and _is_browser_disconnect_error(exc):
+						retire_worker = True
 					cleanup = {'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'}
 					logger.warning('Runtime cleanup failed for task %s: %s', task.task_id, exc)
 				cleanup['grace_seconds'] = TASK_FINALIZATION_GRACE_SECONDS

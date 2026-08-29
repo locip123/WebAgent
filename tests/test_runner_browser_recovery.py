@@ -3,13 +3,78 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import tempfile
 from pathlib import Path
 
+import pytest
 from playwright.async_api import async_playwright
+from playwright._impl._errors import TargetClosedError
 
+from browser_use.webretriever.agent import AgentRunOutcome
 from browser_use.webretriever.model_services import ModelServiceConfig
-from browser_use.webretriever.runner import RunnerConfig, run
+from browser_use.webretriever.models import CompetitionTask
+from browser_use.webretriever.runner import RunnerConfig, _is_browser_disconnect_error, _run_task, run
+
+
+def test_browser_disconnect_detection_is_narrow() -> None:
+	assert _is_browser_disconnect_error('Observation failed: TargetClosedError: browser has been closed')
+	assert _is_browser_disconnect_error('Target page, context or browser has been closed')
+	assert not _is_browser_disconnect_error('page has been closed by the requested close_tab action')
+	assert not _is_browser_disconnect_error('ordinary navigation failed with a 502 response')
+
+
+def test_disconnect_during_runtime_cleanup_retires_cdp_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+	task = CompetitionTask(
+		task_idx=0,
+		task_id='cleanup-disconnect',
+		website='http://example.test/',
+		task='probe',
+	)
+	config = RunnerConfig(
+		input_path=tmp_path / 'tasks.json',
+		output_dir=tmp_path / 'output',
+		model='test-model',
+		cdp_urls=['http://127.0.0.1:9222'],
+		model_services=[ModelServiceConfig('test-service', 'http://127.0.0.1:8000/v1', 'test-key')],
+		task_timeout_seconds=5.0,
+	)
+
+	class FakeRuntime:
+		visited_urls: list[str] = []
+
+		def capture_payload(self) -> dict[str, object]:
+			return {'capture_time': 'now', 'total_requests': 0, 'all_requests': []}
+
+		async def close(self, *, timeout_seconds: float) -> dict[str, object]:
+			raise TargetClosedError('Target page, context or browser has been closed')
+
+	class FakeBrowserSession:
+		async def open_task_runtime(self, request: object, *, deadline_monotonic: float) -> FakeRuntime:
+			return FakeRuntime()
+
+	class FakeAgent:
+		model_call_timing_payload = None
+
+		def __init__(self, **kwargs: object) -> None:
+			pass
+
+		async def run(self) -> AgentRunOutcome:
+			return AgentRunOutcome(status='SUCCESS', agent_answer='done', evidence=['observed'])
+
+	monkeypatch.setattr('browser_use.webretriever.runner.ProtocolIIIAgent', FakeAgent)
+	result = asyncio.run(
+		_run_task(
+			context=None,
+			task=task,
+			config=config,
+			llm=object(),
+			logger=logging.getLogger('test.cleanup-disconnect'),
+			browser_session=FakeBrowserSession(),
+		)
+	)
+	assert result.status == 'SUCCESS'
+	assert result.retire_worker is True
 
 
 async def _serve_page(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
