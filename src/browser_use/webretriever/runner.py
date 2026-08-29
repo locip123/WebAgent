@@ -686,7 +686,7 @@ async def _consume_tasks(
 				)
 				statuses[task.task_id] = task_result.status
 				if task_result.retire_worker:
-					logger.error('Browser recovery exhausted the task deadline; retiring worker %s', worker_id)
+					logger.error('Browser session became unusable; retiring worker %s', worker_id)
 					return
 			except Exception as exc:
 				# Artifact I/O and other runner-level failures must not abandon the
