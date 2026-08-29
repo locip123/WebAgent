@@ -19,6 +19,24 @@ class ModelProviderError(ModelError):
 		self.raw_completion = raw_completion
 
 
+class ModelStructuredOutputError(ModelProviderError):
+	"""A model response that cannot satisfy the requested structured output."""
+
+	def __init__(
+		self,
+		message: str,
+		status_code: int = 502,
+		model: str | None = None,
+		raw_completion: str | None = None,
+	) -> None:
+		super().__init__(message, status_code=status_code, model=model, raw_completion=raw_completion)
+		# The router fills these in before returning the error to the agent.  Keep
+		# them explicit rather than relying on dynamically-added attributes so
+		# callers can safely inspect an error from any model adapter.
+		self.service_name: str | None = None
+		self.service_group: str | None = None
+
+
 class ModelRateLimitError(ModelProviderError):
 	"""Exception raised when a model provider returns a rate limit error."""
 

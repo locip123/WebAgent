@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError
+from browser_use.llm.exceptions import ModelProviderError, ModelStructuredOutputError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.webretriever.model_retry import (
@@ -27,6 +28,35 @@ MODEL_SERVICE_COOLDOWN_MAX_SECONDS = 60.0
 MODEL_SERVICE_AFFINITY_MAX_LOAD_DELTA = 1
 
 
+def model_service_group_key(api_base: str) -> str:
+	"""Return the normalized endpoint key used to exclude one gateway group."""
+
+	normalized = api_base.strip()
+	try:
+		parsed = urlsplit(normalized)
+		hostname = parsed.hostname
+		if not parsed.scheme or not hostname:
+			return normalized.rstrip('/').casefold()
+		# API keys should never become part of the value persisted in routing
+		# events.  Rebuild the authority from the parsed host/port and discard
+		# userinfo, query, and fragment components.
+		port = parsed.port
+		default_port = (parsed.scheme.casefold() == 'https' and port == 443) or (
+			parsed.scheme.casefold() == 'http' and port == 80
+		)
+		host = hostname.casefold()
+		if ':' in host and not host.startswith('['):
+			host = f'[{host}]'
+		netloc = host if port is None or default_port else f'{host}:{port}'
+		path = parsed.path.rstrip('/')
+		return urlunsplit((parsed.scheme.casefold(), netloc, path, '', ''))
+	except ValueError:
+		# Keep malformed legacy endpoint strings comparable without allowing a
+		# malformed URL to abort a repair attempt before it reaches the router.
+		return normalized.rstrip('/').casefold()
+
+
+
 @dataclass(frozen=True, slots=True)
 class ModelServiceConfig:
 	"""The endpoint-specific part of one shared-model service configuration."""
@@ -34,6 +64,10 @@ class ModelServiceConfig:
 	name: str
 	api_base: str
 	api_key: str
+
+	@property
+	def group_key(self) -> str:
+		return model_service_group_key(self.api_base)
 
 
 @dataclass(slots=True)
@@ -65,6 +99,18 @@ class ModelServicesExhausted(ModelProviderError):
 		if details:
 			message = f'{message}: {details}'
 		super().__init__(message=message, status_code=503, model=None)
+
+
+class ModelServiceGroupsExhausted(ModelProviderError):
+	"""A structured-output repair excluded every configured gateway group."""
+
+	def __init__(self, excluded_service_groups: Collection[str]) -> None:
+		self.excluded_service_groups = frozenset(excluded_service_groups)
+		super().__init__(
+			message='No alternative model service group is available for structured-output repair',
+			status_code=503,
+			model=None,
+		)
 
 
 class ModelServicesTimedOut(TimeoutError):
@@ -136,6 +182,14 @@ class ModelServiceRouter:
 	def service_names(self) -> tuple[str, ...]:
 		return tuple(state.config.name for state in self._states)
 
+	def service_group_for_name(self, service_name: str) -> str | None:
+		"""Return the normalized gateway group for a configured service name."""
+
+		for state in self._states:
+			if state.config.name == service_name:
+				return state.config.group_key
+		return None
+
 	@property
 	def base_url(self) -> Any:
 		"""Expose the first client's endpoint for legacy inspection code."""
@@ -188,6 +242,7 @@ class ModelServiceRouter:
 		affinity_migrated: bool = False,
 	) -> None:
 		event: dict[str, Any] = {
+			'service_group': service.config.group_key,
 			'call_index': call_index,
 			'service': service.config.name,
 			'status': status,
@@ -214,6 +269,7 @@ class ModelServiceRouter:
 		*,
 		remaining_seconds: Callable[[], float],
 		attempts: Sequence[dict[str, Any]],
+		excluded_service_groups: frozenset[str] = frozenset(),
 		affinity_key: str | None,
 	) -> _ModelServiceLease:
 		"""Lease an eligible service, waiting for the earliest cooldown if needed."""
@@ -224,7 +280,10 @@ class ModelServiceRouter:
 				raise ModelServicesTimedOut(attempts)
 			now = time.monotonic()
 			async with self._state_lock:
-				eligible = [state for state in self._states if state.cooldown_until_monotonic <= now]
+				available = [state for state in self._states if state.config.group_key not in excluded_service_groups]
+				if not available:
+					raise ModelServiceGroupsExhausted(excluded_service_groups)
+				eligible = [state for state in available if state.cooldown_until_monotonic <= now]
 				if eligible:
 					least_active = min(state.active_request_count for state in eligible)
 					preferred = self._task_affinities.get(affinity_key) if affinity_key is not None else None
@@ -256,7 +315,7 @@ class ModelServiceRouter:
 						selection_reason=selection_reason,
 						preferred_service=preferred.config.name if preferred is not None else None,
 					)
-				wait_seconds = min(state.cooldown_until_monotonic for state in self._states) - now
+				wait_seconds = min(state.cooldown_until_monotonic for state in available) - now
 			await asyncio.sleep(min(max(0.0, wait_seconds), remaining))
 
 	async def _release_success(self, service: _ModelServiceState, *, affinity_key: str | None) -> bool:
@@ -297,6 +356,7 @@ class ModelServiceRouter:
 		self,
 		messages: list[BaseMessage],
 		output_format: type[T] | None = None,
+		excluded_service_groups: Collection[str] = (),
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""Invoke using a single-call deadline when called through the base API."""
@@ -305,6 +365,8 @@ class ModelServiceRouter:
 			self,
 			lambda client: client.ainvoke(messages, output_format=output_format, **kwargs),
 			timeout_seconds=self.model_timeout_seconds,
+			excluded_service_groups=excluded_service_groups,
+			structured_output=output_format is not None,
 		)
 
 
@@ -324,18 +386,25 @@ async def invoke_with_service_failover(
 	timeout_seconds: float | Callable[[], float],
 	on_attempt_started: Callable[[int, str], None] | None = None,
 	on_attempt_finished: Callable[[int, str, str, float, Exception | None], None] | None = None,
+	excluded_service_groups: Collection[str] = (),
 	affinity_key: str | None = None,
+	structured_output: bool = False,
 ) -> T:
 	"""Recover model-service failures until the supplied deadline is exhausted."""
 
 	remaining_seconds = _remaining_timeout(timeout_seconds)
 	attempts: list[dict[str, Any]] = []
+	# Callers may retain the original configured API-base spelling (for example,
+	# an uppercase scheme or a trailing slash). Normalize it at the boundary so
+	# aliases are excluded consistently with the router's stored group keys.
+	excluded_groups = frozenset(model_service_group_key(group) for group in excluded_service_groups)
 	call_index = await router._next_call_index()
 	attempt_number = 0
 
 	while True:
 		lease = await router._acquire_least_loaded_service(
 			remaining_seconds=remaining_seconds,
+			excluded_service_groups=excluded_groups,
 			attempts=attempts,
 			affinity_key=affinity_key,
 		)
@@ -367,8 +436,11 @@ async def invoke_with_service_failover(
 			raise
 		except Exception as exc:
 			duration = time.monotonic() - started_at
+			if isinstance(exc, ModelStructuredOutputError):
+				exc.service_name = service.config.name
+				exc.service_group = service.config.group_key
 			status = 'timed_out' if isinstance(exc, TimeoutError) else 'failed'
-			recoverable = is_retryable_model_error(exc)
+			recoverable = is_retryable_model_error(exc, structured_output=structured_output)
 			await router._release_failure(service, recoverable=recoverable)
 			router._record_event(
 				call_index=call_index,
@@ -385,6 +457,7 @@ async def invoke_with_service_failover(
 				raise
 			attempts.append(
 				{
+					'service_group': service.config.group_key,
 					'service': service.config.name,
 					'status': status,
 					'error_type': type(exc).__name__,
@@ -420,6 +493,8 @@ async def invoke_model_call(
 	*,
 	timeout_seconds: float | Callable[[], float],
 	affinity_key: str | None = None,
+	excluded_service_groups: Collection[str] = (),
+	structured_output: bool = False,
 ) -> T:
 	"""Use service routing when available and retain legacy retry behavior otherwise."""
 
@@ -429,18 +504,23 @@ async def invoke_model_call(
 			invoke,
 			timeout_seconds=timeout_seconds,
 			affinity_key=affinity_key,
+			excluded_service_groups=excluded_service_groups,
+			structured_output=structured_output,
 		)
 	return await invoke_with_reconnect_retries(
 		lambda: invoke(llm),
 		timeout_seconds=timeout_seconds,
+		structured_output=structured_output,
 	)
 
 
 __all__ = [
 	'MODEL_SERVICE_COOLDOWN_BASE_SECONDS',
+	'model_service_group_key',
 	'MODEL_SERVICE_COOLDOWN_MAX_SECONDS',
 	'MODEL_SERVICE_AFFINITY_MAX_LOAD_DELTA',
 	'ModelServiceConfig',
+	'ModelServiceGroupsExhausted',
 	'ModelServiceRouter',
 	'ModelServicesExhausted',
 	'ModelServicesTimedOut',

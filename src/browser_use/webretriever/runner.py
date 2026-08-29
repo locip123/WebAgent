@@ -20,6 +20,11 @@ from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json
 from browser_use.webretriever.browser import BrowserRuntime, cdp_headers_for_url, is_sec_url, redact_cdp_url
+from browser_use.webretriever.browser_session import (
+	BrowserRecoveryDeadlineExceeded,
+	CdpWorkerSession,
+	TaskBrowserRequest,
+)
 from browser_use.webretriever.connection import BrowserConnector, BrowserDriver
 from browser_use.webretriever.experiment import (
 	PATCHRIGHT_EXPERIMENT_TASK_INDICES,
@@ -140,6 +145,12 @@ class RunnerConfig:
 				raise ValueError('Rebrowser qualification report is missing or did not pass the experiment gate')
 		self.sec_user_agent = normalize_sec_user_agent(self.sec_user_agent)
 		self.thought_language = normalize_thought_language(self.thought_language)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRunResult:
+	status: str
+	retire_worker: bool = False
 
 
 def normalize_sec_user_agent(value: str | None) -> str | None:
@@ -387,9 +398,27 @@ def _task_timeout_outcome(agent: ProtocolIIIAgent | None, timeout_seconds: float
 	return outcome
 
 
+def _log_diagnostic_task_failure(
+	logger: logging.Logger,
+	task: CompetitionTask,
+	outcome: AgentRunOutcome,
+) -> None:
+	"""Emit the persisted error for a failed task without exposing CDP credentials."""
+
+	if not outcome.status.startswith('FAIL_') or not outcome.error:
+		return
+	logger.error(
+		'Task %s/%s failed with status %s; error:\n%s',
+		task.task_idx,
+		task.task_id,
+		outcome.status,
+		redact_cdp_url(outcome.error),
+	)
+
+
 async def _run_task(
 	*,
-	context: BrowserContext,
+	context: BrowserContext | None,
 	task: CompetitionTask,
 	config: RunnerConfig,
 	llm: BaseChatModel,
@@ -398,12 +427,13 @@ async def _run_task(
 	browser_driver_fallback_reason: str | None = None,
 	rebrowser_runtime_fix_mode: str | None = None,
 	endpoint_label: str | None = None,
-) -> str:
+	browser_session: CdpWorkerSession | None = None,
+) -> TaskRunResult:
 	writer = TaskArtifactWriter(config.output_dir, task)
 	writer.prepare()
 	if not writer.acquire_lock(blocking=False):
 		logger.info('Skipping task %s/%s because another worker owns its lock', task.task_idx, task.task_id)
-		return 'LOCKED'
+		return TaskRunResult('LOCKED')
 
 	try:
 		# Re-read only after acquiring ownership, so two runners cannot both pass
@@ -411,13 +441,14 @@ async def _run_task(
 		existing_status = _load_existing_status(writer)
 		if _should_skip(existing_status, rerun_failed=config.rerun_failed):
 			logger.info('Skipping task %s/%s with existing status %s', task.task_idx, task.task_id, existing_status)
-			return existing_status or 'SKIPPED'
+			return TaskRunResult(existing_status or 'SKIPPED')
 
 		task_started_at = datetime.now(timezone.utc)
 		task_started_monotonic = time.monotonic()
 		runtime: BrowserRuntime | None = None
 		agent: ProtocolIIIAgent | None = None
 		cleanup: dict[str, Any] | None = None
+		retire_worker = False
 		try:
 			if config.rerun_failed and existing_status not in {None, 'PENDING'}:
 				_clear_previous_trajectory(writer)
@@ -432,17 +463,31 @@ async def _run_task(
 					task.task_id,
 				)
 
-			runtime = BrowserRuntime(
-				context,
-				writer.task_dir,
-				logger,
-				declared_user_agent=config.sec_user_agent if is_sec_task else None,
-				task_identity=task.prompt_payload(),
-			)
-			await _await_with_hard_timeout(
-				runtime.start(task.website),
-				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
-			)
+			if browser_session is not None:
+				runtime = await browser_session.open_task_runtime(
+					TaskBrowserRequest(
+						website=task.website,
+						task_dir=writer.task_dir,
+						logger=logger,
+						declared_user_agent=config.sec_user_agent if is_sec_task else None,
+						task_identity=task.prompt_payload(),
+					),
+					deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
+				)
+			else:
+				if context is None:
+					raise RuntimeError('worker has no browser context')
+				runtime = BrowserRuntime(
+					context,
+					writer.task_dir,
+					logger,
+					declared_user_agent=config.sec_user_agent if is_sec_task else None,
+					task_identity=task.prompt_payload(),
+				)
+				await _await_with_hard_timeout(
+					runtime.start(task.website),
+					_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
+				)
 			# Checkpoint genuine browser traffic before model work begins.  A slow or
 			# cancelled decision loop must not erase evidence that this task reached
 			# its evaluator-provided browser and start URL.
@@ -462,6 +507,10 @@ async def _run_task(
 				agent.run(),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
+		except BrowserRecoveryDeadlineExceeded:
+			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
+			outcome.error = 'Browser recovery exhausted the task deadline'
+			retire_worker = True
 		except TimeoutError:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 		except Exception as exc:
@@ -520,8 +569,9 @@ async def _run_task(
 				experiment_repeat_index=config.experiment_repeat_index if config.experiment_mode else None,
 			)
 		)
+		_log_diagnostic_task_failure(logger, task, outcome)
 		logger.info('Finished task %s/%s with status %s', task.task_idx, task.task_id, outcome.status)
-		return outcome.status
+		return TaskRunResult(outcome.status, retire_worker=retire_worker)
 	finally:
 		try:
 			if isinstance(llm, ModelServiceRouter):
@@ -544,6 +594,7 @@ async def _consume_tasks(
 	rebrowser_runtime_fix_mode: str | None = None,
 	endpoint_label: str | None = None,
 	browser: Browser | None = None,
+	browser_session: CdpWorkerSession | None = None,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
@@ -562,12 +613,12 @@ async def _consume_tasks(
 						raise RuntimeError('experiment_mode requires a connected CDP browser')
 					task_context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
 					created_experiment_context = True
-				if task_context is None:
+				if task_context is None and browser_session is None:
 					raise RuntimeError('worker has no browser context')
 				if is_sec_task:
 					await sec_task_semaphore.acquire()
 					acquired_sec_slot = True
-				statuses[task.task_id] = await _run_task(
+				task_result = await _run_task(
 					context=task_context,
 					task=task,
 					config=config,
@@ -577,13 +628,19 @@ async def _consume_tasks(
 					browser_driver_fallback_reason=browser_driver_fallback_reason,
 					rebrowser_runtime_fix_mode=rebrowser_runtime_fix_mode,
 					endpoint_label=endpoint_label,
+					browser_session=browser_session,
 				)
+				statuses[task.task_id] = task_result.status
+				if task_result.retire_worker:
+					logger.error('Browser recovery exhausted the task deadline; retiring worker %s', worker_id)
+					return
 			except Exception as exc:
 				# Artifact I/O and other runner-level failures must not abandon the
 				# remainder of this worker's one-shot task shard.
 				logger.exception('Runner failed while finalizing task %s/%s', task.task_idx, task.task_id)
 				failure = AgentRunOutcome(status='FAIL_RUNNER', error=f'{type(exc).__name__}: {exc}')
 				statuses[task.task_id] = failure.status
+				_log_diagnostic_task_failure(logger, task, failure)
 				try:
 					writer = TaskArtifactWriter(config.output_dir, task)
 					writer.write_result(_result_payload(task, failure, urls=[], model=config.model))
@@ -615,13 +672,15 @@ async def _cdp_worker(
 	logger = _worker_logger(config.output_dir, worker_id)
 	logger.info('Connecting to CDP browser %s', redact_cdp_url(cdp_url))
 	connection = None
+	browser_session: CdpWorkerSession | None = None
 	try:
 		headers = (
 			config.cdp_headers_provider(cdp_url)
 			if config.cdp_headers_provider is not None
 			else cdp_headers_for_url(cdp_url)
 		)
-		connection = await BrowserConnector().connect(
+		connector = BrowserConnector()
+		connection = await connector.connect(
 			config.browser_driver,
 			cdp_url,
 			headers=dict(headers) or None,
@@ -631,13 +690,16 @@ async def _cdp_worker(
 			logger.warning(
 				'Patchright could not attach before task start; using Playwright fallback: %s', connection.fallback_reason
 			)
-		context = (
-			None
-			if config.experiment_mode
-			else browser.contexts[0]
-			if browser.contexts
-			else await browser.new_context(accept_downloads=True)
-		)
+		context = None
+		if not config.experiment_mode:
+			browser_session = await CdpWorkerSession.from_connection(
+				cdp_url=cdp_url,
+				driver=connection.driver,
+				headers=dict(headers) or None,
+				logger=logger,
+				connector=connector,
+				connection=connection,
+			)
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
@@ -651,13 +713,19 @@ async def _cdp_worker(
 			browser_driver_fallback_reason=connection.fallback_reason,
 			rebrowser_runtime_fix_mode=connection.rebrowser_runtime_fix_mode,
 			endpoint_label=config.experiment_endpoint_label or f'cdp-{worker_id}',
+			browser_session=browser_session,
 		)
 	except Exception as exc:
 		# Playwright connection errors may repeat the endpoint verbatim.  Avoid
 		# traceback logging here so evaluator access tokens never reach artifacts.
 		logger.error('CDP worker failed for %s: %s', redact_cdp_url(cdp_url), redact_cdp_url(str(exc)))
 	finally:
-		if connection is not None:
+		if browser_session is not None:
+			try:
+				await browser_session.close()
+			except Exception as exc:
+				logger.warning('Could not close CDP worker session: %s', redact_cdp_url(str(exc)))
+		elif connection is not None:
 			try:
 				await connection.close()
 			except Exception as exc:
@@ -775,6 +843,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		failure = AgentRunOutcome(status='FAIL_BROWSER_CONNECT', error='No CDP worker was available for this task')
 		writer.write_result(_result_payload(task, failure, urls=[], model=config.model))
 		writer.write_capture()
+		_log_diagnostic_task_failure(_worker_logger(config.output_dir, -1), task, failure)
 		statuses[task.task_id] = failure.status
 		queue.task_done()
 

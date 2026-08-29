@@ -14,7 +14,7 @@ from openai.types.shared_params.response_format_json_schema import JSONSchema, R
 from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError, ModelStructuredOutputError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.responses_serializer import ResponsesAPIMessageSerializer
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
@@ -386,7 +386,7 @@ class ChatOpenAI(BaseChatModel):
 				)
 
 			if not response_text:
-				raise ModelProviderError(
+				raise ModelStructuredOutputError(
 					message='Failed to parse structured output from Responses API response',
 					status_code=500,
 					model=self.name,
@@ -396,7 +396,7 @@ class ChatOpenAI(BaseChatModel):
 			try:
 				parsed = self._parse_responses_structured_text(response_text, output_format)
 			except Exception as exc:
-				raise ModelProviderError(
+				raise ModelStructuredOutputError(
 					message=str(exc),
 					status_code=500,
 					model=self.name,
@@ -575,7 +575,7 @@ class ChatOpenAI(BaseChatModel):
 					)
 
 				if choice.message.content is None:
-					raise ModelProviderError(
+					raise ModelStructuredOutputError(
 						message='Failed to parse structured output from model response',
 						status_code=500,
 						model=self.name,
@@ -588,7 +588,7 @@ class ChatOpenAI(BaseChatModel):
 				try:
 					parsed = output_format.model_validate_json(raw_completion)
 				except Exception as exc:
-					raise ModelProviderError(
+					raise ModelStructuredOutputError(
 						message=str(exc),
 						status_code=500,
 						model=self.name,

@@ -11,7 +11,7 @@ from typing import TypeVar
 import httpx
 from openai import APIError
 
-from browser_use.llm.exceptions import ModelProviderError
+from browser_use.llm.exceptions import ModelProviderError, ModelStructuredOutputError
 
 T = TypeVar('T')
 
@@ -50,7 +50,7 @@ async def await_with_hard_timeout(awaitable: Awaitable[T], timeout_seconds: floa
 	raise TimeoutError
 
 
-def is_retryable_model_error(exc: Exception) -> bool:
+def is_retryable_model_error(exc: Exception, *, structured_output: bool = False) -> bool:
 	"""Identify provider-call failures that another service can recover.
 
 	OpenAI-compatible gateways report upstream failures with inconsistent status
@@ -59,6 +59,19 @@ def is_retryable_model_error(exc: Exception) -> bool:
 	describe a local structured-output validation failure.
 	"""
 
+	# A structured-output parse failure must return to the agent so it can add
+	# repair feedback and choose a different gateway group. Inspect the short
+	# exception chain before broad transport classes: an adapter can wrap the
+	# typed error in an HTTP/provider exception, and the marker must not be lost.
+	seen: set[int] = set()
+	current: BaseException | None = exc
+	while current is not None and id(current) not in seen:
+		seen.add(id(current))
+		if isinstance(current, ModelStructuredOutputError):
+			return False
+		if structured_output and isinstance(current, json.JSONDecodeError):
+			return False
+		current = current.__cause__ or current.__context__
 	if isinstance(exc, TimeoutError):
 		return True
 	if isinstance(exc, ConnectionError):
@@ -66,12 +79,21 @@ def is_retryable_model_error(exc: Exception) -> bool:
 	# ChatOpenAI wraps these as ModelProviderError, but retaining the raw SDK
 	# classes here keeps custom or future model clients inside the same recovery
 	# boundary.
-	if isinstance(exc, (httpx.HTTPError, APIError, json.JSONDecodeError)):
+	if isinstance(exc, (httpx.HTTPError, APIError)):
 		return True
+	if isinstance(exc, json.JSONDecodeError):
+		# A bare decoder error is ambiguous outside a structured call: it may be
+		# the provider's HTTP envelope and should retain the normal failover path.
+		# Decision calls, however, must return to the agent with repair feedback.
+		return not structured_output
 	if not isinstance(exc, ModelProviderError):
 		return False
-	message = str(exc)
-	if 'validation error for ' in message or 'failed to parse structured output' in message.lower():
+	message = str(exc).casefold()
+	if (
+		'validation error for ' in message
+		or 'failed to parse structured output' in message
+		or 'structured output validation' in message
+	):
 		return False
 	return True
 
@@ -83,6 +105,7 @@ async def invoke_with_reconnect_retries(
 	on_attempt_started: Callable[[int], None] | None = None,
 	on_attempt_finished: Callable[[int, str, float, Exception | None], None] | None = None,
 	on_retry_wait_finished: Callable[[int, float], None] | None = None,
+	structured_output: bool = False,
 ) -> T:
 	"""Invoke through at most five fresh clients, waiting eight seconds to retry.
 
@@ -107,7 +130,7 @@ async def invoke_with_reconnect_retries(
 			status = 'timed_out' if isinstance(exc, TimeoutError) else 'failed'
 			if on_attempt_finished is not None:
 				on_attempt_finished(attempt, status, time.monotonic() - started_at, exc)
-			if not is_retryable_model_error(exc) or attempt == MODEL_RETRY_MAX_ATTEMPTS:
+			if not is_retryable_model_error(exc, structured_output=structured_output) or attempt == MODEL_RETRY_MAX_ATTEMPTS:
 				raise
 			# A dynamic deadline (the Agent's shared task deadline) must leave a
 			# full retry interval and a non-zero next attempt budget.

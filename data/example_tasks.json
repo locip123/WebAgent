@@ -1,16 +1,72 @@
 [
-  {
-    "task_idx": 1,
-    "task_id": "330dcf5ea8084f328316f90f0eeac040",
-    "website": "https://data.worldbank.org/",
-    "task": "中国2000年至今青少年生育率（每1000名15-19岁女性的生育子女数）增速最快的年份是哪一年",
-    "answer": "2006年"
+    {
+    "task_idx": 10,
+    "task_id": "52aada65ef7b4b109d32d20477cfd3ba",
+    "website": "https://data.stats.gov.cn",
+    "task": "2025年11月的中国西部地区的原盐产量排名前五的省份各自的当月产量是多少万吨？",
+    "answer": "第一名：青海省-52.43\t\t\n第二名：四川省-19.42\t\t\n第三名：新疆维吾尔自治区-17.63\t\t\n第四名：云南省-14.57\t\t\n第五名：重庆市-13.31"
   },
   {
-    "task_idx": 7,
-    "task_id": "61aca5f22fc84a7c8cab5448d16aad1a",
-    "website": "https://clinicaltrials.gov/",
-    "task": "请找出2018年1月1日至2018年12月31日期间首次发布（First Posted）的，针对‘Glioblastoma’（胶质母细胞瘤）的，且处于‘Phase 3’（III期）的干预性（Interventional）临床试验，在已经终止招募的项目中找出NCT编号（NCT Number）最小的试验，并提供该试验的Actual Enrollment（实际入组人数），数据接口：https://clinicaltrials.gov/api/int/studies?cond=Glioblastoma%20Multiforme%20of%20Brain&aggFilters=&checkSpell=true&from=0&limit=1000&fields=OverallStatus%2CLastKnownStatus%2CStatusVerifiedDate%2CHasResults%2CBriefTitle%2CCondition%2CInterventionType%2CInterventionName%2CLocationFacility%2CLocationCity%2CLocationState%2CLocationCountry%2CLocationStatus%2CLocationZip%2CLocationGeoPoint%2CLocationContactName%2CLocationContactRole%2CLocationContactPhone%2CLocationContactPhoneExt%2CLocationContactEMail%2CCentralContactName%2CCentralContactRole%2CCentralContactPhone%2CCentralContactPhoneExt%2CCentralContactEMail%2CGender%2CMinimumAge%2CMaximumAge%2CStdAge%2CNCTId%2CStudyType%2CLeadSponsorName%2CAcronym%2CEnrollmentCount%2CStartDate%2CPrimaryCompletionDate%2CCompletionDate%2CStudyFirstPostDate%2CResultsFirstPostDate%2CLastUpdatePostDate%2COrgStudyId%2CSecondaryId%2CPhase%2CLargeDocLabel%2CLargeDocFilename%2CPrimaryOutcomeMeasure%2CSecondaryOutcomeMeasure%2CDesignAllocation%2CDesignInterventionModel%2CDesignMasking%2CDesignWhoMasked%2CDesignPrimaryPurpose%2CDesignObservationalModel%2CDesignTimePerspective%2CLeadSponsorClass%2CCollaboratorClass&columns=conditions%2Cinterventions%2Ccollaborators&highlight=true&sort=%40relevance",
-    "answer": "NCT03393000，实际入组人数为19"
+    "task_idx": 11,
+    "task_id": "8ac3d5bf57da470ea5d4879d5fcce527",
+    "website": "https://catalog.mit.edu/",
+    "task": "找到麻省理工学院（MIT） 2021-2022学年的课程目录（Course Catalog），查找计算机科学系的课程编号**‘6.006’ (Introduction to Algorithms)，列出该课程描述中明确要求的直接先修课程（Prerequisites）**的编号。如果先修课之间是‘或（OR）’的关系，请完整保留这种逻辑描述。",
+    "answer": "先修课程：6.042[J] AND（6.0001 OR 6.009）\n\n6.042[J]：计算机科学数学(Mathematics for Computer Science)\n6.0001：Python计算机科学编程导论(Introduction to Computer Science Programming in Python)\n6.009：编程基础(Fundamentals of Programming)"
+  },
+  {
+    "task_idx": 12,
+    "task_id": "6f12102e36264330afd006d889027770",
+    "website": "https://www.zgdypw.cn",
+    "task": "找到2025年12月全中国内地新建影城，并列出银幕数量至少10块的影院简称，并列出对应银幕数量。",
+    "answer": "山东省济南市槐荫区UME影城龙湖西城天街IMAX店\t11\n湖南省岳阳市岳阳楼区星鑫国际影城\t12\n山西省太原市小店区SFC上影国际影城（太原昌盛万达店）\t12"
+  },
+  {
+    "task_idx": 13,
+    "task_id": "636c19752cc042a08930ce59cb277479",
+    "website": "https://www.iata.org/",
+    "task": "找到2025年IATA发布的可持续性分析中关于\"STIP proposals\"的分析的Credit编号。",
+    "answer": "Ugis-Riba_shutterstock_273008201"
+  },
+  {
+    "task_idx": 14,
+    "task_id": "bc620647083742cd8332c8dcfa40582c",
+    "website": "https://www.sf.gov/departments--department-building-inspection",
+    "task": "查询旧金山市地址位于701 Post St的建筑在2015年到2025年所有的建筑许可（Building Permits）申请记录，并找出和‘抗震改造’（Seismic Retrofit）相关的记录，给出所有申请的申请编号(Application Number)，申请描述(Description)和最后行动日期(action date)",
+    "answer": "201612195301，RESTORE BASEMENT RETAINING WALL & STAIR STRUCTURE DRAWING S2.1, S2.2 SEISMIC UPGRADE WORK REPAIRS - BASEMENT LEVELS, NOT VISIBLE，2017-03-07\n201805179391，RECOMMENCEMENT AND COMPLETION OF WORK APPROVED UNDER PA#201612195301，2018-05-17\n201807235225，REVISED STRUCTURAL DRAWING FOR PERMIT APP. #201805179391 & 201612195301. REVISION REQUIRED TO MEET EXISTING BUILDING CONDITIONS. NO CHANGE IN SCOPE OF WORK.，2018-08-01"
+  },
+  {
+    "task_idx": 15,
+    "task_id": "8b6dbf11d1f04652b0522f76fa7761d4",
+    "website": "https://mi.talkingdata.com",
+    "task": "在2020年发布的《TalkingData-“三十而已”女性洞察报告》中，\"30+\"女性整体移动应用类型覆盖率前三的应用类型是什么。",
+    "answer": "第一名：通讯社交\n第二名：移动视频\n第三名：移动工具"
+  },
+  {
+    "task_idx": 16,
+    "task_id": "9a81aaa6061f42fe901fb61bebb0c457",
+    "website": "https://dot.ca.gov/",
+    "task": "查询加利福尼亚州交通局合同编号为‘04-0K1204’的建设项目的‘Bid Summary’（投标汇总）文件（通常是PDF或Excel），\n在该文件中找出排名第二（2nd Low Bidder）的承包商名称，以及他们对‘Item 12’（第12项工程条目，通常是特定材料或施工项）所报的单价（Unit Price）是多少？",
+    "answer": "MIKE BROWN ELECTRIC CO.\n他们对 Item 12 的单价\nItem 12 (0012): PREPARE WATER POLLUTION CONTROL PROGRAM（准备水污染控制计划）\n\nMIKE BROWN ELECTRIC CO. 的单价：$525.00（一次性总价 Lump Sum）"
+  },
+  {
+    "task_idx": 17,
+    "task_id": "eeb5049e10c5416c9c83a730fa850dd1",
+    "website": "https://www.shanghairanking.cn",
+    "task": "查看2024年软科中国大学哲学（专业编号：010101）专业在上海市排名前3的学校是哪些。",
+    "answer": "第一名：复旦大学\n第二名：华东师范大学\n第三名：同济大学"
+  },
+  {
+    "task_idx": 18,
+    "task_id": "fff1c127f04a429d9301e383490acd23",
+    "website": "https://tjj.sc.gov.cn",
+    "task": "查找2025年前三季度四川主要经济指标中1-9月累计的汽油产量（万吨）。",
+    "answer": "193.1（万吨）"
+  },
+  {
+    "task_idx": 19,
+    "task_id": "e67c0f2f7fc74741809a639218840d75",
+    "website": "https://www.cs.toronto.edu",
+    "task": "列出多伦多大学2025秋季周期、音乐学院、时间倾向于上午（8:00-11:59）、在圣乔治(St. George)校园上课的、可信权值(credit weight)为0.17的本科课程编号。",
+    "answer": "EMU150H1\nEMU151H1\nEMU152H1\nEMU252H1\nEMU262H1\nEMU128H1"
   }
 ]

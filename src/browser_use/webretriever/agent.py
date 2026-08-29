@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError
+from browser_use.llm.exceptions import ModelProviderError, ModelStructuredOutputError
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.webretriever.artifacts import (
@@ -167,10 +167,16 @@ class _InvalidStructuredDecision(ValueError):
 	prompt.  The snapshot is explicitly untrusted model content.
 	"""
 
-	def __init__(self, diagnostic: str, previous_invalid_decision: str | None = None) -> None:
+	def __init__(
+		self,
+		diagnostic: str,
+		previous_invalid_decision: str | None = None,
+		source_service_group: str | None = None,
+	) -> None:
 		super().__init__(diagnostic)
 		self.diagnostic = diagnostic
 		self.previous_invalid_decision = previous_invalid_decision
+		self.source_service_group = source_service_group
 
 
 _KNOWN_ACTION_NAMES = frozenset(
@@ -239,7 +245,12 @@ def _safe_contract_diagnostic(message: str) -> str:
 		return 'a required decision field is missing'
 	if 'extra_forbidden' in lowered or 'extra inputs are not permitted' in lowered:
 		return 'decision contains a field outside the supported schema'
-	if 'invalid json' in lowered or 'json decode' in lowered or 'failed to parse structured output' in lowered:
+	if (
+		'invalid json' in lowered
+		or 'json decode' in lowered
+		or 'extra data' in lowered
+		or 'failed to parse structured output' in lowered
+	):
 		return 'decision is not valid structured JSON for AgentDecision'
 	if 'path_json_action' in lowered:
 		return 'path_json_action has an invalid structured shape'
@@ -282,23 +293,38 @@ def _validation_error_diagnostic(error: ValidationError) -> str:
 def _structured_output_error_diagnostic(error: Exception) -> str | None:
 	"""Classify only parser/schema failures; transport and auth errors stay fatal."""
 
-	if isinstance(error, ValidationError):
-		return _validation_error_diagnostic(error)
+	# Adapters sometimes add a generic provider wrapper around the parser error.
+	# Walk only the short local exception chain; never treat arbitrary provider
+	# text as a repair signal.
+	to_visit: list[BaseException] = [error]
+	seen: set[int] = set()
+	while to_visit:
+		current = to_visit.pop(0)
+		if id(current) in seen:
+			continue
+		seen.add(id(current))
+		if isinstance(current, ValidationError):
+			return _validation_error_diagnostic(current)
+		if isinstance(current, ModelStructuredOutputError):
+			return _safe_contract_diagnostic(str(current))
+		if isinstance(current, json.JSONDecodeError):
+			return 'decision is not valid structured JSON for AgentDecision'
 
-	# Model adapters commonly wrap Pydantic failures in ModelProviderError.
-	# Do not classify arbitrary provider failures here: authentication, service,
-	# and connection failures retain their existing retry/failure semantics.
-	message = str(error)
-	lowered = message.casefold()
-	if isinstance(error, ModelProviderError) and (
-		error.status_code not in {401, 403}
-		and (
-			'validation error for agentdecision' in lowered
+		# Do not classify arbitrary provider failures here: authentication,
+		# service, and connection failures retain their existing semantics.
+		message = str(current)
+		lowered = message.casefold()
+		if isinstance(current, ModelProviderError) and current.status_code not in {401, 403} and (
+			'validation error for ' in lowered
 			or 'failed to parse structured output' in lowered
 			or 'structured output validation' in lowered
-		)
-	):
-		return _safe_contract_diagnostic(message)
+		):
+			return _safe_contract_diagnostic(message)
+
+		if not (isinstance(current, ModelProviderError) and current.status_code in {401, 403}):
+			for related in (current.__cause__, current.__context__):
+				if related is not None and id(related) not in seen:
+					to_visit.append(related)
 	return None
 
 
@@ -486,20 +512,27 @@ def _invalid_decision_snapshot_from_error(error: Exception) -> str | None:
 			if completion is not _MISSING_COMPLETION:
 				return _invalid_decision_snapshot(completion)
 
+		raw_completion = getattr(current, 'raw_completion', None)
+		if isinstance(raw_completion, str) and raw_completion:
+			return _invalid_decision_snapshot(raw_completion)
+
 		message = getattr(current, 'message', None)
 		if not isinstance(message, str):
 			message = str(current)
 		completion = _embedded_error_value(message)
 		if completion is not _MISSING_COMPLETION:
 			return _invalid_decision_snapshot(completion)
-
 		for related in (current.__cause__, current.__context__):
 			if related is not None:
 				to_visit.append((related, depth + 1))
 	return None
 
 
-def _coerce_agent_decision(completion: Any) -> AgentDecision:
+def _coerce_agent_decision(
+	completion: Any,
+	*,
+	source_service_group: str | None = None,
+) -> AgentDecision:
 	"""Validate an adapter completion even when it bypassed its output parser."""
 
 	if isinstance(completion, AgentDecision):
@@ -512,7 +545,11 @@ def _coerce_agent_decision(completion: Any) -> AgentDecision:
 		return AgentDecision.model_validate(completion)
 	except ValidationError as error:
 		diagnostic = _raw_completion_contract_diagnostic(completion) or _validation_error_diagnostic(error)
-		raise _InvalidStructuredDecision(diagnostic, _invalid_decision_snapshot(completion)) from error
+		raise _InvalidStructuredDecision(
+			diagnostic,
+			_invalid_decision_snapshot(completion),
+			source_service_group,
+		) from error
 
 
 @dataclass(slots=True)
@@ -1260,6 +1297,8 @@ class ProtocolIIIAgent:
 		step: int,
 		outcome: AgentRunOutcome,
 		output_format: type[BaseModel],
+		excluded_service_groups: Collection[str] = (),
+		service_metadata: dict[str, str] | None = None,
 	) -> Any:
 		"""Call the decision model through the configured service strategy.
 
@@ -1289,6 +1328,11 @@ class ProtocolIIIAgent:
 			self._update_timing_summary(outcome)
 
 		def record_service_attempt_started(attempt: int, service_name: str) -> None:
+			if service_metadata is not None:
+				service_metadata['service_name'] = service_name
+				service_group = self.llm.service_group_for_name(service_name) if isinstance(self.llm, ModelServiceRouter) else None
+				if service_group is not None:
+					service_metadata['service_group'] = service_group
 			self._record_model_attempt_started(step=step, attempt=attempt, service_name=service_name)
 			self._update_timing_summary(outcome)
 
@@ -1299,6 +1343,11 @@ class ProtocolIIIAgent:
 			wait_seconds: float,
 			error: Exception | None,
 		) -> None:
+			if service_metadata is not None:
+				service_metadata['service_name'] = service_name
+				service_group = self.llm.service_group_for_name(service_name) if isinstance(self.llm, ModelServiceRouter) else None
+				if service_group is not None:
+					service_metadata['service_group'] = service_group
 			self._record_model_attempt(
 				step=step,
 				attempt=attempt,
@@ -1317,6 +1366,8 @@ class ProtocolIIIAgent:
 				on_attempt_started=record_service_attempt_started,
 				on_attempt_finished=record_service_attempt,
 				affinity_key=self.task.task_id,
+				excluded_service_groups=excluded_service_groups,
+				structured_output=True,
 			)
 
 		return await invoke_with_reconnect_retries(
@@ -1325,6 +1376,7 @@ class ProtocolIIIAgent:
 			on_attempt_started=record_attempt_started,
 			on_attempt_finished=record_attempt,
 			on_retry_wait_finished=record_retry_wait,
+			structured_output=True,
 		)
 
 	def _record_model_prompt(
@@ -1334,6 +1386,7 @@ class ProtocolIIIAgent:
 		prompt_document: PromptDocument,
 		screenshot_path: Path | None,
 		output_protocol_variant: str,
+		excluded_service_groups: Collection[str] = (),
 	) -> int:
 		"""Atomically persist one model request before it is submitted.
 
@@ -1378,6 +1431,11 @@ class ProtocolIIIAgent:
 					'image': image,
 				}
 			)
+		if excluded_service_groups:
+			entry = steps[-1]
+			if not isinstance(entry, dict):
+				raise TypeError('model prompt log step must be an object')
+			entry['excluded_model_service_groups'] = sorted(set(excluded_service_groups))
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
 		return prompt_index
 
@@ -1435,6 +1493,7 @@ class ProtocolIIIAgent:
 		screenshot: bytes,
 		raw_path: Path | None,
 		outcome: AgentRunOutcome,
+		excluded_service_groups: Collection[str] = (),
 	) -> tuple[AgentDecision, dict[str, int], int, float]:
 		"""Request one decision while allowing path-tree retries to reuse a step.
 
@@ -1464,11 +1523,13 @@ class ProtocolIIIAgent:
 		if model_call_timeout <= 0:
 			raise _DecisionTaskDeadline()
 		output_format = self._decision_output_format(context)
+		service_metadata: dict[str, str] = {}
 		prompt_index = self._record_model_prompt(
 			step=step,
 			prompt_document=prompt_document,
 			screenshot_path=raw_path,
 			output_protocol_variant=self._output_protocol_variant(output_format),
+			excluded_service_groups=excluded_service_groups,
 		)
 		model_call_started_at = time.monotonic()
 		try:
@@ -1477,6 +1538,8 @@ class ProtocolIIIAgent:
 				step=step,
 				outcome=outcome,
 				output_format=output_format,
+				excluded_service_groups=excluded_service_groups,
+				service_metadata=service_metadata,
 			)
 		except TimeoutError as exc:
 			if isinstance(self.llm, ModelServiceRouter) and str(exc):
@@ -1505,9 +1568,15 @@ class ProtocolIIIAgent:
 					error=model_error,
 					raw_completion=getattr(exc, 'raw_completion', None),
 				)
+				source_service_group = getattr(exc, 'service_group', None)
+				if not isinstance(source_service_group, str) or not source_service_group.strip():
+					source_service_group = service_metadata.get('service_group')
+				if not isinstance(source_service_group, str) or not source_service_group.strip():
+					source_service_group = None
 				raise _InvalidStructuredDecision(
 					diagnostic,
 					_invalid_decision_snapshot_from_error(exc),
+					source_service_group,
 				) from exc
 			self._record_model_result(
 				step=step,
@@ -1522,8 +1591,14 @@ class ProtocolIIIAgent:
 		_merge_usage(outcome.usage, model_usage)
 		completion = getattr(response, 'completion', _MISSING_COMPLETION)
 		raw_completion = getattr(response, 'raw_completion', None)
+		source_service_group = service_metadata.get('service_group')
+		if not isinstance(source_service_group, str) or not source_service_group.strip():
+			source_service_group = None
 		try:
-			decision = _coerce_agent_decision(completion)
+			decision = _coerce_agent_decision(
+				completion,
+				source_service_group=source_service_group,
+			)
 		except _InvalidStructuredDecision as exc:
 			model_error = f'Model structured decision is invalid: {exc.diagnostic}'
 			self._record_model_result(
@@ -1681,6 +1756,7 @@ class ProtocolIIIAgent:
 			exploration_review = exploration_tracker.review_request(current_page_url=observation.url)
 			path_tree_ready = False
 			structured_decision_repair_feedback: StructuredDecisionRepairFeedback | None = None
+			excluded_model_service_groups: set[str] = set()
 			while not path_tree_ready:
 				try:
 					decision, model_usage, prompt_index, model_call_started_at = await self._request_model_decision(
@@ -1706,6 +1782,7 @@ class ProtocolIIIAgent:
 						screenshot=screenshot,
 						raw_path=raw_path if screenshot else None,
 						outcome=outcome,
+						excluded_service_groups=excluded_model_service_groups,
 					)
 					# A valid decision closes the same-step repair context.  Later
 					# prompts must not carry an obsolete invalid output forward.
@@ -1723,6 +1800,8 @@ class ProtocolIIIAgent:
 						observation,
 					)
 					consecutive_model_output_errors += 1
+					if exc.source_service_group is not None:
+						excluded_model_service_groups.add(exc.source_service_group)
 					structured_decision_repair_feedback = StructuredDecisionRepairFeedback(
 						diagnostic=exc.diagnostic,
 						previous_invalid_decision=exc.previous_invalid_decision,

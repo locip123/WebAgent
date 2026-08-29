@@ -660,6 +660,7 @@ class BrowserRuntime:
 		max_response_body_bytes: int = _MAX_RESPONSE_BODY_BYTES,
 		declared_user_agent: str | None = None,
 		task_identity: Mapping[str, Any] | None = None,
+		before_close: Callable[[], Coroutine[Any, Any, Any]] | None = None,
 	) -> None:
 		if not 0 < navigation_first_observation_timeout_ms <= navigation_timeout_ms:
 			raise ValueError('navigation_first_observation_timeout_ms must be in (0, navigation_timeout_ms]')
@@ -680,6 +681,7 @@ class BrowserRuntime:
 		self.max_response_body_bytes = max(0, max_response_body_bytes)
 		self.declared_user_agent = declared_user_agent
 		self.task_identity = dict(task_identity) if isinstance(task_identity, Mapping) else None
+		self._before_close = before_close
 
 		self.page: Page | None = None
 		self.website = ''
@@ -1301,6 +1303,10 @@ class BrowserRuntime:
 			with contextlib.suppress(Exception):
 				self.context.remove_listener(event, handler)
 		self._context_handlers.clear()
+		if self._before_close is not None:
+			anchor_restored = await self._await_cleanup_operation(self._before_close(), deadline)
+			if not anchor_restored:
+				report['residual_tasks']['anchor_restore'] = 1
 		residual_navigation = await self._cancel_pending_navigations(timeout_seconds=self._cleanup_remaining_seconds(deadline))
 		if residual_navigation:
 			report['residual_tasks']['navigation'] = residual_navigation
