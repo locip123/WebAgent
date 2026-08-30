@@ -25,6 +25,7 @@ tests/*
 !tests/test_runner_browser_recovery.py
 !tests/test_runner_failure_logging.py
 !tests/test_structured_output_repair.py
+!tests/test_browser_failure_diagnostics.py
 CONTEXT.md
 聊天记录.md
 data/example_tasks.json

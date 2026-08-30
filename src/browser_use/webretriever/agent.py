@@ -34,6 +34,7 @@ from browser_use.webretriever.artifacts import (
 	prompt_text_lines,
 )
 from browser_use.webretriever.browser import is_browser_session_closed_error
+from browser_use.webretriever.browser_failures import BrowserFailurePhase, classify_browser_failure
 from browser_use.webretriever.exploration_paths import (
 	ExplorationPathError,
 	ExplorationPathTracker,
@@ -602,6 +603,7 @@ class AgentRunOutcome:
 	duration_seconds: float = 0.0
 	usage: dict[str, int] = field(default_factory=dict)
 	verification: dict[str, object] = field(default_factory=dict)
+	browser_failure: dict[str, Any] | None = None
 	model_call_timing_summary: dict[str, int | float] = field(
 		default_factory=lambda: dict(empty_model_call_timing_payload()['summary'])
 	)
@@ -1759,7 +1761,8 @@ class ProtocolIIIAgent:
 			try:
 				observation = await self.runtime.observe(step)
 			except Exception as exc:
-				if is_browser_session_closed_error(exc):
+				session_closed = is_browser_session_closed_error(exc)
+				if session_closed:
 					try:
 						recovered = await self.runtime.recover_live_task_page()
 					except Exception:
@@ -1768,13 +1771,19 @@ class ProtocolIIIAgent:
 						step_counter.refund_last()
 						last_outcome = 'Browser target closed; a surviving task page was re-grounded. Observe it before deciding again.'
 						continue
-				outcome.status = 'FAIL_BROWSER'
+				browser_failure = classify_browser_failure(
+					exc,
+					phase=BrowserFailurePhase.OBSERVATION,
+					session_closed=session_closed,
+				)
+				outcome.status = browser_failure.status
 				outcome.error = f'Observation failed: {type(exc).__name__}: {exc}'
+				outcome.browser_failure = browser_failure.payload(recovery_attempted=session_closed)
 				break
 			try:
 				exploration_tracker.ensure_system_initial_path(start_url=observation.url)
 			except ExplorationPathError as exc:
-				outcome.status = 'FAIL_BROWSER'
+				outcome.status = 'FAIL_EXPLORATION_PATH_INITIALIZATION'
 				outcome.error = f'Initial exploration-path setup failed: {exc}'
 				break
 
@@ -2465,11 +2474,17 @@ class ProtocolIIIAgent:
 				decision=decision,
 			)
 			if browser_session_interrupted is not None:
-				outcome.status = 'FAIL_BROWSER'
+				browser_failure = classify_browser_failure(
+					browser_session_interrupted,
+					phase=BrowserFailurePhase.ACTION,
+					session_closed=True,
+				)
+				outcome.status = browser_failure.status
 				outcome.error = (
 					'Browser session closed with no surviving task pages: '
 					f'{browser_session_interrupted}'
 				)
+				outcome.browser_failure = browser_failure.payload(recovery_attempted=True)
 				break
 			if action_failed:
 				consecutive_errors += 1

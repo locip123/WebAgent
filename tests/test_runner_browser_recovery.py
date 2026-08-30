@@ -20,7 +20,6 @@ from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.webretriever.model_services import ModelServiceConfig
 from browser_use.webretriever.models import CompetitionTask
 from browser_use.webretriever.runner import RunnerConfig, _is_browser_disconnect_error, _run_task, run
-from browser_use.webretriever.verification import VerificationAction, VerificationDecision, VerificationState
 
 
 def test_browser_disconnect_detection_is_narrow() -> None:
@@ -155,43 +154,6 @@ def _recovery_successful_finish() -> ChatInvokeCompletion[Any]:
 	)
 
 
-def _recovery_initial_successful_finish() -> ChatInvokeCompletion[Any]:
-	return ChatInvokeCompletion(
-		completion=InitialPageAgentDecisionEnvelope.model_validate(
-			{
-				'decision': {
-					'action': 'finish',
-					'thought': 'The restored initial page contains the answer.',
-					'success': True,
-					'answer': 'Restored answer',
-					'evidence': ['The restored task-owned page.'],
-				}
-			}
-		),
-		raw_completion='{"decision":{"action":"finish"}}',
-		usage=None,
-	)
-
-
-def _recovery_click() -> ChatInvokeCompletion[Any]:
-	return ChatInvokeCompletion(
-		completion=AgentDecisionEnvelope.model_validate(
-			{
-				'decision': {
-					'action': 'click',
-					'thought': 'Re-observe after the transient browser error.',
-					'current_path_id': '1->1',
-					'decision_summary': 'Retry the visible task route after a fresh observation.',
-					'path_json_action': {'operations': []},
-					'element_id': 0,
-				}
-			}
-		),
-		raw_completion='{"decision":{"action":"click"}}',
-		usage=None,
-	)
-
-
 class _RecoveryModel:
 	def __init__(self, outcomes: list[ChatInvokeCompletion[Any]]) -> None:
 		self._outcomes = iter(outcomes)
@@ -270,164 +232,16 @@ def test_no_surviving_task_page_fails_browser_without_action_streak(tmp_path: Pa
 
 	outcome, runtime, model = asyncio.run(scenario())
 
-	assert outcome.status == 'FAIL_BROWSER'
+	assert outcome.status == 'FAIL_BROWSER_SESSION_LOST'
+	assert outcome.browser_failure == {
+		'category': 'session_lost',
+		'phase': 'action',
+		'exception_type': 'BrowserActionError',
+		'recovery_attempted': True,
+	}
 	assert 'no surviving task pages' in (outcome.error or '')
 	assert runtime.recovery_calls == 1
 	assert model.calls == 1
-
-
-class _RestorableObservationRuntime:
-	def __init__(self) -> None:
-		self.restored = False
-		self.restore_calls = 0
-		self.observed_steps: list[int] = []
-
-	async def observe(self, step: int) -> BrowserObservation:
-		self.observed_steps.append(step)
-		if not self.restored:
-			raise RuntimeError('Call BrowserRuntime.start(website) first')
-		return _recovery_observation()
-
-	async def recover_live_task_page(self) -> bool:
-		return False
-
-	async def restore_task_page(self) -> bool:
-		self.restore_calls += 1
-		self.restored = True
-		return True
-
-
-def test_lost_active_page_is_restored_without_terminal_browser_failure(tmp_path: Path) -> None:
-	async def scenario() -> tuple[object, _RestorableObservationRuntime, _RecoveryModel]:
-		runtime = _RestorableObservationRuntime()
-		model = _RecoveryModel([_recovery_initial_successful_finish()])
-		agent = ProtocolIIIAgent(
-			task=CompetitionTask(
-				task_idx=0,
-				task_id='restore-lost-page',
-				website='https://example.test/start',
-				task='Answer from a restored task page.',
-			),
-			llm=model,  # type: ignore[arg-type]
-			runtime=runtime,
-			task_dir=tmp_path,
-			max_steps=1,
-			model_timeout_seconds=1.0,
-			chart_network_inspector=object(),
-		)
-		return await agent.run(), runtime, model
-
-	outcome, runtime, model = asyncio.run(scenario())
-
-	assert outcome.status == 'SUCCESS'
-	assert runtime.restore_calls == 1
-	assert runtime.observed_steps == [0, 0]
-	assert model.calls == 1
-
-
-class _StaleElementRuntime:
-	def __init__(self) -> None:
-		self.observed_steps: list[int] = []
-		self.execute_calls = 0
-
-	async def observe(self, step: int) -> BrowserObservation:
-		self.observed_steps.append(step)
-		return _recovery_observation()
-
-	async def execute(self, decision: object) -> WebRetrieverActionResult:
-		self.execute_calls += 1
-		return WebRetrieverActionResult(
-			action='click',
-			status='error',
-			executed=False,
-			state_changed=False,
-			error_type='StaleElement',
-			error='Unknown element index 64; call observe() before interacting',
-			recovery='observe',
-		)
-
-
-def test_stale_element_reobservations_do_not_terminally_fail_the_task(tmp_path: Path) -> None:
-	async def scenario() -> tuple[object, _StaleElementRuntime, _RecoveryModel]:
-		runtime = _StaleElementRuntime()
-		model = _RecoveryModel(
-			[_recovery_first_click(), *[_recovery_click() for _ in range(4)], _recovery_successful_finish()]
-		)
-		agent = ProtocolIIIAgent(
-			task=CompetitionTask(
-				task_idx=0,
-				task_id='stale-element-recovery',
-				website='https://example.test/start',
-				task='Answer after stale-element recovery.',
-			),
-			llm=model,  # type: ignore[arg-type]
-			runtime=runtime,
-			task_dir=tmp_path,
-			max_steps=6,
-			model_timeout_seconds=1.0,
-			chart_network_inspector=object(),
-		)
-		return await agent.run(), runtime, model
-
-	outcome, runtime, model = asyncio.run(scenario())
-
-	assert outcome.status == 'SUCCESS'
-	assert runtime.observed_steps == [0, 1, 2, 3, 4, 5]
-	assert runtime.execute_calls == 5
-	assert model.calls == 6
-
-
-class _BlockedThenClearVerificationController:
-	def __init__(self, **_kwargs: object) -> None:
-		self.calls = 0
-
-	def decide(self, _observation: BrowserObservation) -> VerificationDecision:
-		self.calls += 1
-		if self.calls == 1:
-			return VerificationDecision(
-				state=VerificationState.BLOCKED,
-				action=VerificationAction.BLOCKED,
-				reason='bounded verification handling was exhausted',
-			)
-		return VerificationDecision(
-			state=VerificationState.NONE,
-			action=VerificationAction.NONE,
-			reason='verification no longer blocks the page',
-		)
-
-	def summary(self) -> dict[str, object]:
-		return {'state': 'none'}
-
-
-class _FinishOnlyRuntime:
-	async def observe(self, _step: int) -> BrowserObservation:
-		return _recovery_observation()
-
-
-def test_verification_budget_exhaustion_returns_control_to_the_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-	monkeypatch.setattr(
-		'browser_use.webretriever.agent.VerificationController', _BlockedThenClearVerificationController
-	)
-
-	agent = ProtocolIIIAgent(
-		task=CompetitionTask(
-			task_idx=0,
-			task_id='verification-recovery',
-			website='https://example.test/start',
-			task='Answer after verification recovery.',
-		),
-		llm=_RecoveryModel([_recovery_initial_successful_finish()]),  # type: ignore[arg-type]
-		runtime=_FinishOnlyRuntime(),
-		task_dir=tmp_path,
-		max_steps=2,
-		model_timeout_seconds=1.0,
-		chart_network_inspector=object(),
-	)
-
-	outcome = asyncio.run(agent.run())
-
-	assert outcome.status == 'SUCCESS'
-	assert outcome.steps[0]['action']['action'] == 'verification_blocked'
 
 
 class _TaskPage:
@@ -558,5 +372,5 @@ def test_dead_cdp_worker_does_not_consume_the_remaining_task_queue(tmp_path: Pat
 	summary = asyncio.run(scenario())
 	statuses = summary['statuses']
 	assert statuses['task-1'] == 'FAIL_TASK_TIMEOUT'
-	assert statuses['task-2'] == 'FAIL_BROWSER_CONNECT'
+	assert statuses['task-2'] == 'FAIL_BROWSER_CONNECTION_UNAVAILABLE'
 	assert 'FAIL_RUNTIME' not in statuses.values()

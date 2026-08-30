@@ -26,6 +26,7 @@ from browser_use.webretriever.browser import (
 	is_sec_url,
 	redact_cdp_url,
 )
+from browser_use.webretriever.browser_failures import BrowserFailurePhase, classify_browser_failure
 from browser_use.webretriever.browser_session import (
 	BrowserRecoveryDeadlineExceeded,
 	CdpWorkerSession,
@@ -332,6 +333,7 @@ def _result_payload(
 		'thought_language': thought_language,
 		'usage': outcome.usage,
 		'verification': outcome.verification,
+		'browser_failure': outcome.browser_failure,
 		'model_call_timing_summary': outcome.model_call_timing_summary,
 		# ``duration_seconds`` predates the task watchdog and measures only the
 		# agent loop.  Keep it for compatibility while exposing the end-to-end
@@ -463,6 +465,7 @@ async def _run_task(
 		cleanup: dict[str, Any] | None = None
 		retire_worker = False
 		recover_worker = False
+		browser_startup_in_progress = False
 		try:
 			if config.rerun_failed and existing_status not in {None, 'PENDING'}:
 				_clear_previous_trajectory(writer)
@@ -477,6 +480,7 @@ async def _run_task(
 					task.task_id,
 				)
 
+			browser_startup_in_progress = True
 			if browser_session is not None:
 				runtime = await browser_session.open_task_runtime(
 					TaskBrowserRequest(
@@ -506,6 +510,7 @@ async def _run_task(
 			# cancelled decision loop must not erase evidence that this task reached
 			# its evaluator-provided browser and start URL.
 			writer.write_capture(runtime.capture_payload())
+			browser_startup_in_progress = False
 			agent = ProtocolIIIAgent(
 				task=task,
 				llm=llm,
@@ -521,11 +526,7 @@ async def _run_task(
 				agent.run(),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
-			if (
-				browser_session is not None
-				and outcome.status in {'FAIL_BROWSER', 'FAIL_ACTIONS', 'FAIL_RUNTIME'}
-				and _is_browser_disconnect_error(outcome.error)
-			):
+			if browser_session is not None and _is_browser_disconnect_error(outcome.error):
 				recover_worker = True
 		except BrowserRecoveryDeadlineExceeded:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
@@ -537,10 +538,22 @@ async def _run_task(
 			if browser_session is not None and _is_browser_disconnect_error(exc):
 				recover_worker = True
 			logger.exception('Task %s/%s crashed', task.task_idx, task.task_id)
-			outcome = AgentRunOutcome(
-				status='FAIL_RUNTIME',
-				error=f'{type(exc).__name__}: {exc}',
-			)
+			if browser_startup_in_progress:
+				browser_failure = classify_browser_failure(
+					exc,
+					phase=BrowserFailurePhase.STARTUP,
+					session_closed=_is_browser_disconnect_error(exc),
+				)
+				outcome = AgentRunOutcome(
+					status=browser_failure.status,
+					error=f'Browser startup failed: {type(exc).__name__}: {exc}',
+					browser_failure=browser_failure.payload(recovery_attempted=False),
+				)
+			else:
+				outcome = AgentRunOutcome(
+					status='FAIL_RUNTIME',
+					error=f'{type(exc).__name__}: {exc}',
+				)
 		finally:
 			if runtime is not None:
 				cleanup_started_at = time.monotonic()
@@ -886,7 +899,15 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		task = queue.get_nowait()
 		writer = TaskArtifactWriter(config.output_dir, task)
 		writer.prepare()
-		failure = AgentRunOutcome(status='FAIL_BROWSER_CONNECT', error='No CDP worker was available for this task')
+		browser_failure = classify_browser_failure(
+			'No CDP worker was available for this task',
+			phase=BrowserFailurePhase.STARTUP,
+		)
+		failure = AgentRunOutcome(
+			status=browser_failure.status,
+			error='No CDP worker was available for this task',
+			browser_failure=browser_failure.payload(recovery_attempted=False),
+		)
 		writer.write_result(_result_payload(task, failure, urls=[], model=config.model))
 		writer.write_capture()
 		_log_diagnostic_task_failure(_worker_logger(config.output_dir, -1), task, failure)
