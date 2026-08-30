@@ -93,6 +93,80 @@ def test_disconnect_during_runtime_cleanup_marks_cdp_worker_for_recovery(
 	assert session.abandoned is True
 
 
+def test_runner_replaces_an_unstarted_runtime_with_a_clean_cdp_runtime(
+	tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+	task = CompetitionTask(
+		task_idx=0,
+		task_id='unstarted-runtime-replacement',
+		website='http://example.test/',
+		task='probe',
+	)
+	config = RunnerConfig(
+		input_path=tmp_path / 'tasks.json',
+		output_dir=tmp_path / 'output',
+		model='test-model',
+		cdp_urls=['http://127.0.0.1:9222'],
+		model_services=[ModelServiceConfig('test-service', 'http://127.0.0.1:8000/v1', 'test-key')],
+		task_timeout_seconds=5.0,
+	)
+
+	class FakeRuntime:
+		visited_urls: list[str] = []
+
+		def __init__(self) -> None:
+			self.close_calls = 0
+
+		def capture_payload(self) -> dict[str, object]:
+			return {'capture_time': 'now', 'total_requests': 0, 'all_requests': []}
+
+		async def close(self, *, timeout_seconds: float) -> dict[str, object]:
+			self.close_calls += 1
+			return {'status': 'completed'}
+
+	class FakeBrowserSession:
+		def __init__(self) -> None:
+			self.initial_runtime = FakeRuntime()
+			self.replacement_runtime = FakeRuntime()
+			self.replace_calls = 0
+
+		async def open_task_runtime(self, request: object, *, deadline_monotonic: float) -> FakeRuntime:
+			return self.initial_runtime
+
+		async def replace_unstarted_task_runtime(self, request: object, *, deadline_monotonic: float) -> FakeRuntime:
+			self.replace_calls += 1
+			return self.replacement_runtime
+
+	class FakeAgent:
+		model_call_timing_payload = None
+
+		def __init__(self, *, runtime: FakeRuntime, recover_unstarted_runtime, **kwargs: object) -> None:
+			self.runtime = runtime
+			self._recover_unstarted_runtime = recover_unstarted_runtime
+
+		async def run(self) -> AgentRunOutcome:
+			self.runtime = await self._recover_unstarted_runtime()
+			return AgentRunOutcome(status='SUCCESS', agent_answer='done', evidence=['recovered'])
+
+	monkeypatch.setattr('browser_use.webretriever.runner.ProtocolIIIAgent', FakeAgent)
+	session = FakeBrowserSession()
+	result = asyncio.run(
+		_run_task(
+			context=None,
+			task=task,
+			config=config,
+			llm=object(),
+			logger=logging.getLogger('test.unstarted-runtime-replacement'),
+			browser_session=session,  # type: ignore[arg-type]
+		)
+	)
+
+	assert result.status == 'SUCCESS'
+	assert session.replace_calls == 1
+	assert session.initial_runtime.close_calls == 1
+	assert session.replacement_runtime.close_calls == 1
+
+
 def _recovery_observation() -> BrowserObservation:
 	return BrowserObservation(
 		screenshot=b'',

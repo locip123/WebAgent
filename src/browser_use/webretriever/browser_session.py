@@ -102,6 +102,17 @@ class CdpWorkerSession:
 		await self._connect_until(deadline_monotonic, fresh_context=True)
 		self._recovery_required = False
 
+	async def replace_unstarted_task_runtime(
+		self,
+		request: TaskBrowserRequest,
+		*,
+		deadline_monotonic: float,
+	) -> BrowserRuntime:
+		"""Replace a task runtime that failed before its first usable observation."""
+
+		await self.abandon_interrupted_task()
+		return await self.open_task_runtime(request, deadline_monotonic=deadline_monotonic)
+
 	async def open_task_runtime(
 		self,
 		request: TaskBrowserRequest,

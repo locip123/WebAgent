@@ -219,7 +219,7 @@ def test_cdp_worker_session_keeps_the_sandbox_alive_between_tasks(tmp_path: Path
 	asyncio.run(scenario())
 
 
-def test_cdp_worker_session_rebuilds_a_fresh_context_after_interruption(tmp_path: Path) -> None:
+def test_cdp_worker_session_replaces_an_unstarted_runtime_with_a_fresh_context(tmp_path: Path) -> None:
 	async def scenario() -> None:
 		server = await asyncio.start_server(_serve_page, '127.0.0.1', 0)
 		website = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/'
@@ -250,12 +250,16 @@ def test_cdp_worker_session_rebuilds_a_fresh_context_after_interruption(tmp_path
 						first = await _task_runtime(session, website=website, task_dir=tmp_path / 'interrupted-first')
 						old_context = session.context
 						await first.close(timeout_seconds=5)
-						await session.abandon_interrupted_task()
-						assert session.recovery_required is True
-						await session.recover_before_next_task(deadline_monotonic=time.monotonic() + 10)
+						second = await session.replace_unstarted_task_runtime(
+							TaskBrowserRequest(
+								website=website,
+								task_dir=tmp_path / 'interrupted-second',
+								logger=logging.getLogger('cdp-worker-recovery-test'),
+							),
+							deadline_monotonic=time.monotonic() + 10,
+						)
 						assert session.recovery_required is False
 						assert session.context is not old_context
-						second = await _task_runtime(session, website=website, task_dir=tmp_path / 'interrupted-second')
 						assert second.page is not None
 						assert await second.page.text_content('body') == 'session-alive'
 						await second.close(timeout_seconds=5)

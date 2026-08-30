@@ -472,6 +472,23 @@ class InitialPageAgentDecision(AgentDecision):
 	path_json_action: InitialPathJsonAction = Field(default_factory=InitialPathJsonAction)
 
 
+class RootUpdateRepairPathJsonAction(PathJsonAction):
+	"""Add-only path delta used to repair a rejected system-root update.
+
+	Unlike the initial-page protocol, this retry may add below any existing
+	path and may leave the tree unchanged. Its sole purpose is to remove the
+	``update`` shape from the provider's next-response output space.
+	"""
+
+	operations: list[PathJsonAddOperation] = Field(default_factory=list)
+
+
+class RootUpdateRepairAgentDecision(AgentDecision):
+	"""An ``AgentDecision`` that cannot update a path during root-update repair."""
+
+	path_json_action: RootUpdateRepairPathJsonAction = Field(default_factory=RootUpdateRepairPathJsonAction)
+
+
 _INITIAL_PAGE_ACTION_BRANCH_VARIANTS: dict[str, tuple[dict[str, Any], ...]] = {
 	action: (
 		{
@@ -527,6 +544,17 @@ class InitialPageAgentDecisionEnvelope(BaseModel):
 	__structured_decision_model__: ClassVar[type[AgentDecision]] = InitialPageAgentDecision
 
 	decision: InitialPageAgentDecision
+
+
+class RootUpdateRepairAgentDecisionEnvelope(BaseModel):
+	"""Provider envelope for the one-retry add-only root-update repair protocol."""
+
+	model_config = ConfigDict(extra='forbid', strict=True)
+	__structured_action_parameter_contracts__: ClassVar[dict[str, ActionParameterContract]] = ACTION_PARAMETER_CONTRACTS
+	__structured_action_parameter_field__: ClassVar[str] = 'decision'
+	__structured_decision_model__: ClassVar[type[AgentDecision]] = RootUpdateRepairAgentDecision
+
+	decision: RootUpdateRepairAgentDecision
 
 
 def _decode_task_document(path: Path, source: str) -> list[Any]:

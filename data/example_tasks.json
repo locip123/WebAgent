@@ -1,142 +1,72 @@
 [
   {
-    "task_idx": 30,
-    "task_id": "d47e8b197478442da72f23b1e0079619",
-    "website": "https://cn.silabs.com",
-    "task": "获取产品\"Simplicity Studio\"1.0.0版本文档的入门指南的SETTINGS的完整内容。",
-    "answer": "SETTINGS\nAdd, remove, run, refresh, and test adapter packs.\nSet your preferred IDE.\nAdjust the timeouts for offline content.\nCheck the SDKs available for building project configurations.\nAdjust the component visibility filters for your software components.\nSet the theme for Simplicity Studio to either light or dark.\nGrant permission to have your user experience tracked anonymously or not."
+    "task_idx": 60,
+    "task_id": "ab957ad53d024bc290719a09cf2d2293",
+    "website": "https://www.usaspending.gov/",
+    "task": "在USASpending.gov的Award Search页面中，设置筛选：Time Period=FY 2022、Awarding Agency=Department of Education、Award Type=Grants，满足条件的记录共有多少个？",
+    "answer": "26257"
   },
   {
-    "task_idx": 31,
-    "task_id": "91a2ccddc5444e0f8716d158f7acad13",
-    "website": "https://travel.state.gov/content/travel.html",
-    "task": "在财政年度1986-2025年中，美国护照申请数量最多的是哪一年？",
-    "answer": "2025（FY2025）"
+    "task_idx": 61,
+    "task_id": "1fc91519a75a4a3a89e729631a879519",
+    "website": "https://www.globalforestwatch.org/",
+    "task": "在Global Forest Watch的Country Dashboard中,选择Country=Cambodia,在Tree Cover Loss柱状图中,find Year=2018对应的树木覆盖损失面积是多少公顷(ha)?",
+    "answer": "110 kha /110,000"
   },
   {
-    "task_idx": 32,
-    "task_id": "46cf576105184aeb8ca6ec9138139202",
-    "website": "https://www.questmobile.com.cn/",
-    "task": "查看《QuestMobile 2025潜力营销价值媒介研究》报告，找出2025年AIGC行业月活跃用户规模最大的一个月。",
-    "answer": "2025-03"
+    "task_idx": 62,
+    "task_id": "ddeda0f53e064d2695a025836a99a90f",
+    "website": "https://www.transtats.bts.gov",
+    "task": "在BTS的Airline On-Time Statistics中,选择Carrier=JetBlue Airways、Airport=Boston, MA (BOS)、Time Period=October 2019,On-Time Arrival Percentage是多少?",
+    "answer": "0.7753"
   },
   {
-    "task_idx": 33,
-    "task_id": "bd70d0af63804d288b83c93562772f5b",
-    "website": "https://www.cbndata.com/",
-    "task": "找到CBNData榜单2023年双11品牌号召力榜食品饮料篇top15中首字母前三的品牌。",
-    "answer": "第一：AIRMETER（空刻）\n第二：白象\n第三：大希地"
+    "task_idx": 63,
+    "task_id": "2dd800c4249f4a46978e250ea6ed9ad2",
+    "website": "https://wid.world/",
+    "task": "在WID中选择Country=Mongolia、Indicator=Top 10% income share、Year=2010,图表上hover显示的值是多少(%)?",
+    "answer": "0.437"
   },
   {
-    "task_idx": 34,
-    "task_id": "4bb4eceaf3494fc2b8cc8e472c438ae7",
-    "website": "https://acl.gov/",
-    "task": "查询老龄化、独立生活和残疾（AGID）数据门户，查找2021年阿拉巴马州和加利福利亚分别的老年人照护者可获得的援助（每位服务对象可获得的单位数量）。",
-    "answer": "阿拉巴马州：34.17\n加利福利亚州：1.78"
+    "task_idx": 64,
+    "task_id": "c85152cb6c7a4576850f4d9ecce2854a",
+    "website": "https://atlas.hks.harvard.edu/",
+    "task": "在Harvard Atlas of Economic Complexity中,选择Country=Laos、Year=2019,找到ECI Ranking值是多少?",
+    "answer": "111th"
   },
   {
-    "task_idx": 35,
-    "task_id": "c5063f6cf11144ff8f242cddd33c9f4f",
-    "website": "https://data.cityofnewyork.us/",
-    "task": "查询NYC 311投诉数据库中，2024年1月曼哈顿区(Manhattan)噪音(Noise)类别投诉总数。",
-    "answer": "11674"
+    "task_idx": 65,
+    "task_id": "90d9566aaddf4098ab897dd84b2ee9f2",
+    "website": "https://globalcarbonatlas.org/",
+    "task": "在Global Carbon Atlas中,选择Country=Peru、Units=tCO₂/person, 在图表中hover到Year=2018,人均碳排放值是多少tCO2/person?",
+    "answer": "1.8 tCO2/person"
   },
   {
-    "task_idx": 36,
-    "task_id": "c022cb291f864aa1a22138ec449bedf9",
-    "website": "https://data.bls.gov/",
-    "task": "查询美国劳工统计局(BLS)数据，2024年12月Information行业就业人数（季节性调整，千人）。",
-    "answer": "2895（千人）"
+    "task_idx": 66,
+    "task_id": "cbb22de8559d4a29bf5a90b7fabcd5c3",
+    "website": "https://www.footprintnetwork.org/",
+    "task": "在Global Footprint Network中,选择Country=Paraguay、Year=2018,找到Ecological Footprint of Consumption per Capita值是多少gha/person?",
+    "answer": "3.24 gha /3.2 gha"
   },
   {
-    "task_idx": 37,
-    "task_id": "ff93022b2eea467fbde813744775c743",
-    "website": "https://www.sec.gov/",
-    "task": "查询SEC EDGAR数据库中，NVIDIA公司首次提交10-K年报的日期",
-    "answer": "1999-04-29 00:00:00"
+    "task_idx": 67,
+    "task_id": "3644a4828fe142dcaccaf583fd155759",
+    "website": "https://v-dem.net/",
+    "task": "在V-Dem的Variable Graph中,选择Country=Laos、Indicators=Liberal Democracy Index (v2x_libdem)、hover Year=2015,指数值是多少?",
+    "answer": "0.09"
   },
   {
-    "task_idx": 38,
-    "task_id": "27d5aa7ecf4c4dc7a417de55ada0902f",
-    "website": "https://www.eia.gov/",
-    "task": "基于EIA数据，2024年德州(Texas)原油产量最高的月份。",
-    "answer": "2024-10-01 00:00:00"
+    "task_idx": 68,
+    "task_id": "41491a22df3240e18117e07979ae35dd",
+    "website": "https://pageviews.wmcloud.org/",
+    "task": "在Wikimedia Pageviews Analysis中,输入Article=Eli Manning (en.wikipedia)、Date range=2024-02-01 to 2024-02-29,当月总浏览量是多少?",
+    "answer": "210007"
   },
   {
-    "task_idx": 39,
-    "task_id": "059f5bfb92884cd5af1a2c377d4011d7",
-    "website": "https://www.ssa.gov/",
-    "task": "查询SSA网站Wyoming州2020年男婴最流行名字第1名的出生人数。",
-    "answer": "38"
-  },
-  {
-    "task_idx": 40,
-    "task_id": "b5e170701d5540859d7d9ef8c2ce7ca3",
-    "website": "https://earthquake.usgs.gov/",
-    "task": "查询USGS地震数据库2025年1月发生的6级及以上地震总数。",
-    "answer": "7"
-  },
-  {
-    "task_idx": 41,
-    "task_id": "2c5f4f1cbd99402ab2e14d2220524761",
-    "website": "https://ec.europa.eu/eurostat/web/main/home",
-    "task": "查找欧盟国家2025-06周期25岁以下女性失业率top3的国家（经季节性调整的数据）。",
-    "answer": "第一名：西班牙\n第二名：芬兰\n第三名：罗马尼亚"
-  },
-  {
-    "task_idx": 42,
-    "task_id": "f321dc0c375441f1ad633b8f7f890cfd",
-    "website": "https://www.cbre.com/",
-    "task": "查看CBRE发布的研究\"Global Prime Office Rent Tracker\"，找到欧洲地区2025年第3季度哪一个城市的租金处于低谷，预计接下来的走势会上涨。",
-    "answer": "Dublin（都柏林）"
-  },
-  {
-    "task_idx": 43,
-    "task_id": "0e8ed2a315a640969b502ab05c72eed7",
-    "website": "https://www.pwc.com/gx/en.html",
-    "task": "查看pwc普华永道发布的报告\"Global M&A trends in health industries:2026 outlook\",找出亚太地区2016-2025e周期健康服务交易量最多的一年和对应的健康服务数量。",
-    "answer": "2023\n502"
-  },
-  {
-    "task_idx": 44,
-    "task_id": "0756c7647da24e9c89c97646c9ca7b22",
-    "website": "https://www.askci.com/",
-    "task": "找到中商情报网发布的《2025年12月食糖市场供需及价格走势分析》查看2022-2025年中国食糖国内价格及国际价格走势，找到国内价格低于国际价格的月份。",
-    "answer": "2023/11"
-  },
-  {
-    "task_idx": 45,
-    "task_id": "6302c60638fb4158a7acc2fd95dd83e9",
-    "website": "https://www.datayicai.com/",
-    "task": "找到第一财经独家数据库“高新技术企业迁入数量”，查询2022-2024年粤港澳大湾区高新技术企业迁入数量总和。",
-    "answer": "87（家）"
-  },
-  {
-    "task_idx": 46,
-    "task_id": "b11a693cbb5b4d8186a06055427df7e6",
-    "website": "https://data.cityofchicago.org/",
-    "task": "查询2024年6月芝加哥THEFT类型犯罪总数。",
-    "answer": "5489（件）"
-  },
-  {
-    "task_idx": 47,
-    "task_id": "cd0348cbf8dd478ca17c7952edd9ed99",
-    "website": "https://www.topklout.com/#/home",
-    "task": "查看克劳锐品牌社交媒体排行榜2024年4月小红书平台美妆类排名前三的品牌名称。",
-    "answer": "第一名：雅诗兰黛\n第二名：颐莲\n第三名：urara悠茉"
-  },
-  {
-    "task_idx": 48,
-    "task_id": "bb0e16d8ed8e4f13bc238524e96fd816",
-    "website": "https://www.yidaiyilu.gov.cn/",
-    "task": "查询中国一带一路网中海上丝路贸易指数在2020-03-01至2025-03-31周期，出口贸易指数的最高值和最低值。",
-    "answer": "236.07\n128.37"
-  },
-  {
-    "task_idx": 49,
-    "task_id": "201d5595d1b74c0cac7023cb5bbe13a5",
-    "website": "https://lpl.qq.com/",
-    "task": "查询2025lpl第一赛段ban率第二的英雄的胜率排第几。",
-    "answer": "17"
+    "task_idx": 69,
+    "task_id": "714f9fbc74a94c8ebbacfc72f223c85f",
+    "website": "https://iiag.online/",
+    "task": "在Ibrahim Index的Interactive Data中,选择Country=Senegal、Category=Human Development、Sub-category=Health,在图表中找到Year=2020,得分是多少(0-100)?",
+    "answer": "59.1"
   }
 ]

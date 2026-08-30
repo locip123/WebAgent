@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections import deque
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -54,6 +54,7 @@ from browser_use.webretriever.models import (
 	AgentDecisionEnvelope,
 	CompetitionTask,
 	InitialPageAgentDecisionEnvelope,
+	RootUpdateRepairAgentDecisionEnvelope,
 	WebRetrieverActionResult,
 )
 from browser_use.webretriever.network import ChartNetworkInspector
@@ -77,6 +78,12 @@ _FINISH_FALSE_RETRY_SUFFIX = '这个任务是一定可以完成的，当前尚�
 _NON_RETRYABLE_ANALYSIS_STATUSES = frozenset({'analysis_unavailable', 'invalid_manifest', 'no_tabular_data'})
 _INVALID_DECISION_SNAPSHOT_MAX_CHARACTERS = 8_000
 _INVALID_DECISION_SNAPSHOT_TRUNCATION_MARKER = '\n...[previous_invalid_decision truncated]...\n'
+_ACTION_CONTRACT_ERRORS_BEFORE_HIDE = 2
+_RUNTIME_NOT_STARTED_ERROR = 'call browserruntime.start(website) first'
+_RUNTIME_NOT_STARTED_RECOVERY_NOTICE = (
+	'Browser runtime was restarted after its initial observation found it unstarted. '
+	'The page below is a fresh observation; reassess it before acting.'
+)
 _ANALYSIS_NOT_READY_RECOVERY = (
 	'数据分析助手当前不可用：本任务没有可用的 ready_data_dir。\n'
 	'downloads/ 下的文档不是可分析数据工件；禁止再次调用 call_data_analysis_assistant，'
@@ -87,12 +94,22 @@ _ANALYSIS_NOT_READY_RECOVERY = (
 
 def _action_contracts_for_data_capability(
 	eligible_data_dirs: tuple[str, ...],
+	*,
+	hidden_actions: Collection[str] = (),
 ) -> dict[str, Any]:
-	"""Return a request-local action set without mutating the global contract."""
+	"""Return one request-local action set without mutating the global contract.
+
+	``hidden_actions`` only applies to same-step structured-output repair.  The
+	``finish`` action always remains available so the model can return an honest
+	terminal result instead of being left with an empty action space.
+	"""
 
 	contracts = dict(ACTION_PARAMETER_CONTRACTS)
 	if not eligible_data_dirs:
 		contracts.pop('call_data_analysis_assistant')
+	for action in hidden_actions:
+		if action != 'finish':
+			contracts.pop(action, None)
 	return contracts
 
 
@@ -100,18 +117,32 @@ def _action_contracts_for_data_capability(
 def _capability_gated_output_format(
 	*,
 	initial_page: bool,
+	root_update_repair: bool,
 	eligible_data_dirs: tuple[str, ...],
+	hidden_actions: tuple[str, ...],
 ) -> type[BaseModel]:
 	"""Build an immutable provider schema variant for one task-local capability state."""
 
-	base = InitialPageAgentDecisionEnvelope if initial_page else AgentDecisionEnvelope
-	contracts = _action_contracts_for_data_capability(eligible_data_dirs)
+	base = (
+		InitialPageAgentDecisionEnvelope
+		if initial_page
+		else RootUpdateRepairAgentDecisionEnvelope
+		if root_update_repair
+		else AgentDecisionEnvelope
+	)
+	contracts = _action_contracts_for_data_capability(eligible_data_dirs, hidden_actions=hidden_actions)
 	attributes: dict[str, Any] = {'__structured_action_parameter_contracts__': contracts}
 	if eligible_data_dirs:
 		attributes['__structured_action_field_enums__'] = {
 			'call_data_analysis_assistant': {'data_dir': eligible_data_dirs}
 		}
-	name = ('InitialPage' if initial_page else 'Standard') + 'CapabilityGatedAgentDecisionEnvelope'
+	name = (
+		'InitialPage'
+		if initial_page
+		else 'RootUpdateRepair'
+		if root_update_repair
+		else 'Standard'
+	) + 'CapabilityGatedAgentDecisionEnvelope'
 	return type(name, (base,), attributes)
 
 
@@ -250,6 +281,10 @@ _SAFE_CONTRACT_DETAIL = re.compile(
 	r'(?P<fields>[a-z_]{1,64}(?:\s*,\s*[a-z_]{1,64})*)',
 	re.IGNORECASE,
 )
+_ACTION_CONTRACT_DIAGNOSTIC = re.compile(
+	r"^action '(?P<action>[a-z_]{1,64})' (?:requires field\(s\)|does not accept field\(s\)):",
+	re.IGNORECASE,
+)
 
 
 def _safe_contract_diagnostic(message: str) -> str:
@@ -296,6 +331,25 @@ def _safe_contract_diagnostic(message: str) -> str:
 	if 'action' in lowered:
 		return 'action must be a supported browser action with its required fields'
 	return 'decision does not match the AgentDecision schema'
+
+
+def _action_name_from_contract_diagnostic(diagnostic: str) -> str | None:
+	"""Return the known non-terminal action named by a schema-only diagnostic."""
+
+	match = _ACTION_CONTRACT_DIAGNOSTIC.match(diagnostic)
+	if match is None:
+		return None
+	action = match.group('action').casefold()
+	return action if action in ACTION_PARAMETER_CONTRACTS and action != 'finish' else None
+
+
+def _temporarily_hidden_action_diagnostic(diagnostic: str, action: str) -> str:
+	"""Explain that a repeatedly malformed action was removed from this repair."""
+
+	return (
+		f"{diagnostic}。动作 {action!r} 已从当前步骤剩余的修复请求中暂时移除；"
+		'请从仍在动作契约中的其他动作重新选择。'
+	)
 
 
 def _validation_error_diagnostic(error: ValidationError) -> str:
@@ -580,6 +634,8 @@ def _coerce_agent_decision(
 		return completion.decision
 	if isinstance(completion, InitialPageAgentDecisionEnvelope):
 		return completion.decision
+	if isinstance(completion, RootUpdateRepairAgentDecisionEnvelope):
+		return completion.decision
 	try:
 		return AgentDecision.model_validate(completion)
 	except ValidationError as error:
@@ -652,7 +708,7 @@ def _normalized_path_repair_diagnostic(
 	if path_action_result.blocked_reason == 'initial page exploration review adds must use system initial root "1" as parent_path_id':
 		return '首轮创建的每条路径必须使用 `parent_path_id="1"`，以作为系统根的直接子路径。'
 	if any('system initial root "1" is immutable' in reason for reason in reasons):
-		return '删除所有 `path_id="1"` 的 `update`；首轮至少保留一个 `add`。'
+		return '删除所有 `path_id="1"` 的 `update`；至少保留一个 `add`，现在需要你使用 `add`将当前页面内所有可能的找到答案的探索路径添加到路径树中。'
 	if any('marking a path failed requires' in reason for reason in reasons):
 		return '将路径标记为 `failed` 时必须在同一个 `update` 中用 `progress` 写明该路径无法到达任务目的地或答案页面的具体证据，然后再切换到新的探索路径。'
 	if any('marking a path succeeded requires' in reason for reason in reasons):
@@ -666,6 +722,21 @@ def _normalized_path_repair_diagnostic(
 	if path_action_result.blocked and 'terminal' in (path_action_result.blocked_reason or ''):
 		return '`current_path_id` 不能指向已终态路径。请根据完整路径树选择一个未终态路径。'
 	return '一个或多个路径增量未被应用。请根据当前可信路径树和 `add`/`update` 契约，仅提交本轮有效增量。'
+
+
+def _requires_root_update_repair_protocol(path_action_result: PathJsonActionResult) -> bool:
+	"""Whether the next same-step retry must hide the ``update`` operation.
+
+	Only the executor's immutable-system-root rejection activates this temporary
+	protocol. Other path errors retain the normal schema because a concrete
+	path's verified lifecycle update may still be required to repair them.
+	"""
+
+	return any(
+		operation.requested_op == 'update'
+		and 'system initial root "1" is immutable' in (operation.reason or '')
+		for operation in path_action_result.operations
+	)
 
 
 def _path_json_action_artifact_payload(decision: AgentDecision) -> dict[str, Any]:
@@ -954,6 +1025,7 @@ class ProtocolIIIAgent:
 		chart_network_inspector: Any | None = None,
 		data_analysis_assistant: Any | None = None,
 		task_deadline_monotonic: float | None = None,
+		recover_unstarted_runtime: Callable[[], Awaitable[Any]] | None = None,
 	):
 		if not 1 <= max_steps <= 100:
 			raise ValueError('max_steps must be between 1 and the competition limit of 100')
@@ -985,6 +1057,7 @@ class ProtocolIIIAgent:
 		self._model_output_protocol_variants = {
 			'standard': _model_output_protocol(llm, AgentDecisionEnvelope),
 			'initial_page_add_only': _model_output_protocol(llm, InitialPageAgentDecisionEnvelope),
+			'root_update_repair_add_only': _model_output_protocol(llm, RootUpdateRepairAgentDecisionEnvelope),
 		}
 		# Preserve the long-standing top-level protocol entry for downstream log
 		# readers; each request records the chosen variant below.
@@ -995,6 +1068,7 @@ class ProtocolIIIAgent:
 		self._model_call_timing: dict[str, Any] = empty_model_call_timing_payload()
 		self._model_service_event_start = llm.event_count if isinstance(llm, ModelServiceRouter) else 0
 		self.task_deadline_monotonic = task_deadline_monotonic
+		self._recover_unstarted_runtime = recover_unstarted_runtime
 		self._trusted_data_manifests: dict[str, str] = {}
 		self._ready_data_dirs: set[str] = set()
 		self._unavailable_analysis_data_dirs: set[str] = set()
@@ -1043,6 +1117,50 @@ class ProtocolIIIAgent:
 		if self.task_deadline_monotonic is None:
 			return float('inf')
 		return max(0.0, self.task_deadline_monotonic - time.monotonic())
+
+	async def _await_runtime_recovery(self, awaitable: Awaitable[Any]) -> Any:
+		"""Await a recovery operation without extending the task deadline."""
+
+		remaining = self._remaining_task_seconds()
+		if remaining <= 0:
+			raise TimeoutError('task deadline expired before browser recovery')
+		if self.task_deadline_monotonic is None:
+			return await awaitable
+		return await _await_with_hard_timeout(awaitable, remaining)
+
+	@staticmethod
+	def _is_runtime_not_started_error(error: BaseException) -> bool:
+		return _RUNTIME_NOT_STARTED_ERROR in str(error).casefold()
+
+	async def _recover_initially_unstarted_runtime(self) -> tuple[bool, bool]:
+		"""Restart once locally, then ask the runner for one clean worker runtime."""
+
+		attempted = False
+		start = getattr(self.runtime, 'start', None)
+		if callable(start):
+			attempted = True
+			try:
+				await self._await_runtime_recovery(start(self.task.website))
+			except TimeoutError:
+				raise
+			except Exception:
+				pass
+			else:
+				return True, attempted
+
+		if self._recover_unstarted_runtime is None:
+			return False, attempted
+		attempted = True
+		try:
+			replacement_runtime = await self._await_runtime_recovery(self._recover_unstarted_runtime())
+		except TimeoutError:
+			raise
+		except Exception:
+			return False, attempted
+		if replacement_runtime is None:
+			return False, attempted
+		self.runtime = replacement_runtime
+		return True, attempted
 
 	def _chart_action_budget(self, action: str, *, cursor: bool = False) -> float:
 		remaining = self._remaining_task_seconds()
@@ -1480,6 +1598,7 @@ class ProtocolIIIAgent:
 		screenshot_path: Path | None,
 		output_protocol_variant: str,
 		analysis_capability: Mapping[str, Any],
+		hidden_actions: Collection[str] = (),
 		excluded_service_groups: Collection[str] = (),
 	) -> int:
 		"""Atomically persist one model request before it is submitted.
@@ -1527,11 +1646,14 @@ class ProtocolIIIAgent:
 					'analysis_capability': dict(analysis_capability),
 				}
 			)
-		if excluded_service_groups:
+		if excluded_service_groups or hidden_actions:
 			entry = steps[-1]
 			if not isinstance(entry, dict):
 				raise TypeError('model prompt log step must be an object')
-			entry['excluded_model_service_groups'] = sorted(set(excluded_service_groups))
+			if excluded_service_groups:
+				entry['excluded_model_service_groups'] = sorted(set(excluded_service_groups))
+			if hidden_actions:
+				entry['temporarily_hidden_actions'] = sorted(set(hidden_actions))
 		atomic_write_json(self._model_prompt_log_path, self._model_prompt_log)
 		return prompt_index
 
@@ -1540,22 +1662,34 @@ class ProtocolIIIAgent:
 		context: StepContext,
 		*,
 		eligible_data_dirs: tuple[str, ...] | None = None,
+		root_update_repair: bool = False,
+		hidden_actions: Collection[str] = (),
 	) -> type[BaseModel]:
 		"""Select the provider schema matching this observation's path state."""
 
 		review = context.exploration_review
 		initial_page = not context.answer_priority_mode and review is not None and review.trigger == 'initial_page'
-		if eligible_data_dirs is None:
-			return InitialPageAgentDecisionEnvelope if initial_page else AgentDecisionEnvelope
+		normalized_hidden_actions = tuple(
+			sorted(action for action in set(hidden_actions) if action in ACTION_PARAMETER_CONTRACTS and action != 'finish')
+		)
+		if eligible_data_dirs is None and not normalized_hidden_actions:
+			if initial_page:
+				return InitialPageAgentDecisionEnvelope
+			return RootUpdateRepairAgentDecisionEnvelope if root_update_repair else AgentDecisionEnvelope
 		return _capability_gated_output_format(
 			initial_page=initial_page,
-			eligible_data_dirs=eligible_data_dirs,
+			root_update_repair=root_update_repair,
+			eligible_data_dirs=eligible_data_dirs or (),
+			hidden_actions=normalized_hidden_actions,
 		)
 
 	@staticmethod
 	def _output_protocol_variant(output_format: type[BaseModel]) -> str:
-		if output_format is InitialPageAgentDecisionEnvelope:
+		decision_model = getattr(output_format, '__structured_decision_model__', None)
+		if decision_model is InitialPageAgentDecisionEnvelope.__structured_decision_model__:
 			return 'initial_page_add_only'
+		if decision_model is RootUpdateRepairAgentDecisionEnvelope.__structured_decision_model__:
+			return 'root_update_repair_add_only'
 		return 'standard'
 
 	def _record_model_result(
@@ -1598,6 +1732,8 @@ class ProtocolIIIAgent:
 		raw_path: Path | None,
 		outcome: AgentRunOutcome,
 		excluded_service_groups: Collection[str] = (),
+		root_update_repair: bool = False,
+		hidden_actions: Collection[str] = (),
 	) -> tuple[AgentDecision, dict[str, int], int, float]:
 		"""Request one decision while allowing path-tree retries to reuse a step.
 
@@ -1620,7 +1756,13 @@ class ProtocolIIIAgent:
 				)
 			)
 		eligible_data_dirs = self._eligible_data_dirs()
-		action_contracts = _action_contracts_for_data_capability(eligible_data_dirs)
+		normalized_hidden_actions = tuple(
+			sorted(action for action in set(hidden_actions) if action in ACTION_PARAMETER_CONTRACTS and action != 'finish')
+		)
+		action_contracts = _action_contracts_for_data_capability(
+			eligible_data_dirs,
+			hidden_actions=normalized_hidden_actions,
+		)
 		system_document = self.prompt_composer.system_for_action_contracts(action_contracts)
 		messages = [
 			SystemMessage(content=system_document.text),
@@ -1629,7 +1771,12 @@ class ProtocolIIIAgent:
 		model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
 		if model_call_timeout <= 0:
 			raise _DecisionTaskDeadline()
-		output_format = self._decision_output_format(context, eligible_data_dirs=eligible_data_dirs)
+		output_format = self._decision_output_format(
+			context,
+			eligible_data_dirs=eligible_data_dirs,
+			root_update_repair=root_update_repair,
+			hidden_actions=normalized_hidden_actions,
+		)
 		analysis_capability = {
 			'status': 'available' if eligible_data_dirs else 'unavailable',
 			'eligible_data_dirs': list(eligible_data_dirs),
@@ -1641,6 +1788,7 @@ class ProtocolIIIAgent:
 			screenshot_path=raw_path,
 			output_protocol_variant=self._output_protocol_variant(output_format),
 			analysis_capability=analysis_capability,
+			hidden_actions=normalized_hidden_actions,
 			excluded_service_groups=excluded_service_groups,
 		)
 		model_call_started_at = time.monotonic()
@@ -1711,6 +1859,12 @@ class ProtocolIIIAgent:
 				completion,
 				source_service_group=source_service_group,
 			)
+			if decision.action in normalized_hidden_actions:
+				raise _InvalidStructuredDecision(
+					f"action {decision.action!r} is temporarily unavailable for the current same-step repair",
+					_invalid_decision_snapshot(raw_completion),
+					source_service_group,
+				)
 		except _InvalidStructuredDecision as exc:
 			model_error = f'Model structured decision is invalid: {exc.diagnostic}'
 			self._record_model_result(
@@ -1757,6 +1911,7 @@ class ProtocolIIIAgent:
 		verification = VerificationController(target_url=self.task.website)
 
 		step_counter = _RefundableStepCounter(self.max_steps)
+		runtime_not_started_recovery_attempted = False
 		for step in step_counter:
 			try:
 				observation = await self.runtime.observe(step)
@@ -1771,6 +1926,18 @@ class ProtocolIIIAgent:
 						step_counter.refund_last()
 						last_outcome = 'Browser target closed; a surviving task page was re-grounded. Observe it before deciding again.'
 						continue
+				if (
+					step == 0
+					and not outcome.steps
+					and not runtime_not_started_recovery_attempted
+					and self._is_runtime_not_started_error(exc)
+				):
+					recovered, recovery_attempted = await self._recover_initially_unstarted_runtime()
+					runtime_not_started_recovery_attempted = recovery_attempted
+					if recovered:
+						step_counter.refund_last()
+						last_outcome = _RUNTIME_NOT_STARTED_RECOVERY_NOTICE
+						continue
 				browser_failure = classify_browser_failure(
 					exc,
 					phase=BrowserFailurePhase.OBSERVATION,
@@ -1778,7 +1945,9 @@ class ProtocolIIIAgent:
 				)
 				outcome.status = browser_failure.status
 				outcome.error = f'Observation failed: {type(exc).__name__}: {exc}'
-				outcome.browser_failure = browser_failure.payload(recovery_attempted=session_closed)
+				outcome.browser_failure = browser_failure.payload(
+					recovery_attempted=session_closed or runtime_not_started_recovery_attempted
+				)
 				break
 			try:
 				exploration_tracker.ensure_system_initial_path(start_url=observation.url)
@@ -1884,8 +2053,12 @@ class ProtocolIIIAgent:
 			answer_priority_mode = exploration_tracker.answer_priority_mode
 			exploration_review = exploration_tracker.review_request(current_page_url=observation.url)
 			path_tree_ready = False
+			root_update_repair = False
 			structured_decision_repair_feedback: StructuredDecisionRepairFeedback | None = None
 			excluded_model_service_groups: set[str] = set()
+			temporarily_hidden_actions: set[str] = set()
+			last_action_contract_error: str | None = None
+			consecutive_action_contract_errors = 0
 			while not path_tree_ready:
 				try:
 					decision, model_usage, prompt_index, model_call_started_at = await self._request_model_decision(
@@ -1911,9 +2084,11 @@ class ProtocolIIIAgent:
 						),
 						screenshot=screenshot,
 						raw_path=raw_path if screenshot else None,
-						outcome=outcome,
-						excluded_service_groups=excluded_model_service_groups,
-					)
+					outcome=outcome,
+					excluded_service_groups=excluded_model_service_groups,
+					root_update_repair=root_update_repair,
+					hidden_actions=temporarily_hidden_actions,
+				)
 					# A valid decision closes the same-step repair context.  Later
 					# prompts must not carry an obsolete invalid output forward.
 					structured_decision_repair_feedback = None
@@ -1930,15 +2105,40 @@ class ProtocolIIIAgent:
 						observation,
 					)
 					consecutive_model_output_errors += 1
+					action_contract_error = _action_name_from_contract_diagnostic(exc.diagnostic)
+					if action_contract_error is None:
+						last_action_contract_error = None
+						consecutive_action_contract_errors = 0
+					elif action_contract_error == last_action_contract_error:
+						consecutive_action_contract_errors += 1
+					else:
+						last_action_contract_error = action_contract_error
+						consecutive_action_contract_errors = 1
+
+					repair_diagnostic = exc.diagnostic
+					if (
+						action_contract_error is not None
+						and consecutive_action_contract_errors >= _ACTION_CONTRACT_ERRORS_BEFORE_HIDE
+					):
+						temporarily_hidden_actions.add(action_contract_error)
+						repair_diagnostic = _temporarily_hidden_action_diagnostic(
+							exc.diagnostic,
+							action_contract_error,
+						)
+						# Filtering the repeatedly malformed action creates a new choice
+						# space. Give that repaired schema a fresh bounded error budget.
+						consecutive_model_output_errors = 0
+						last_action_contract_error = None
+						consecutive_action_contract_errors = 0
 					if exc.source_service_group is not None:
 						excluded_model_service_groups.add(exc.source_service_group)
 					structured_decision_repair_feedback = StructuredDecisionRepairFeedback(
-						diagnostic=exc.diagnostic,
+						diagnostic=repair_diagnostic,
 						previous_invalid_decision=exc.previous_invalid_decision,
 					)
 					last_outcome = (
 						'ERROR: The previous model decision output was invalid_decision; no browser action was executed. '
-						f'Diagnostic: {exc.diagnostic}. Correct the action and return one valid AgentDecision; '
+						f'Diagnostic: {repair_diagnostic}. Correct the action and return one valid AgentDecision; '
 						'this retry does not consume a step.'
 					)
 					if consecutive_model_output_errors >= self.max_consecutive_model_output_errors:
@@ -2037,6 +2237,8 @@ class ProtocolIIIAgent:
 					continue
 
 				if decision.action == 'call_data_analysis_assistant' and decision.data_dir not in eligible_data_dirs:
+					last_action_contract_error = None
+					consecutive_action_contract_errors = 0
 					diagnostic = 'data_dir must be one of the current eligible ready_data_dir values'
 					model_error = f'Model response omitted or violated the data-directory contract: {diagnostic}'
 					self._record_model_result(
@@ -2100,6 +2302,9 @@ class ProtocolIIIAgent:
 						path_error = '路径树状态无法应用。请根据当前可信路径树和 `add`/`update` 契约，仅提交本轮有效增量。'
 
 				if path_error is not None:
+					last_action_contract_error = None
+					consecutive_action_contract_errors = 0
+					root_update_repair = _requires_root_update_repair_protocol(path_action_result)
 					model_error = f'Model response omitted or invalidated exploration-path state: {path_error}'
 					self._record_model_result(
 						step=step,

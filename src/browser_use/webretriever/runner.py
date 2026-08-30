@@ -480,16 +480,17 @@ async def _run_task(
 					task.task_id,
 				)
 
+			browser_request = TaskBrowserRequest(
+				website=task.website,
+				task_dir=writer.task_dir,
+				logger=logger,
+				declared_user_agent=config.sec_user_agent if is_sec_task else None,
+				task_identity=task.prompt_payload(),
+			)
 			browser_startup_in_progress = True
 			if browser_session is not None:
 				runtime = await browser_session.open_task_runtime(
-					TaskBrowserRequest(
-						website=task.website,
-						task_dir=writer.task_dir,
-						logger=logger,
-						declared_user_agent=config.sec_user_agent if is_sec_task else None,
-						task_identity=task.prompt_payload(),
-					),
+					browser_request,
 					deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
 				)
 			else:
@@ -511,6 +512,43 @@ async def _run_task(
 			# its evaluator-provided browser and start URL.
 			writer.write_capture(runtime.capture_payload())
 			browser_startup_in_progress = False
+
+			async def recover_unstarted_runtime() -> BrowserRuntime:
+				nonlocal runtime
+				if runtime is not None:
+					try:
+						cleanup_budget = min(
+							1.0,
+							_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
+						)
+						await _await_with_hard_timeout(
+							runtime.close(timeout_seconds=cleanup_budget),
+							cleanup_budget,
+						)
+					except Exception as exc:
+						logger.warning('Could not clean up the unstarted browser runtime before replacement: %s', exc)
+				deadline_monotonic = task_started_monotonic + config.task_timeout_seconds
+				if browser_session is not None:
+					runtime = await browser_session.replace_unstarted_task_runtime(
+						browser_request,
+						deadline_monotonic=deadline_monotonic,
+					)
+					return runtime
+				if context is None:
+					raise RuntimeError('worker has no browser context')
+				runtime = BrowserRuntime(
+					context,
+					writer.task_dir,
+					logger,
+					declared_user_agent=config.sec_user_agent if is_sec_task else None,
+					task_identity=task.prompt_payload(),
+				)
+				await _await_with_hard_timeout(
+					runtime.start(task.website),
+					_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
+				)
+				return runtime
+
 			agent = ProtocolIIIAgent(
 				task=task,
 				llm=llm,
@@ -521,11 +559,13 @@ async def _run_task(
 				thought_language=config.thought_language,
 				structured_prompt_log=config.structured_prompt_log,
 				task_deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
+				recover_unstarted_runtime=recover_unstarted_runtime,
 			)
 			outcome = await _await_with_hard_timeout(
 				agent.run(),
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
+			runtime = getattr(agent, 'runtime', runtime)
 			if browser_session is not None and _is_browser_disconnect_error(outcome.error):
 				recover_worker = True
 		except BrowserRecoveryDeadlineExceeded:

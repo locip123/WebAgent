@@ -18,7 +18,12 @@ from browser_use.webretriever.exploration_paths import (
 	available_leaf_path_ids,
 	model_facing_path_tree,
 )
-from browser_use.webretriever.models import ActionParameterContract, CompetitionTask, render_action_parameter_contracts
+from browser_use.webretriever.models import (
+	ACTION_PARAMETER_CONTRACTS,
+	ActionParameterContract,
+	CompetitionTask,
+	render_action_parameter_contracts,
+)
 
 DEFAULT_THOUGHT_LANGUAGE = '简体中文'
 _DEFAULT_MODEL_ID = 'gpt-5.4'
@@ -181,10 +186,7 @@ _SYSTEM_SECTION_BODIES: tuple[tuple[str, str, str], ...] = (
 3. Use one or two concise sentences naming the observed cue and immediate next action, not a long chain of reasoning.
 4. Populate only fields allowed for the selected action and the path-tree metadata required by exploration mode.
 5. Leave unrelated optional fields unset or null.
-6. inspect_network text is relevance search, not exact proof; request_id scopes text to one captured response, or without text reads a result; network_cursor only continues a request read without text.
-7. chart_cursor belongs only to find_chart_data_requests.
-8. analysis_query/data_dir must use the exact validated task-local data artifact.
-9. calculate text must be JSON numbers copied from browser evidence.""",
+{action_specific_guidance}""",
 	),
 	(
 		'exploration_path_tree',
@@ -209,6 +211,25 @@ _SYSTEM_SECTION_BODIES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _action_specific_guidance(action_contracts: Mapping[str, ActionParameterContract] | None) -> str:
+	"""Render guidance only for actions exposed by this request's strict schema."""
+
+	active_actions = ACTION_PARAMETER_CONTRACTS if action_contracts is None else action_contracts
+	guidance: list[str] = []
+	if 'inspect_network' in active_actions:
+		guidance.append(
+			'inspect_network text is relevance search, not exact proof; request_id scopes text to one captured response, '
+			'or without text reads a result; network_cursor only continues a request read without text.'
+		)
+	if 'find_chart_data_requests' in active_actions:
+		guidance.append('chart_cursor belongs only to find_chart_data_requests.')
+	if 'call_data_analysis_assistant' in active_actions:
+		guidance.append('analysis_query/data_dir must use the exact validated task-local data artifact.')
+	if 'calculate' in active_actions:
+		guidance.append('calculate text must be JSON numbers copied from browser evidence.')
+	return '\n'.join(f'{index}. {item}' for index, item in enumerate(guidance, start=6))
+
+
 def _render_system_document(
 	thought_language: str,
 	*,
@@ -225,6 +246,7 @@ def _render_system_document(
 		body = template.format(
 			thought_language=language,
 			action_contract=action_contract,
+			action_specific_guidance=_action_specific_guidance(action_contracts),
 			system_initial_path_progress=SYSTEM_INITIAL_PATH_PROGRESS,
 		)
 		blocks.append(f'{title}\n{body}')

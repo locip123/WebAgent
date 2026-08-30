@@ -113,6 +113,26 @@ class _RecoveryRuntime:
         return WebRetrieverActionResult(action='wait', status='ok', executed=True, state_changed=False, summary='waited')
 
 
+class _ExplorationRuntime:
+    async def observe(self, step: int) -> BrowserObservation:
+        assert step in {0, 1}
+        return BrowserObservation(
+            screenshot=b'',
+            url='https://example.test/start',
+            title='测试页面',
+            tabs=[{'index': 0, 'url': 'https://example.test/start', 'title': '测试页面', 'active': True}],
+            viewport_width=1280,
+            viewport_height=720,
+            elements=[],
+            page_text='页面中已显示可作为答案的事实。',
+            recent_network=[],
+            downloads=[],
+        )
+
+    async def execute(self, _decision: Any) -> WebRetrieverActionResult:
+        return WebRetrieverActionResult(action='wait', status='ok', executed=True, state_changed=False, summary='waited')
+
+
 class _ReadyRuntime:
     def __init__(self, ready_data_dir: Path) -> None:
         self._ready_data_dir = ready_data_dir
@@ -205,6 +225,34 @@ def _initial_wait() -> ChatInvokeCompletion[Any]:
                                 'parent_path_id': '1',
                                 'location': '等待下载',
                                 'strategy_description': '等待当前下载生成结构化工件。',
+                            }
+                        ]
+                    },
+                    'seconds': 1,
+                }
+            }
+        ),
+        raw_completion='{"decision":{"action":"wait"}}',
+        usage=None,
+    )
+
+
+def _root_update_wait() -> ChatInvokeCompletion[Any]:
+    return ChatInvokeCompletion(
+        completion=AgentDecisionEnvelope.model_validate(
+            {
+                'decision': {
+                    'action': 'wait',
+                    'thought': '错误地把系统锚点当成可更新路径。',
+                    'current_path_id': '1->1',
+                    'decision_summary': '错误地更新根节点。',
+                    'path_json_action': {
+                        'operations': [
+                            {
+                                'op': 'update',
+                                'path_id': '1',
+                                'status': 'in_progress',
+                                'progress': '错误地记录起始页进展。',
                             }
                         ]
                     },
@@ -632,6 +680,90 @@ def test_path_semantic_repair_does_not_exclude_the_current_gateway_group(
         "STRUCTURED DECISION REPAIR FEEDBACK"
         in prompt_log["steps"][1]["prompt"]["rendered_text"]
     )
+
+
+def test_root_update_repair_hides_update_from_the_same_step_retry(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel, dict[str, Any]]:
+        model = _FakeModel('direct', [_initial_wait(), _root_update_wait(), _successful_finish()])
+        task_dir = tmp_path / 'root-update-repair'
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='root-update-repair',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_ExplorationRuntime(),
+            task_dir=task_dir,
+            max_steps=2,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        outcome = await agent.run()
+        prompt_log = json.loads((task_dir / 'model_prompts.json').read_text(encoding='utf-8'))
+        return outcome, model, prompt_log
+
+    outcome, model, prompt_log = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 3
+    repair_schema = json.dumps(
+        SchemaOptimizer.create_optimized_json_schema(model.output_formats[2]), ensure_ascii=False
+    )
+    assert 'PathJsonUpdateOperation' not in repair_schema
+    assert [entry['output_protocol_variant'] for entry in prompt_log['steps']] == [
+        'initial_page_add_only',
+        'standard',
+        'root_update_repair_add_only',
+    ]
+
+
+def test_repeated_action_contract_error_hides_action_only_for_the_current_step(tmp_path: Path) -> None:
+    invalid_inspect_network = ModelStructuredOutputError(
+        'inspect_network does not accept: analysis_query',
+        raw_completion='{"decision":{"action":"inspect_network","analysis_query":"THEFT"}}',
+    )
+
+    async def scenario() -> tuple[Any, _FakeModel, dict[str, Any]]:
+        model = _FakeModel(
+            'direct',
+            [invalid_inspect_network, invalid_inspect_network, _initial_wait(), _successful_finish()],
+        )
+        task_dir = tmp_path / 'repeated-action-contract-error'
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='repeated-action-contract-error',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_ExplorationRuntime(),
+            task_dir=task_dir,
+            max_steps=2,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        outcome = await agent.run()
+        prompt_log = json.loads((task_dir / 'model_prompts.json').read_text(encoding='utf-8'))
+        return outcome, model, prompt_log
+
+    outcome, model, prompt_log = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 4
+    hidden_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(model.output_formats[2]), ensure_ascii=False)
+    restored_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(model.output_formats[3]), ensure_ascii=False)
+    assert 'inspect_network' not in hidden_schema
+    assert 'finish' in hidden_schema
+    assert 'inspect_network' in restored_schema
+    assert 'inspect_network' not in model.system_prompts[2]
+    assert 'inspect_network' in model.system_prompts[3]
+    assert prompt_log['steps'][2]['temporarily_hidden_actions'] == ['inspect_network']
+    assert '已从当前步骤剩余的修复请求中暂时移除' in model.user_prompts[2]
 
 
 def test_bare_json_decode_error_in_structured_call_returns_to_agent_without_router_fallback(
