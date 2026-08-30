@@ -5,9 +5,11 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 from browser_use.llm.exceptions import ModelStructuredOutputError
 from browser_use.llm.views import ChatInvokeCompletion
+from browser_use.llm.schema import SchemaOptimizer
 from browser_use.webretriever.agent import ProtocolIIIAgent
 from browser_use.webretriever.browser import BrowserObservation
 from browser_use.webretriever.model_services import (
@@ -17,8 +19,11 @@ from browser_use.webretriever.model_services import (
 )
 from browser_use.webretriever.model_retry import is_retryable_model_error
 from browser_use.webretriever.models import (
+    ACTION_PARAMETER_CONTRACTS,
+    AgentDecisionEnvelope,
     CompetitionTask,
     InitialPageAgentDecisionEnvelope,
+    WebRetrieverActionResult,
 )
 
 
@@ -29,9 +34,21 @@ class _FakeModel:
         self.name = name
         self._outcomes = iter(outcomes)
         self.calls = 0
+        self.output_formats: list[Any] = []
+        self.system_prompts: list[str] = []
+        self.user_prompts: list[str] = []
 
     async def ainvoke(self, *_args: Any, **_kwargs: Any) -> ChatInvokeCompletion[Any]:
         self.calls += 1
+        output_format = _kwargs.get('output_format')
+        if output_format is not None:
+            self.output_formats.append(output_format)
+        if _args and isinstance(_args[0], list) and _args[0]:
+            self.system_prompts.append(str(getattr(_args[0][0], 'content', '')))
+            if len(_args[0]) > 1:
+                content = getattr(_args[0][1], 'content', '')
+                if isinstance(content, list) and content:
+                    self.user_prompts.append(str(getattr(content[0], 'text', '')))
         outcome = next(self._outcomes)
         if isinstance(outcome, Exception):
             raise outcome
@@ -62,6 +79,69 @@ class _Runtime:
         )
 
 
+class _RecoveryRuntime:
+    def __init__(self, ready_data_dir: Path) -> None:
+        self._ready_data_dir = ready_data_dir
+
+    async def observe(self, step: int) -> BrowserObservation:
+        downloads: list[dict[str, Any]] = []
+        if step == 1:
+            downloads.append(
+                {
+                    'data_artifact': {
+                        'status': 'ready',
+                        'data_dir': str(self._ready_data_dir),
+                        'manifest_sha256': 'a' * 64,
+                        'artifact_id': 'download-ready-artifact',
+                    }
+                }
+            )
+        return BrowserObservation(
+            screenshot=b'',
+            url='https://example.test/start',
+            title='测试页面',
+            tabs=[{'index': 0, 'url': 'https://example.test/start', 'title': '测试页面', 'active': True}],
+            viewport_width=1280,
+            viewport_height=720,
+            elements=[],
+            page_text='页面中已显示可作为答案的事实。',
+            recent_network=[],
+            downloads=downloads,
+        )
+
+    async def execute(self, _decision: Any) -> WebRetrieverActionResult:
+        return WebRetrieverActionResult(action='wait', status='ok', executed=True, state_changed=False, summary='waited')
+
+
+class _ReadyRuntime:
+    def __init__(self, ready_data_dir: Path) -> None:
+        self._ready_data_dir = ready_data_dir
+
+    async def observe(self, step: int) -> BrowserObservation:
+        assert step == 0
+        return BrowserObservation(
+            screenshot=b'',
+            url='https://example.test/start',
+            title='测试页面',
+            tabs=[{'index': 0, 'url': 'https://example.test/start', 'title': '测试页面', 'active': True}],
+            viewport_width=1280,
+            viewport_height=720,
+            elements=[],
+            page_text='页面中已显示可作为答案的事实。',
+            recent_network=[],
+            downloads=[
+                {
+                    'data_artifact': {
+                        'status': 'ready',
+                        'data_dir': str(self._ready_data_dir),
+                        'manifest_sha256': 'b' * 64,
+                        'artifact_id': 'initial-ready-artifact',
+                    }
+                }
+            ],
+        )
+
+
 def _successful_finish() -> ChatInvokeCompletion[Any]:
     return ChatInvokeCompletion(
         completion=InitialPageAgentDecisionEnvelope.model_validate(
@@ -78,6 +158,126 @@ def _successful_finish() -> ChatInvokeCompletion[Any]:
         raw_completion='{"decision":{"action":"finish"}}',
         usage=None,
     )
+
+
+def _unavailable_analysis_attempt() -> ChatInvokeCompletion[Any]:
+    return ChatInvokeCompletion(
+        completion=InitialPageAgentDecisionEnvelope.model_validate(
+            {
+                "decision": {
+                    "action": "call_data_analysis_assistant",
+                    "thought": "下载文档后尝试交给数据分析助手。",
+                    "current_path_id": "1->1",
+                    "decision_summary": "文档已下载，准备分析。",
+                    "path_json_action": {
+                        "operations": [
+                            {
+                                "op": "add",
+                                "parent_path_id": "1",
+                                "location": "下载文档",
+                                "strategy_description": "下载文档并交给数据分析助手。",
+                            }
+                        ]
+                    },
+                    "analysis_query": "提取答案。",
+                    "data_dir": "/downloads/report.pdf",
+                }
+            }
+        ),
+        raw_completion='{"decision":{"action":"call_data_analysis_assistant"}}',
+        usage=None,
+    )
+
+
+def _initial_wait() -> ChatInvokeCompletion[Any]:
+    return ChatInvokeCompletion(
+        completion=InitialPageAgentDecisionEnvelope.model_validate(
+            {
+                'decision': {
+                    'action': 'wait',
+                    'thought': '等待下载工件被浏览器运行时登记。',
+                    'current_path_id': '1->1',
+                    'decision_summary': '等待已观察的下载完成。',
+                    'path_json_action': {
+                        'operations': [
+                            {
+                                'op': 'add',
+                                'parent_path_id': '1',
+                                'location': '等待下载',
+                                'strategy_description': '等待当前下载生成结构化工件。',
+                            }
+                        ]
+                    },
+                    'seconds': 1,
+                }
+            }
+        ),
+        raw_completion='{"decision":{"action":"wait"}}',
+        usage=None,
+    )
+
+
+def _ineligible_data_dir_attempt() -> ChatInvokeCompletion[Any]:
+    return ChatInvokeCompletion(
+        completion=AgentDecisionEnvelope.model_validate(
+            {
+                'decision': {
+                    'action': 'call_data_analysis_assistant',
+                    'thought': '尝试使用下载目录而不是已登记工件。',
+                    'current_path_id': '1->1',
+                    'decision_summary': '错误地把下载路径作为数据目录。',
+                    'path_json_action': {
+                        'operations': [
+                            {
+                                'op': 'update',
+                                'path_id': '1->1',
+                                'status': 'in_progress',
+                                'progress': '错误地宣称文档可以分析。',
+                            }
+                        ]
+                    },
+                    'analysis_query': '提取答案。',
+                    'data_dir': '/downloads/report.pdf',
+                }
+            }
+        ),
+        raw_completion='{"decision":{"action":"call_data_analysis_assistant"}}',
+        usage=None,
+    )
+
+
+def _eligible_data_dir_attempt(data_dir: str) -> ChatInvokeCompletion[Any]:
+    return ChatInvokeCompletion(
+        completion=AgentDecisionEnvelope.model_validate(
+            {
+                'decision': {
+                    'action': 'call_data_analysis_assistant',
+                    'thought': '使用运行时登记的数据工件。',
+                    'current_path_id': '1->1',
+                    'decision_summary': '对已登记工件进行分析。',
+                    'analysis_query': '提取答案。',
+                    'data_dir': data_dir,
+                }
+            }
+        ),
+        raw_completion='{"decision":{"action":"call_data_analysis_assistant"}}',
+        usage=None,
+    )
+
+
+class _UnavailableAnalysisAssistant:
+    async def execute(self, *, analysis_query: str, data_dir: str) -> Any:
+        return SimpleNamespace(
+            output=json.dumps(
+                {
+                    'action': 'call_data_analysis_assistant',
+                    'status': 'analysis_unavailable',
+                    'analysis_query': analysis_query,
+                    'error': 'no tabular input is available',
+                }
+            ),
+            usage={},
+        )
 
 
 def _initial_path_semantic_error() -> ChatInvokeCompletion[Any]:
@@ -140,6 +340,225 @@ def _agent(router: ModelServiceRouter, task_dir: Path) -> ProtocolIIIAgent:
         structured_prompt_log=True,
         chart_network_inspector=object(),
     )
+
+
+def test_agent_request_hides_unavailable_analysis_capability_from_model(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel]:
+        model = _FakeModel('direct', [_successful_finish()])
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='analysis-capability-gate',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_Runtime(),
+            task_dir=tmp_path / 'analysis-capability-gate',
+            max_steps=1,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        return await agent.run(), model
+
+    outcome, model = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 1
+    assert 'call_data_analysis_assistant' not in json.dumps(
+        SchemaOptimizer.create_optimized_json_schema(model.output_formats[0]), ensure_ascii=False
+    )
+    assert len(model.system_prompts) == 1
+    assert 'call_data_analysis_assistant' not in model.system_prompts[0]
+    prompt_log = json.loads((tmp_path / 'analysis-capability-gate' / 'model_prompts.json').read_text(encoding='utf-8'))
+    assert prompt_log['steps'][0]['analysis_capability'] == {
+        'status': 'unavailable',
+        'eligible_data_dirs': [],
+    }
+
+
+def test_unavailable_analysis_attempt_is_rejected_before_path_updates_and_recovers_same_step(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[Any, _FakeModel]:
+        model = _FakeModel('direct', [_unavailable_analysis_attempt(), _successful_finish()])
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='analysis-not-ready-recovery',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_Runtime(),
+            task_dir=tmp_path / 'analysis-not-ready-recovery',
+            max_steps=1,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        return await agent.run(), model
+
+    outcome, model = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 2
+    assert len(model.system_prompts) == 2
+    assert '数据分析助手当前不可用' in model.user_prompts[1]
+    rejected_step = outcome.steps[0]
+    assert rejected_step['gate_rejected'] is True
+    assert json.loads(rejected_step['outcome'])['status'] == 'analysis_not_ready'
+    assert rejected_step['path_json_action_result']['operations'] == []
+
+
+def test_new_ready_data_dir_clears_recovery_and_restores_analysis_capability(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel, str]:
+        task_dir = tmp_path / 'new-ready-data-dir'
+        ready_data_dir = task_dir / 'data_artifacts' / 'download-ready-artifact'
+        ready_data_dir.mkdir(parents=True)
+        model = _FakeModel('direct', [_unavailable_analysis_attempt(), _initial_wait(), _successful_finish()])
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='new-ready-data-dir',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_RecoveryRuntime(ready_data_dir),
+            task_dir=task_dir,
+            max_steps=2,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        return await agent.run(), model, str(ready_data_dir)
+
+    outcome, model, ready_data_dir = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 3
+    third_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(model.output_formats[2]), ensure_ascii=False)
+    assert 'call_data_analysis_assistant' in third_schema
+    assert ready_data_dir in third_schema
+    assert '===== DATA ANALYSIS RECOVERY STATUS =====' not in model.user_prompts[2]
+
+
+def test_ineligible_data_dir_repairs_same_step_without_path_or_action_effect(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel]:
+        task_dir = tmp_path / 'ineligible-data-dir'
+        ready_data_dir = task_dir / 'data_artifacts' / 'download-ready-artifact'
+        ready_data_dir.mkdir(parents=True)
+        model = _FakeModel('direct', [_initial_wait(), _ineligible_data_dir_attempt(), _successful_finish()])
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='ineligible-data-dir',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_RecoveryRuntime(ready_data_dir),
+            task_dir=task_dir,
+            max_steps=2,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        return await agent.run(), model
+
+    outcome, model = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 3
+    assert len(outcome.steps) == 2
+    assert outcome.steps[0]['action']['action'] == 'wait'
+    assert 'STRUCTURED DECISION REPAIR FEEDBACK' in model.user_prompts[2]
+    assert '错误地宣称文档可以分析' not in json.dumps(outcome.steps, ensure_ascii=False)
+
+
+def test_static_analysis_rejection_preserves_diagnostic_then_activates_capability_gate(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel]:
+        task_dir = tmp_path / 'static-analysis-rejection'
+        ready_data_dir = task_dir / 'data_artifacts' / 'download-ready-artifact'
+        ready_data_dir.mkdir(parents=True)
+        model = _FakeModel('direct', [_initial_wait(), _eligible_data_dir_attempt(str(ready_data_dir)), _successful_finish()])
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='static-analysis-rejection',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_RecoveryRuntime(ready_data_dir),
+            task_dir=task_dir,
+            max_steps=3,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+            data_analysis_assistant=_UnavailableAnalysisAssistant(),
+        )
+        return await agent.run(), model
+
+    outcome, model = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert json.loads(outcome.steps[1]['outcome'])['status'] == 'analysis_unavailable'
+    assert 'call_data_analysis_assistant' not in json.dumps(
+        SchemaOptimizer.create_optimized_json_schema(model.output_formats[2]), ensure_ascii=False
+    )
+    assert '===== DATA ANALYSIS RECOVERY STATUS =====' in model.user_prompts[2]
+
+
+def test_concurrent_agents_keep_data_analysis_capabilities_isolated(tmp_path: Path) -> None:
+    async def scenario() -> tuple[Any, _FakeModel, Any, _FakeModel, str]:
+        unavailable_model = _FakeModel('unavailable', [_successful_finish()])
+        unavailable_agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='concurrent-unavailable',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=unavailable_model,  # type: ignore[arg-type]
+            runtime=_Runtime(),
+            task_dir=tmp_path / 'concurrent-unavailable',
+            max_steps=1,
+            model_timeout_seconds=1.0,
+            chart_network_inspector=object(),
+        )
+        ready_task_dir = tmp_path / 'concurrent-ready'
+        ready_data_dir = ready_task_dir / 'data_artifacts' / 'initial-ready-artifact'
+        ready_data_dir.mkdir(parents=True)
+        ready_model = _FakeModel('ready', [_successful_finish()])
+        ready_agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=1,
+                task_id='concurrent-ready',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=ready_model,  # type: ignore[arg-type]
+            runtime=_ReadyRuntime(ready_data_dir),
+            task_dir=ready_task_dir,
+            max_steps=1,
+            model_timeout_seconds=1.0,
+            chart_network_inspector=object(),
+        )
+        unavailable_outcome, ready_outcome = await asyncio.gather(unavailable_agent.run(), ready_agent.run())
+        return unavailable_outcome, unavailable_model, ready_outcome, ready_model, str(ready_data_dir)
+
+    unavailable_outcome, unavailable_model, ready_outcome, ready_model, ready_data_dir = asyncio.run(scenario())
+
+    assert unavailable_outcome.status == ready_outcome.status == 'SUCCESS'
+    unavailable_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(unavailable_model.output_formats[0]))
+    ready_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(ready_model.output_formats[0]))
+    assert 'call_data_analysis_assistant' not in unavailable_schema
+    assert 'call_data_analysis_assistant' in ready_schema
+    assert ready_data_dir in ready_schema
+    assert 'call_data_analysis_assistant' in ACTION_PARAMETER_CONTRACTS
 
 
 def test_agent_repairs_invalid_structured_output_through_another_gateway_group(

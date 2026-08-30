@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from browser_use.webretriever.artifacts import (
 	model_prompt_log_metadata,
 	prompt_text_lines,
 )
+from browser_use.webretriever.browser import is_browser_session_closed_error
 from browser_use.webretriever.exploration_paths import (
 	ExplorationPathError,
 	ExplorationPathTracker,
@@ -74,6 +76,42 @@ _FINISH_FALSE_RETRY_SUFFIX = '这个任务是一定可以完成的，当前尚�
 _NON_RETRYABLE_ANALYSIS_STATUSES = frozenset({'analysis_unavailable', 'invalid_manifest', 'no_tabular_data'})
 _INVALID_DECISION_SNAPSHOT_MAX_CHARACTERS = 8_000
 _INVALID_DECISION_SNAPSHOT_TRUNCATION_MARKER = '\n...[previous_invalid_decision truncated]...\n'
+_ANALYSIS_NOT_READY_RECOVERY = (
+	'数据分析助手当前不可用：本任务没有可用的 ready_data_dir。\n'
+	'downloads/ 下的文档不是可分析数据工件；禁止再次调用 call_data_analysis_assistant，'
+	'直到观察中出现新的、完整的 ready_data_dir。\n'
+	'请改用文档取证：find_text / read_element，或继续在官方一方来源中查找任务所需证据。'
+)
+
+
+def _action_contracts_for_data_capability(
+	eligible_data_dirs: tuple[str, ...],
+) -> dict[str, Any]:
+	"""Return a request-local action set without mutating the global contract."""
+
+	contracts = dict(ACTION_PARAMETER_CONTRACTS)
+	if not eligible_data_dirs:
+		contracts.pop('call_data_analysis_assistant')
+	return contracts
+
+
+@lru_cache(maxsize=256)
+def _capability_gated_output_format(
+	*,
+	initial_page: bool,
+	eligible_data_dirs: tuple[str, ...],
+) -> type[BaseModel]:
+	"""Build an immutable provider schema variant for one task-local capability state."""
+
+	base = InitialPageAgentDecisionEnvelope if initial_page else AgentDecisionEnvelope
+	contracts = _action_contracts_for_data_capability(eligible_data_dirs)
+	attributes: dict[str, Any] = {'__structured_action_parameter_contracts__': contracts}
+	if eligible_data_dirs:
+		attributes['__structured_action_field_enums__'] = {
+			'call_data_analysis_assistant': {'data_dir': eligible_data_dirs}
+		}
+	name = ('InitialPage' if initial_page else 'Standard') + 'CapabilityGatedAgentDecisionEnvelope'
+	return type(name, (base,), attributes)
 
 
 def _model_output_protocol(
@@ -664,6 +702,38 @@ def _format_runtime_action_result(result: WebRetrieverActionResult | str) -> tup
 	return text, None, text.startswith('ERROR:')
 
 
+def _is_closed_browser_runtime_result(result: WebRetrieverActionResult | str) -> bool:
+	"""Recognize a runtime action result that needs session re-grounding."""
+
+	return isinstance(result, WebRetrieverActionResult) and (
+		result.error_type == 'BrowserSessionClosed' or is_browser_session_closed_error(result.error)
+	)
+
+
+class _RefundableStepCounter:
+	"""Iterator that can give a closed-target recovery its step back once."""
+
+	def __init__(self, maximum: int) -> None:
+		self._maximum = maximum
+		self._next = 0
+		self._last: int | None = None
+
+	def __iter__(self) -> _RefundableStepCounter:
+		return self
+
+	def __next__(self) -> int:
+		if self._next >= self._maximum:
+			raise StopIteration
+		self._last = self._next
+		self._next += 1
+		return self._last
+
+	def refund_last(self) -> None:
+		if self._last is None or self._next != self._last + 1:
+			raise RuntimeError('Only the current step may be refunded')
+		self._next = self._last
+
+
 def _observation_hash(rendered_observation: str) -> str:
 	"""Stable browser-state identity used only for exact-action loop protection."""
 
@@ -926,6 +996,7 @@ class ProtocolIIIAgent:
 		self._trusted_data_manifests: dict[str, str] = {}
 		self._ready_data_dirs: set[str] = set()
 		self._unavailable_analysis_data_dirs: set[str] = set()
+		self._analysis_not_ready_recovery_ready_dirs: frozenset[str] | None = None
 		self._data_artifact_filters: dict[str, dict[str, Any]] = {}
 		self._announced_data_artifact_ids: set[str] = set()
 		self._announced_download_timeout_keys: set[str] = set()
@@ -1097,6 +1168,26 @@ class ProtocolIIIAgent:
 		except (FileNotFoundError, OSError):
 			return None
 		return key if key in self._ready_data_dirs else None
+
+	def _eligible_data_dirs(self) -> tuple[str, ...]:
+		"""Return the complete task-local analysis inputs that remain callable."""
+
+		return tuple(sorted(self._ready_data_dirs - self._unavailable_analysis_data_dirs))
+
+	def _activate_analysis_not_ready_recovery(self) -> None:
+		"""Latch document-evidence recovery until a newly observed eligible directory exists."""
+
+		if self._analysis_not_ready_recovery_ready_dirs is None:
+			self._analysis_not_ready_recovery_ready_dirs = frozenset(self._ready_data_dirs)
+
+	def _analysis_not_ready_recovery_notice(self) -> str:
+		baseline = self._analysis_not_ready_recovery_ready_dirs
+		if baseline is None:
+			return ''
+		if any(data_dir not in baseline for data_dir in self._eligible_data_dirs()):
+			self._analysis_not_ready_recovery_ready_dirs = None
+			return ''
+		return _ANALYSIS_NOT_READY_RECOVERY
 
 	def _is_ready_data_dir(self, data_dir: str | None) -> bool:
 		return self._ready_data_dir_key(data_dir) is not None
@@ -1386,6 +1477,7 @@ class ProtocolIIIAgent:
 		prompt_document: PromptDocument,
 		screenshot_path: Path | None,
 		output_protocol_variant: str,
+		analysis_capability: Mapping[str, Any],
 		excluded_service_groups: Collection[str] = (),
 	) -> int:
 		"""Atomically persist one model request before it is submitted.
@@ -1415,6 +1507,7 @@ class ProtocolIIIAgent:
 					'prompt': prompt_text_lines(prompt_document.text),
 					'image': image,
 					'output_protocol_variant': output_protocol_variant,
+					'analysis_capability': dict(analysis_capability),
 				}
 			)
 		else:
@@ -1429,6 +1522,7 @@ class ProtocolIIIAgent:
 						'metrics': dict(prompt_document.metrics),
 					},
 					'image': image,
+					'analysis_capability': dict(analysis_capability),
 				}
 			)
 		if excluded_service_groups:
@@ -1440,13 +1534,21 @@ class ProtocolIIIAgent:
 		return prompt_index
 
 	@staticmethod
-	def _decision_output_format(context: StepContext) -> type[BaseModel]:
+	def _decision_output_format(
+		context: StepContext,
+		*,
+		eligible_data_dirs: tuple[str, ...] | None = None,
+	) -> type[BaseModel]:
 		"""Select the provider schema matching this observation's path state."""
 
 		review = context.exploration_review
-		if not context.answer_priority_mode and review is not None and review.trigger == 'initial_page':
-			return InitialPageAgentDecisionEnvelope
-		return AgentDecisionEnvelope
+		initial_page = not context.answer_priority_mode and review is not None and review.trigger == 'initial_page'
+		if eligible_data_dirs is None:
+			return InitialPageAgentDecisionEnvelope if initial_page else AgentDecisionEnvelope
+		return _capability_gated_output_format(
+			initial_page=initial_page,
+			eligible_data_dirs=eligible_data_dirs,
+		)
 
 	@staticmethod
 	def _output_protocol_variant(output_format: type[BaseModel]) -> str:
@@ -1515,20 +1617,28 @@ class ProtocolIIIAgent:
 					)
 				)
 			)
+		eligible_data_dirs = self._eligible_data_dirs()
+		action_contracts = _action_contracts_for_data_capability(eligible_data_dirs)
+		system_document = self.prompt_composer.system_for_action_contracts(action_contracts)
 		messages = [
-			SystemMessage(content=self.system_prompt),
+			SystemMessage(content=system_document.text),
 			UserMessage(content=content),
 		]
 		model_call_timeout = min(self.model_timeout_seconds, self._remaining_task_seconds())
 		if model_call_timeout <= 0:
 			raise _DecisionTaskDeadline()
-		output_format = self._decision_output_format(context)
+		output_format = self._decision_output_format(context, eligible_data_dirs=eligible_data_dirs)
+		analysis_capability = {
+			'status': 'available' if eligible_data_dirs else 'unavailable',
+			'eligible_data_dirs': list(eligible_data_dirs),
+		}
 		service_metadata: dict[str, str] = {}
 		prompt_index = self._record_model_prompt(
 			step=step,
 			prompt_document=prompt_document,
 			screenshot_path=raw_path,
 			output_protocol_variant=self._output_protocol_variant(output_format),
+			analysis_capability=analysis_capability,
 			excluded_service_groups=excluded_service_groups,
 		)
 		model_call_started_at = time.monotonic()
@@ -1644,10 +1754,20 @@ class ProtocolIIIAgent:
 		atomic_write_json(exploration_paths_path, exploration_tracker.payload())
 		verification = VerificationController(target_url=self.task.website)
 
-		for step in range(self.max_steps):
+		step_counter = _RefundableStepCounter(self.max_steps)
+		for step in step_counter:
 			try:
 				observation = await self.runtime.observe(step)
 			except Exception as exc:
+				if is_browser_session_closed_error(exc):
+					try:
+						recovered = await self.runtime.recover_live_task_page()
+					except Exception:
+						recovered = False
+					if recovered:
+						step_counter.refund_last()
+						last_outcome = 'Browser target closed; a surviving task page was re-grounded. Observe it before deciding again.'
+						continue
 				outcome.status = 'FAIL_BROWSER'
 				outcome.error = f'Observation failed: {type(exc).__name__}: {exc}'
 				break
@@ -1778,6 +1898,7 @@ class ProtocolIIIAgent:
 							answer_priority_mode=answer_priority_mode,
 							data_artifact_notice=data_artifact_notice,
 							download_recovery_notice=download_recovery_notice,
+							analysis_not_ready_recovery=self._analysis_not_ready_recovery_notice(),
 						),
 						screenshot=screenshot,
 						raw_path=raw_path if screenshot else None,
@@ -1874,6 +1995,60 @@ class ProtocolIIIAgent:
 					outcome.status = 'FAIL_MODEL'
 					outcome.error = model_error
 					break
+				eligible_data_dirs = self._eligible_data_dirs()
+				if decision.action == 'call_data_analysis_assistant' and not eligible_data_dirs:
+					self._activate_analysis_not_ready_recovery()
+					last_outcome = json.dumps(
+						{
+							'action': decision.action,
+							'status': 'analysis_not_ready',
+							'error': 'this task has no eligible ready_data_dir',
+							'recovery': _ANALYSIS_NOT_READY_RECOVERY,
+						},
+						ensure_ascii=False,
+						separators=(',', ':'),
+					)
+					outcome.steps.append(
+						{
+							'step': step,
+							'url': observation.url,
+							'thought': decision.thought,
+							'action': _decision_action_payload(decision),
+							'current_path_id': decision.current_path_id,
+							'decision_summary': decision.decision_summary,
+							'path_json_action': _path_json_action_artifact_payload(decision),
+							'path_json_action_result': {
+								'operations': [],
+								'blocked_reason': 'analysis action rejected before path updates because no eligible ready_data_dir exists',
+							},
+							'gate_rejected': True,
+							'outcome': last_outcome,
+						}
+					)
+					continue
+
+				if decision.action == 'call_data_analysis_assistant' and decision.data_dir not in eligible_data_dirs:
+					diagnostic = 'data_dir must be one of the current eligible ready_data_dir values'
+					model_error = f'Model response omitted or violated the data-directory contract: {diagnostic}'
+					self._record_model_result(
+						step=step,
+						prompt_index=prompt_index,
+						started_at=model_call_started_at,
+						error=model_error,
+					)
+					consecutive_model_output_errors += 1
+					structured_decision_repair_feedback = StructuredDecisionRepairFeedback(diagnostic=diagnostic)
+					last_outcome = (
+						'ERROR: The previous model decision output was invalid_decision because its data_dir was not eligible; '
+						'no browser action or path update was executed. Correct data_dir and return one valid AgentDecision; '
+						'this retry does not consume a step.'
+					)
+					if consecutive_model_output_errors >= self.max_consecutive_model_output_errors:
+						outcome.status = 'FAIL_MODEL'
+						outcome.error = model_error
+						break
+					continue
+
 				path_error: str | None = None
 				answer = (decision.answer or '').strip()
 				evidence = [item.strip() for item in (decision.evidence or []) if item.strip()]
@@ -2083,6 +2258,7 @@ class ProtocolIIIAgent:
 			outcome.steps.append(step_record)
 			action_failed = False
 			action_result_payload: dict[str, Any] | None = None
+			browser_session_interrupted: str | None = None
 			try:
 				if decision.action == 'find_chart_data_requests':
 					budget = self._chart_action_budget(decision.action, cursor=decision.chart_cursor is not None)
@@ -2196,6 +2372,8 @@ class ProtocolIIIAgent:
 							analysis_payload = None
 						if _is_non_retryable_analysis_status(analysis_payload):
 							self._unavailable_analysis_data_dirs.add(ready_data_dir)
+							if not self._eligible_data_dirs():
+								self._activate_analysis_not_ready_recovery()
 							analysis_payload = dict(analysis_payload)
 							analysis_payload['recovery'] = (
 								'do not retry this data_dir with call_data_analysis_assistant; use page content, '
@@ -2207,6 +2385,29 @@ class ProtocolIIIAgent:
 							action_failed = not isinstance(analysis_payload, dict) or analysis_payload.get('status') != 'ok'
 				else:
 					runtime_result = await self.runtime.execute(decision)
+					if _is_closed_browser_runtime_result(runtime_result):
+						try:
+							recovered = await self.runtime.recover_live_task_page()
+						except Exception:
+							recovered = False
+						if recovered:
+							if outcome.actions:
+								outcome.actions.pop()
+							if outcome.thoughts:
+								outcome.thoughts.pop()
+							if outcome.steps and outcome.steps[-1] is step_record:
+								outcome.steps.pop()
+							if recent_signatures and recent_signatures[-1] == (action_intent, observation_fingerprint):
+								recent_signatures.pop()
+							last_action_signature = None
+							repeated_action_count = 0
+							step_counter.refund_last()
+							last_outcome = (
+								'Browser target closed during the previous action; a surviving task page was re-grounded. '
+								'Observe it before deciding again.'
+							)
+							continue
+						browser_session_interrupted = runtime_result.error or runtime_result.summary
 					last_outcome, action_result_payload, action_failed = _format_runtime_action_result(runtime_result)
 			except TimeoutError:
 				last_outcome = json.dumps(
@@ -2215,6 +2416,29 @@ class ProtocolIIIAgent:
 				)
 				action_failed = True
 			except Exception as exc:
+				if is_browser_session_closed_error(exc):
+					try:
+						recovered = await self.runtime.recover_live_task_page()
+					except Exception:
+						recovered = False
+					if recovered:
+						if outcome.actions:
+							outcome.actions.pop()
+						if outcome.thoughts:
+							outcome.thoughts.pop()
+						if outcome.steps and outcome.steps[-1] is step_record:
+							outcome.steps.pop()
+						if recent_signatures and recent_signatures[-1] == (action_intent, observation_fingerprint):
+							recent_signatures.pop()
+						last_action_signature = None
+						repeated_action_count = 0
+						step_counter.refund_last()
+						last_outcome = (
+							'Browser target closed during the previous action; a surviving task page was re-grounded. '
+							'Observe it before deciding again.'
+						)
+						continue
+					browser_session_interrupted = str(exc)
 				last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
 				action_failed = True
 
@@ -2240,6 +2464,13 @@ class ProtocolIIIAgent:
 				exploration_tracker,
 				decision=decision,
 			)
+			if browser_session_interrupted is not None:
+				outcome.status = 'FAIL_BROWSER'
+				outcome.error = (
+					'Browser session closed with no surviving task pages: '
+					f'{browser_session_interrupted}'
+				)
+				break
 			if action_failed:
 				consecutive_errors += 1
 			else:

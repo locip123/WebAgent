@@ -1,72 +1,142 @@
 [
-    {
-    "task_idx": 10,
-    "task_id": "52aada65ef7b4b109d32d20477cfd3ba",
-    "website": "https://data.stats.gov.cn",
-    "task": "2025年11月的中国西部地区的原盐产量排名前五的省份各自的当月产量是多少万吨？",
-    "answer": "第一名：青海省-52.43\t\t\n第二名：四川省-19.42\t\t\n第三名：新疆维吾尔自治区-17.63\t\t\n第四名：云南省-14.57\t\t\n第五名：重庆市-13.31"
+  {
+    "task_idx": 30,
+    "task_id": "d47e8b197478442da72f23b1e0079619",
+    "website": "https://cn.silabs.com",
+    "task": "获取产品\"Simplicity Studio\"1.0.0版本文档的入门指南的SETTINGS的完整内容。",
+    "answer": "SETTINGS\nAdd, remove, run, refresh, and test adapter packs.\nSet your preferred IDE.\nAdjust the timeouts for offline content.\nCheck the SDKs available for building project configurations.\nAdjust the component visibility filters for your software components.\nSet the theme for Simplicity Studio to either light or dark.\nGrant permission to have your user experience tracked anonymously or not."
   },
   {
-    "task_idx": 11,
-    "task_id": "8ac3d5bf57da470ea5d4879d5fcce527",
-    "website": "https://catalog.mit.edu/",
-    "task": "找到麻省理工学院（MIT） 2021-2022学年的课程目录（Course Catalog），查找计算机科学系的课程编号**‘6.006’ (Introduction to Algorithms)，列出该课程描述中明确要求的直接先修课程（Prerequisites）**的编号。如果先修课之间是‘或（OR）’的关系，请完整保留这种逻辑描述。",
-    "answer": "先修课程：6.042[J] AND（6.0001 OR 6.009）\n\n6.042[J]：计算机科学数学(Mathematics for Computer Science)\n6.0001：Python计算机科学编程导论(Introduction to Computer Science Programming in Python)\n6.009：编程基础(Fundamentals of Programming)"
+    "task_idx": 31,
+    "task_id": "91a2ccddc5444e0f8716d158f7acad13",
+    "website": "https://travel.state.gov/content/travel.html",
+    "task": "在财政年度1986-2025年中，美国护照申请数量最多的是哪一年？",
+    "answer": "2025（FY2025）"
   },
   {
-    "task_idx": 12,
-    "task_id": "6f12102e36264330afd006d889027770",
-    "website": "https://www.zgdypw.cn",
-    "task": "找到2025年12月全中国内地新建影城，并列出银幕数量至少10块的影院简称，并列出对应银幕数量。",
-    "answer": "山东省济南市槐荫区UME影城龙湖西城天街IMAX店\t11\n湖南省岳阳市岳阳楼区星鑫国际影城\t12\n山西省太原市小店区SFC上影国际影城（太原昌盛万达店）\t12"
+    "task_idx": 32,
+    "task_id": "46cf576105184aeb8ca6ec9138139202",
+    "website": "https://www.questmobile.com.cn/",
+    "task": "查看《QuestMobile 2025潜力营销价值媒介研究》报告，找出2025年AIGC行业月活跃用户规模最大的一个月。",
+    "answer": "2025-03"
   },
   {
-    "task_idx": 13,
-    "task_id": "636c19752cc042a08930ce59cb277479",
-    "website": "https://www.iata.org/",
-    "task": "找到2025年IATA发布的可持续性分析中关于\"STIP proposals\"的分析的Credit编号。",
-    "answer": "Ugis-Riba_shutterstock_273008201"
+    "task_idx": 33,
+    "task_id": "bd70d0af63804d288b83c93562772f5b",
+    "website": "https://www.cbndata.com/",
+    "task": "找到CBNData榜单2023年双11品牌号召力榜食品饮料篇top15中首字母前三的品牌。",
+    "answer": "第一：AIRMETER（空刻）\n第二：白象\n第三：大希地"
   },
   {
-    "task_idx": 14,
-    "task_id": "bc620647083742cd8332c8dcfa40582c",
-    "website": "https://www.sf.gov/departments--department-building-inspection",
-    "task": "查询旧金山市地址位于701 Post St的建筑在2015年到2025年所有的建筑许可（Building Permits）申请记录，并找出和‘抗震改造’（Seismic Retrofit）相关的记录，给出所有申请的申请编号(Application Number)，申请描述(Description)和最后行动日期(action date)",
-    "answer": "201612195301，RESTORE BASEMENT RETAINING WALL & STAIR STRUCTURE DRAWING S2.1, S2.2 SEISMIC UPGRADE WORK REPAIRS - BASEMENT LEVELS, NOT VISIBLE，2017-03-07\n201805179391，RECOMMENCEMENT AND COMPLETION OF WORK APPROVED UNDER PA#201612195301，2018-05-17\n201807235225，REVISED STRUCTURAL DRAWING FOR PERMIT APP. #201805179391 & 201612195301. REVISION REQUIRED TO MEET EXISTING BUILDING CONDITIONS. NO CHANGE IN SCOPE OF WORK.，2018-08-01"
+    "task_idx": 34,
+    "task_id": "4bb4eceaf3494fc2b8cc8e472c438ae7",
+    "website": "https://acl.gov/",
+    "task": "查询老龄化、独立生活和残疾（AGID）数据门户，查找2021年阿拉巴马州和加利福利亚分别的老年人照护者可获得的援助（每位服务对象可获得的单位数量）。",
+    "answer": "阿拉巴马州：34.17\n加利福利亚州：1.78"
   },
   {
-    "task_idx": 15,
-    "task_id": "8b6dbf11d1f04652b0522f76fa7761d4",
-    "website": "https://mi.talkingdata.com",
-    "task": "在2020年发布的《TalkingData-“三十而已”女性洞察报告》中，\"30+\"女性整体移动应用类型覆盖率前三的应用类型是什么。",
-    "answer": "第一名：通讯社交\n第二名：移动视频\n第三名：移动工具"
+    "task_idx": 35,
+    "task_id": "c5063f6cf11144ff8f242cddd33c9f4f",
+    "website": "https://data.cityofnewyork.us/",
+    "task": "查询NYC 311投诉数据库中，2024年1月曼哈顿区(Manhattan)噪音(Noise)类别投诉总数。",
+    "answer": "11674"
   },
   {
-    "task_idx": 16,
-    "task_id": "9a81aaa6061f42fe901fb61bebb0c457",
-    "website": "https://dot.ca.gov/",
-    "task": "查询加利福尼亚州交通局合同编号为‘04-0K1204’的建设项目的‘Bid Summary’（投标汇总）文件（通常是PDF或Excel），\n在该文件中找出排名第二（2nd Low Bidder）的承包商名称，以及他们对‘Item 12’（第12项工程条目，通常是特定材料或施工项）所报的单价（Unit Price）是多少？",
-    "answer": "MIKE BROWN ELECTRIC CO.\n他们对 Item 12 的单价\nItem 12 (0012): PREPARE WATER POLLUTION CONTROL PROGRAM（准备水污染控制计划）\n\nMIKE BROWN ELECTRIC CO. 的单价：$525.00（一次性总价 Lump Sum）"
+    "task_idx": 36,
+    "task_id": "c022cb291f864aa1a22138ec449bedf9",
+    "website": "https://data.bls.gov/",
+    "task": "查询美国劳工统计局(BLS)数据，2024年12月Information行业就业人数（季节性调整，千人）。",
+    "answer": "2895（千人）"
   },
   {
-    "task_idx": 17,
-    "task_id": "eeb5049e10c5416c9c83a730fa850dd1",
-    "website": "https://www.shanghairanking.cn",
-    "task": "查看2024年软科中国大学哲学（专业编号：010101）专业在上海市排名前3的学校是哪些。",
-    "answer": "第一名：复旦大学\n第二名：华东师范大学\n第三名：同济大学"
+    "task_idx": 37,
+    "task_id": "ff93022b2eea467fbde813744775c743",
+    "website": "https://www.sec.gov/",
+    "task": "查询SEC EDGAR数据库中，NVIDIA公司首次提交10-K年报的日期",
+    "answer": "1999-04-29 00:00:00"
   },
   {
-    "task_idx": 18,
-    "task_id": "fff1c127f04a429d9301e383490acd23",
-    "website": "https://tjj.sc.gov.cn",
-    "task": "查找2025年前三季度四川主要经济指标中1-9月累计的汽油产量（万吨）。",
-    "answer": "193.1（万吨）"
+    "task_idx": 38,
+    "task_id": "27d5aa7ecf4c4dc7a417de55ada0902f",
+    "website": "https://www.eia.gov/",
+    "task": "基于EIA数据，2024年德州(Texas)原油产量最高的月份。",
+    "answer": "2024-10-01 00:00:00"
   },
   {
-    "task_idx": 19,
-    "task_id": "e67c0f2f7fc74741809a639218840d75",
-    "website": "https://www.cs.toronto.edu",
-    "task": "列出多伦多大学2025秋季周期、音乐学院、时间倾向于上午（8:00-11:59）、在圣乔治(St. George)校园上课的、可信权值(credit weight)为0.17的本科课程编号。",
-    "answer": "EMU150H1\nEMU151H1\nEMU152H1\nEMU252H1\nEMU262H1\nEMU128H1"
+    "task_idx": 39,
+    "task_id": "059f5bfb92884cd5af1a2c377d4011d7",
+    "website": "https://www.ssa.gov/",
+    "task": "查询SSA网站Wyoming州2020年男婴最流行名字第1名的出生人数。",
+    "answer": "38"
+  },
+  {
+    "task_idx": 40,
+    "task_id": "b5e170701d5540859d7d9ef8c2ce7ca3",
+    "website": "https://earthquake.usgs.gov/",
+    "task": "查询USGS地震数据库2025年1月发生的6级及以上地震总数。",
+    "answer": "7"
+  },
+  {
+    "task_idx": 41,
+    "task_id": "2c5f4f1cbd99402ab2e14d2220524761",
+    "website": "https://ec.europa.eu/eurostat/web/main/home",
+    "task": "查找欧盟国家2025-06周期25岁以下女性失业率top3的国家（经季节性调整的数据）。",
+    "answer": "第一名：西班牙\n第二名：芬兰\n第三名：罗马尼亚"
+  },
+  {
+    "task_idx": 42,
+    "task_id": "f321dc0c375441f1ad633b8f7f890cfd",
+    "website": "https://www.cbre.com/",
+    "task": "查看CBRE发布的研究\"Global Prime Office Rent Tracker\"，找到欧洲地区2025年第3季度哪一个城市的租金处于低谷，预计接下来的走势会上涨。",
+    "answer": "Dublin（都柏林）"
+  },
+  {
+    "task_idx": 43,
+    "task_id": "0e8ed2a315a640969b502ab05c72eed7",
+    "website": "https://www.pwc.com/gx/en.html",
+    "task": "查看pwc普华永道发布的报告\"Global M&A trends in health industries:2026 outlook\",找出亚太地区2016-2025e周期健康服务交易量最多的一年和对应的健康服务数量。",
+    "answer": "2023\n502"
+  },
+  {
+    "task_idx": 44,
+    "task_id": "0756c7647da24e9c89c97646c9ca7b22",
+    "website": "https://www.askci.com/",
+    "task": "找到中商情报网发布的《2025年12月食糖市场供需及价格走势分析》查看2022-2025年中国食糖国内价格及国际价格走势，找到国内价格低于国际价格的月份。",
+    "answer": "2023/11"
+  },
+  {
+    "task_idx": 45,
+    "task_id": "6302c60638fb4158a7acc2fd95dd83e9",
+    "website": "https://www.datayicai.com/",
+    "task": "找到第一财经独家数据库“高新技术企业迁入数量”，查询2022-2024年粤港澳大湾区高新技术企业迁入数量总和。",
+    "answer": "87（家）"
+  },
+  {
+    "task_idx": 46,
+    "task_id": "b11a693cbb5b4d8186a06055427df7e6",
+    "website": "https://data.cityofchicago.org/",
+    "task": "查询2024年6月芝加哥THEFT类型犯罪总数。",
+    "answer": "5489（件）"
+  },
+  {
+    "task_idx": 47,
+    "task_id": "cd0348cbf8dd478ca17c7952edd9ed99",
+    "website": "https://www.topklout.com/#/home",
+    "task": "查看克劳锐品牌社交媒体排行榜2024年4月小红书平台美妆类排名前三的品牌名称。",
+    "answer": "第一名：雅诗兰黛\n第二名：颐莲\n第三名：urara悠茉"
+  },
+  {
+    "task_idx": 48,
+    "task_id": "bb0e16d8ed8e4f13bc238524e96fd816",
+    "website": "https://www.yidaiyilu.gov.cn/",
+    "task": "查询中国一带一路网中海上丝路贸易指数在2020-03-01至2025-03-31周期，出口贸易指数的最高值和最低值。",
+    "answer": "236.07\n128.37"
+  },
+  {
+    "task_idx": 49,
+    "task_id": "201d5595d1b74c0cac7023cb5bbe13a5",
+    "website": "https://lpl.qq.com/",
+    "task": "查询2025lpl第一赛段ban率第二的英雄的胜率排第几。",
+    "answer": "17"
   }
 ]

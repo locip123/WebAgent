@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from playwright.async_api import BrowserContext, Error as PlaywrightError, Page
 
-from browser_use.webretriever.browser import BrowserRuntime, redact_cdp_url
+from browser_use.webretriever.browser import BrowserRuntime, is_browser_session_closed_error, redact_cdp_url
 from browser_use.webretriever.connection import BrowserConnector, BrowserDriver, CdpConnection
 
 __all__ = ['BrowserRecoveryDeadlineExceeded', 'CdpWorkerSession', 'TaskBrowserRequest']
@@ -58,6 +58,7 @@ class CdpWorkerSession:
 		self.connection: CdpConnection | None = None
 		self.context: BrowserContext | None = None
 		self._anchor_page: Page | None = None
+		self._recovery_required = False
 
 	@classmethod
 	async def from_connection(
@@ -81,6 +82,26 @@ class CdpWorkerSession:
 		self._anchor_page = anchor_page
 		return self
 
+	@property
+	def recovery_required(self) -> bool:
+		"""Whether a failed task requires worker-session recovery before new work."""
+
+		return self._recovery_required
+
+	async def abandon_interrupted_task(self) -> None:
+		"""Discard the old client after a task lost all of its owned pages."""
+
+		await self._invalidate_connection()
+		self._recovery_required = True
+
+	async def recover_before_next_task(self, *, deadline_monotonic: float) -> None:
+		"""Rebuild a clean CDP context and anchor before claiming another task."""
+
+		if not self._recovery_required:
+			return
+		await self._connect_until(deadline_monotonic, fresh_context=True)
+		self._recovery_required = False
+
 	async def open_task_runtime(
 		self,
 		request: TaskBrowserRequest,
@@ -89,6 +110,8 @@ class CdpWorkerSession:
 	) -> BrowserRuntime:
 		"""Open the task start page while retaining a worker-owned anchor page."""
 
+		if self._recovery_required:
+			await self.recover_before_next_task(deadline_monotonic=deadline_monotonic)
 		while True:
 			remaining = deadline_monotonic - self._monotonic()
 			if remaining <= 0:
@@ -107,7 +130,7 @@ class CdpWorkerSession:
 					await self._invalidate_connection()
 					raise BrowserRecoveryDeadlineExceeded('Browser recovery exhausted the task deadline') from exc
 				except PlaywrightError as exc:
-					if not self._is_target_closed_error(exc):
+					if not is_browser_session_closed_error(exc):
 						raise
 					await self._invalidate_connection()
 					continue
@@ -131,7 +154,7 @@ class CdpWorkerSession:
 				await self._invalidate_connection()
 				raise BrowserRecoveryDeadlineExceeded('Browser recovery exhausted the task deadline') from exc
 			except PlaywrightError as exc:
-				if not self._is_target_closed_error(exc):
+				if not is_browser_session_closed_error(exc):
 					raise
 				remaining = deadline_monotonic - self._monotonic()
 				if remaining > 0:
@@ -146,7 +169,7 @@ class CdpWorkerSession:
 				continue
 			return runtime
 
-	async def _connect_until(self, deadline_monotonic: float) -> None:
+	async def _connect_until(self, deadline_monotonic: float, *, fresh_context: bool = False) -> None:
 		retry_delay = 1.0
 		last_error: BaseException | None = None
 		while True:
@@ -160,7 +183,7 @@ class CdpWorkerSession:
 					timeout=remaining,
 				)
 				browser = connection.browser
-				if browser.contexts:
+				if browser.contexts and not fresh_context:
 					context = browser.contexts[0]
 				else:
 					context = await asyncio.wait_for(
@@ -197,10 +220,6 @@ class CdpWorkerSession:
 			self._anchor_page = anchor_page
 			return
 
-	@staticmethod
-	def _is_target_closed_error(exc: PlaywrightError) -> bool:
-		return type(exc).__name__ == 'TargetClosedError' or 'context or browser has been closed' in str(exc).lower()
-
 	async def _invalidate_connection(self) -> None:
 		connection, self.connection = self.connection, None
 		self.context = None
@@ -220,3 +239,4 @@ class CdpWorkerSession:
 		"""Disconnect this worker's Playwright client from the evaluator browser."""
 
 		await self._invalidate_connection()
+		self._recovery_required = False

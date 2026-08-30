@@ -19,7 +19,13 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.webretriever.agent import AgentRunOutcome, ProtocolIIIAgent
 from browser_use.webretriever.artifacts import TaskArtifactWriter, atomic_write_json
-from browser_use.webretriever.browser import BrowserRuntime, cdp_headers_for_url, is_sec_url, redact_cdp_url
+from browser_use.webretriever.browser import (
+	BrowserRuntime,
+	cdp_headers_for_url,
+	is_browser_session_closed_error,
+	is_sec_url,
+	redact_cdp_url,
+)
 from browser_use.webretriever.browser_session import (
 	BrowserRecoveryDeadlineExceeded,
 	CdpWorkerSession,
@@ -151,6 +157,7 @@ class RunnerConfig:
 class TaskRunResult:
 	status: str
 	retire_worker: bool = False
+	recover_worker: bool = False
 
 
 def normalize_sec_user_agent(value: str | None) -> str | None:
@@ -416,48 +423,10 @@ def _log_diagnostic_task_failure(
 	)
 
 
-_BROWSER_DISCONNECT_MARKERS = (
-	'targetclosederror',
-	'target closed',
-	'context or browser has been closed',
-	'browser context has been closed',
-	'browser has been closed',
-	'browser closed',
-	'cdp session closed',
-	'websocket is not open',
-)
-
-
 def _is_browser_disconnect_error(error: BaseException | str | None) -> bool:
-	"""Recognize worker-level CDP loss without treating a page error as fatal.
+	"""Backward-compatible name for the shared narrow session-close predicate."""
 
-	A formal CDP worker must not reconnect and claim another task after a task has
-	started and the browser connection disappears.  Playwright exposes this as a
-	``TargetClosedError`` in some versions and as a plain ``Error`` with one of the
-	messages below in others, so inspect both the exception chain and persisted
-	status text.  Deliberately avoid the broad ``page closed`` wording: closing a
-	user-visible tab is a valid WebRetriever action.
-	"""
-	to_visit: list[BaseException | str] = [error] if error is not None else []
-	seen: set[int] = set()
-	while to_visit:
-		current = to_visit.pop(0)
-		if isinstance(current, str):
-			text = current.casefold()
-			if any(marker in text for marker in _BROWSER_DISCONNECT_MARKERS):
-				return True
-			continue
-		if id(current) in seen:
-			continue
-		seen.add(id(current))
-		type_name = type(current).__name__.casefold()
-		text = f'{type_name}: {current}'.casefold()
-		if type_name == 'targetclosederror' or any(marker in text for marker in _BROWSER_DISCONNECT_MARKERS):
-			return True
-		for related in (current.__cause__, current.__context__):
-			if related is not None and id(related) not in seen:
-				to_visit.append(related)
-	return False
+	return is_browser_session_closed_error(error)
 
 
 async def _run_task(
@@ -493,6 +462,7 @@ async def _run_task(
 		agent: ProtocolIIIAgent | None = None
 		cleanup: dict[str, Any] | None = None
 		retire_worker = False
+		recover_worker = False
 		try:
 			if config.rerun_failed and existing_status not in {None, 'PENDING'}:
 				_clear_previous_trajectory(writer)
@@ -556,7 +526,7 @@ async def _run_task(
 				and outcome.status in {'FAIL_BROWSER', 'FAIL_ACTIONS', 'FAIL_RUNTIME'}
 				and _is_browser_disconnect_error(outcome.error)
 			):
-				retire_worker = True
+				recover_worker = True
 		except BrowserRecoveryDeadlineExceeded:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 			outcome.error = 'Browser recovery exhausted the task deadline'
@@ -565,7 +535,7 @@ async def _run_task(
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 		except Exception as exc:
 			if browser_session is not None and _is_browser_disconnect_error(exc):
-				retire_worker = True
+				recover_worker = True
 			logger.exception('Task %s/%s crashed', task.task_idx, task.task_id)
 			outcome = AgentRunOutcome(
 				status='FAIL_RUNTIME',
@@ -595,11 +565,19 @@ async def _run_task(
 					)
 				except Exception as exc:
 					if browser_session is not None and _is_browser_disconnect_error(exc):
-						retire_worker = True
+						recover_worker = True
 					cleanup = {'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'}
 					logger.warning('Runtime cleanup failed for task %s: %s', task.task_id, exc)
 				cleanup['grace_seconds'] = TASK_FINALIZATION_GRACE_SECONDS
 				cleanup['elapsed_seconds'] = round(time.monotonic() - cleanup_started_at, 3)
+
+		if recover_worker and browser_session is not None and not retire_worker:
+			try:
+				await browser_session.abandon_interrupted_task()
+			except Exception as exc:
+				logger.warning('Could not discard the interrupted CDP session: %s', redact_cdp_url(str(exc)))
+				recover_worker = False
+				retire_worker = True
 
 		urls = list(runtime.visited_urls) if runtime is not None else []
 		capture = runtime.capture_payload() if runtime is not None else None
@@ -625,7 +603,7 @@ async def _run_task(
 		)
 		_log_diagnostic_task_failure(logger, task, outcome)
 		logger.info('Finished task %s/%s with status %s', task.task_idx, task.task_id, outcome.status)
-		return TaskRunResult(outcome.status, retire_worker=retire_worker)
+		return TaskRunResult(outcome.status, retire_worker=retire_worker, recover_worker=recover_worker)
 	finally:
 		try:
 			if isinstance(llm, ModelServiceRouter):
@@ -652,6 +630,18 @@ async def _consume_tasks(
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
+		if browser_session is not None and browser_session.recovery_required:
+			recovery_deadline = time.monotonic() + TASK_FINALIZATION_GRACE_SECONDS
+			try:
+				await browser_session.recover_before_next_task(deadline_monotonic=recovery_deadline)
+			except Exception as exc:
+				logger.error(
+					'Browser worker recovery failed within its %g-second window; retiring worker %s: %s',
+					TASK_FINALIZATION_GRACE_SECONDS,
+					worker_id,
+					redact_cdp_url(f'{type(exc).__name__}: {exc}'),
+				)
+				return
 		try:
 			task = queue.get_nowait()
 		except asyncio.QueueEmpty:
@@ -688,6 +678,8 @@ async def _consume_tasks(
 				if task_result.retire_worker:
 					logger.error('Browser session became unusable; retiring worker %s', worker_id)
 					return
+				if task_result.recover_worker:
+					logger.warning('Browser session interrupted; recovering worker %s before the next task', worker_id)
 			except Exception as exc:
 				# Artifact I/O and other runner-level failures must not abandon the
 				# remainder of this worker's one-shot task shard.

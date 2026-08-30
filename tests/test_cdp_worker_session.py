@@ -219,6 +219,58 @@ def test_cdp_worker_session_keeps_the_sandbox_alive_between_tasks(tmp_path: Path
 	asyncio.run(scenario())
 
 
+def test_cdp_worker_session_rebuilds_a_fresh_context_after_interruption(tmp_path: Path) -> None:
+	async def scenario() -> None:
+		server = await asyncio.start_server(_serve_page, '127.0.0.1', 0)
+		website = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/'
+		with tempfile.TemporaryDirectory(prefix='wr-cdp-worker-recovery-') as profile:
+			profile_dir = Path(profile)
+			async with async_playwright() as playwright:
+				process = await asyncio.create_subprocess_exec(
+					playwright.chromium.executable_path,
+					'--headless=new',
+					'--no-sandbox',
+					'--disable-gpu',
+					'--remote-debugging-port=0',
+					f'--user-data-dir={profile_dir}',
+					'about:blank',
+					stdout=asyncio.subprocess.DEVNULL,
+					stderr=asyncio.subprocess.DEVNULL,
+				)
+				try:
+					endpoint = await _wait_for_devtools_port(profile_dir)
+					session = CdpWorkerSession(
+						cdp_url=endpoint,
+						driver=BrowserDriver.PLAYWRIGHT,
+						headers=None,
+						logger=logging.getLogger('cdp-worker-recovery-test'),
+						connector=BrowserConnector(),
+					)
+					try:
+						first = await _task_runtime(session, website=website, task_dir=tmp_path / 'interrupted-first')
+						old_context = session.context
+						await first.close(timeout_seconds=5)
+						await session.abandon_interrupted_task()
+						assert session.recovery_required is True
+						await session.recover_before_next_task(deadline_monotonic=time.monotonic() + 10)
+						assert session.recovery_required is False
+						assert session.context is not old_context
+						second = await _task_runtime(session, website=website, task_dir=tmp_path / 'interrupted-second')
+						assert second.page is not None
+						assert await second.page.text_content('body') == 'session-alive'
+						await second.close(timeout_seconds=5)
+					finally:
+						await session.close()
+				finally:
+					if process.returncode is None:
+						process.terminate()
+						await process.wait()
+		server.close()
+		await server.wait_closed()
+
+	asyncio.run(scenario())
+
+
 def test_cdp_worker_session_recovers_before_the_task_deadline(tmp_path: Path) -> None:
 	async def scenario() -> None:
 		server = await asyncio.start_server(_serve_page, '127.0.0.1', 0)

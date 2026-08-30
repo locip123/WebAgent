@@ -51,6 +51,8 @@ __all__ = [
 	'BrowserRuntime',
 	'ElementRef',
 	'cdp_headers_for_url',
+	'is_browser_session_closed_error',
+	'is_task_page_unavailable_error',
 	'is_sec_url',
 	'is_forbidden_search_url',
 	'redact_cdp_url',
@@ -145,6 +147,10 @@ class _ArchiveResourceLimitError(RuntimeError):
 	"""Raised when a ZIP member exceeds an extraction resource budget."""
 
 
+class _TaskPageUnavailableError(RuntimeError):
+	"""Raised when a started runtime no longer owns an active task page."""
+
+
 @dataclass(slots=True)
 class _PendingNavigation:
 	page: Page
@@ -218,6 +224,83 @@ def redact_cdp_url(cdp_url: str) -> str:
 	"""Redact CDP credentials without otherwise rewriting the URL."""
 
 	return _TOKEN_RE.sub(rf'\1{_REDACTED}', str(cdp_url))
+
+
+_BROWSER_SESSION_CLOSED_MARKERS = (
+	'targetclosederror',
+	'target closed',
+	'context or browser has been closed',
+	'browser context has been closed',
+	'browser has been closed',
+	'browser session closed',
+	'context closed',
+	'cdp session closed',
+	'websocket is not open',
+)
+_TASK_PAGE_UNAVAILABLE_MARKERS = (
+	'no active task-owned page is available',
+	# Kept for task artifacts emitted before the explicit error above was added.
+	'call browserruntime.start(website) first',
+)
+
+
+def is_browser_session_closed_error(error: BaseException | str | None) -> bool:
+	"""Whether Playwright reports that its target, context, or browser closed.
+
+	The match intentionally excludes generic ``page closed`` text: closing a
+	user-visible tab is a valid action, while a TargetClosedError or an explicit
+	connection/context-close message means the executor lost its browser target.
+	"""
+
+	to_visit: list[BaseException | str] = [error] if error is not None else []
+	seen: set[int] = set()
+	while to_visit:
+		current = to_visit.pop(0)
+		if isinstance(current, str):
+			if any(marker in current.casefold() for marker in _BROWSER_SESSION_CLOSED_MARKERS):
+				return True
+			continue
+		if id(current) in seen:
+			continue
+		seen.add(id(current))
+		type_name = type(current).__name__.casefold()
+		text = f'{type_name}: {current}'.casefold()
+		if type_name == 'targetclosederror' or any(marker in text for marker in _BROWSER_SESSION_CLOSED_MARKERS):
+			return True
+		for related in (current.__cause__, current.__context__):
+			if related is not None and id(related) not in seen:
+				to_visit.append(related)
+	return False
+
+
+def is_task_page_unavailable_error(error: BaseException | str | None) -> bool:
+	"""Whether a started task has lost every page it owns.
+
+	This deliberately differs from a closed browser context: a healthy context
+	can create a replacement task page without discarding the task's existing
+	trajectory or deadline.
+	"""
+
+	to_visit: list[BaseException | str] = [error] if error is not None else []
+	seen: set[int] = set()
+	while to_visit:
+		current = to_visit.pop(0)
+		if isinstance(current, str):
+			if any(marker in current.casefold() for marker in _TASK_PAGE_UNAVAILABLE_MARKERS):
+				return True
+			continue
+		if id(current) in seen:
+			continue
+		seen.add(id(current))
+		if isinstance(current, _TaskPageUnavailableError):
+			return True
+		text = f'{type(current).__name__}: {current}'.casefold()
+		if any(marker in text for marker in _TASK_PAGE_UNAVAILABLE_MARKERS):
+			return True
+		for related in (current.__cause__, current.__context__):
+			if related is not None and id(related) not in seen:
+				to_visit.append(related)
+	return False
 
 
 def _host_matches(host: str, domain: str) -> bool:
@@ -858,6 +941,84 @@ class BrowserRuntime:
 			screenshot_path=str(raw_path),
 			visual_screenshot_path=str(visual_path),
 		)
+
+	async def recover_live_task_page(self) -> bool:
+		"""Re-ground a task after a closed target by selecting another owned page.
+
+		Only pages registered by this runtime qualify.  In particular, the
+		worker-owned anchor page is deliberately absent from ``_owned_pages`` and
+		therefore cannot turn an interrupted task into a blank-page continuation.
+		"""
+
+		if self._closed or not self._started:
+			return False
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
+		for candidate in reversed(self._owned_pages):
+			try:
+				if candidate.is_closed() or candidate.url == _DOWNLOAD_PLACEHOLDER_URL:
+					continue
+				if is_forbidden_search_url(candidate.url):
+					continue
+				await candidate.bring_to_front()
+			except Exception:
+				continue
+			self.page = candidate
+			self.logger.warning('Browser target closed; re-grounding task on surviving page %s', redact_cdp_url(candidate.url))
+			return True
+		self.page = None
+		return False
+
+	async def restore_task_page(self) -> bool:
+		"""Recreate a lost task page in the same healthy browser context.
+
+		The logical task is not restarted: its deadline, accumulated trajectory,
+		and captured evidence remain intact.  This only replaces an owned page
+		that has disappeared after the runtime successfully started.  A closed
+		browser context is left to the worker-session recovery path.
+		"""
+
+		if self._closed or not self._started:
+			return False
+		if await self.recover_live_task_page():
+			return True
+
+		recovery_url = next(
+			(
+				url
+				for url in reversed(self.visited_urls)
+				if url != _DOWNLOAD_PLACEHOLDER_URL and not is_forbidden_search_url(url)
+			),
+			self.website,
+		)
+		if not recovery_url or is_forbidden_search_url(recovery_url):
+			return False
+
+		page: Page | None = None
+		try:
+			page = await self.context.new_page()
+			self._register_page(page, make_active=True)
+			await self._configure_owned_page(page)
+			download_started = await self._goto_exact(page, recovery_url)
+			self._record_url(
+				recovery_url if download_started or id(page) in self._pending_navigations else page.url,
+				unless_last=True,
+			)
+			if not is_forbidden_search_url(page.url):
+				self._last_safe_urls[id(page)] = page.url
+			await self._enforce_search_policy()
+			self.logger.warning(
+				'All task-owned pages were lost; restored the task in a new owned page at %s',
+				redact_cdp_url(page.url),
+			)
+			return True
+		except Exception as exc:
+			if page is not None:
+				with contextlib.suppress(Exception):
+					await page.close(run_before_unload=False)
+			self.page = None
+			self.logger.warning('Could not restore a lost task page: %s', redact_cdp_url(f'{type(exc).__name__}: {exc}'))
+			return False
 
 	async def _capture_screenshot(self, page: Page, path: Path) -> bytes:
 		try:
@@ -2099,6 +2260,8 @@ class BrowserRuntime:
 	def _error_metadata(exc: Exception) -> tuple[str, str]:
 		message = str(exc)
 		folded = message.casefold()
+		if is_browser_session_closed_error(exc):
+			return 'BrowserSessionClosed', 're_ground'
 		if 'outside the current viewport' in folded:
 			return 'ElementOutsideViewport', 'observe'
 		if 'unknown element index' in folded or 'stale' in folded or 'page changed' in folded:
@@ -3768,8 +3931,10 @@ class BrowserRuntime:
 	def _ensure_started(self) -> None:
 		if self._closed:
 			raise RuntimeError('BrowserRuntime is closed')
-		if not self._started or self.page is None:
+		if not self._started:
 			raise RuntimeError('Call BrowserRuntime.start(website) first')
+		if self.page is None:
+			raise _TaskPageUnavailableError('No active task-owned page is available; browser recovery is required')
 
 	def _record_url(self, url: str, *, unless_last: bool = False) -> None:
 		if not url or url in {'about:blank', _DOWNLOAD_PLACEHOLDER_URL}:

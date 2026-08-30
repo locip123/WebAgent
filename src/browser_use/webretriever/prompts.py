@@ -18,7 +18,7 @@ from browser_use.webretriever.exploration_paths import (
 	available_leaf_path_ids,
 	model_facing_path_tree,
 )
-from browser_use.webretriever.models import CompetitionTask, render_action_parameter_contracts
+from browser_use.webretriever.models import ActionParameterContract, CompetitionTask, render_action_parameter_contracts
 
 DEFAULT_THOUGHT_LANGUAGE = '简体中文'
 _DEFAULT_MODEL_ID = 'gpt-5.4'
@@ -95,6 +95,7 @@ class StepContext:
 	answer_priority_mode: bool = False
 	data_artifact_notice: str = ''
 	download_recovery_notice: str = ''
+	analysis_not_ready_recovery: str = ''
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,11 +209,15 @@ _SYSTEM_SECTION_BODIES: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _render_system_document(thought_language: str) -> PromptDocument:
+def _render_system_document(
+	thought_language: str,
+	*,
+	action_contracts: Mapping[str, ActionParameterContract] | None = None,
+) -> PromptDocument:
 	language = normalize_thought_language(thought_language)
 	action_contract = '\n'.join(
 		f'{index}. {line.removeprefix("- ")}'
-		for index, line in enumerate(render_action_parameter_contracts().splitlines(), start=1)
+		for index, line in enumerate(render_action_parameter_contracts(action_contracts).splitlines(), start=1)
 	)
 	sections: list[dict[str, Any]] = []
 	blocks: list[str] = []
@@ -326,6 +331,7 @@ _CHART_STATUS_GUIDANCE: dict[str, str] = {
 	'stale_state': 'Current chart status is stale_state: re-verify the visible filters and create a fresh scan.',
 	'too_large': 'Current chart status is too_large: narrow the visible chart/filter before one new scan.',
 	'timeout': 'Current chart status is timeout: use a cheaper browser-grounded fallback and preserve time to finish.',
+	'analysis_not_ready': 'Current analysis status is analysis_not_ready: follow the data-analysis recovery status and do not retry until a new ready_data_dir is observed.',
 	'invalid_data_dir': 'Current analysis status is invalid_data_dir: use only the latest ready data_dir from this task.',
 	'invalid_manifest': 'Current analysis status is invalid_manifest: return to the latest ready artifact and resolve filter provenance.',
 	'no_tabular_data': 'Current analysis status is no_tabular_data: use the official table/export or exact tooltip fallback.',
@@ -411,6 +417,7 @@ class PromptComposer:
 		# controls the normal representation; the global prompt budget may still
 		# compact it on a retry.
 		'previous_invalid_decision': 8_000,
+		'analysis_not_ready_recovery': 500,
 	}
 
 	def __init__(
@@ -447,6 +454,23 @@ class PromptComposer:
 	@property
 	def system(self) -> PromptDocument:
 		return self._system
+
+	def system_for_action_contracts(self, action_contracts: Mapping[str, ActionParameterContract]) -> PromptDocument:
+		"""Render the request-local action contract without mutating the base prompt."""
+
+		base_system = _render_system_document(self._thought_language, action_contracts=action_contracts)
+		metrics = dict(base_system.metrics)
+		metrics.update(
+			accounting_profile=self._target.accounting_profile,
+			estimated_tokens=len(self._encoding.encode(base_system.text, disallowed_special=())),
+			model_id=self._target.model_id,
+		)
+		return PromptDocument(
+			role=base_system.role,
+			text=base_system.text,
+			sections=base_system.sections,
+			metrics=metrics,
+		)
 
 	def _tokens(self, value: str) -> int:
 		return len(self._encoding.encode(value, disallowed_special=()))
@@ -651,7 +675,7 @@ class PromptComposer:
 			if action_name in {'click_xy', 'hover_xy', 'drag'}:
 				target_parts.append('coordinates')
 			if action_name == 'call_data_analysis_assistant':
-				target_parts.append('validated task-local artifact')
+				target_parts.append('data analysis input')
 			if action_name == 'finish' and action.get('success') is not None:
 				target_parts.append(f"success={str(action['success']).lower()}")
 			target = '; '.join(target_parts) or 'current context'
@@ -922,7 +946,14 @@ class PromptComposer:
 				raise PromptInputError('structured decision repair diagnostic must be a non-empty string')
 			if feedback.previous_invalid_decision is not None and not isinstance(feedback.previous_invalid_decision, str):
 				raise PromptInputError('previous_invalid_decision must be a string or None')
-		if not isinstance(context.data_artifact_notice, str) or not isinstance(context.download_recovery_notice, str):
+		if not all(
+			isinstance(value, str)
+			for value in (
+				context.data_artifact_notice,
+				context.download_recovery_notice,
+				context.analysis_not_ready_recovery,
+			)
+		):
 			raise PromptInputError('runtime notices must be strings')
 		if not isinstance(context.history, tuple) or any(not isinstance(item, Mapping) for item in context.history):
 			raise PromptInputError('history must be a tuple of mappings')
@@ -961,6 +992,12 @@ class PromptComposer:
 			self._SOURCE_LIMITS['download_recovery_notice'],
 			strategy='head_tail',
 		)
+		analysis_not_ready_recovery = self._clip_tokens(
+			'analysis_not_ready_recovery',
+			context.analysis_not_ready_recovery,
+			self._SOURCE_LIMITS['analysis_not_ready_recovery'],
+			strategy='head',
+		)
 		repair_diagnostic = (
 			self._clip_tokens(
 				'repair_diagnostic',
@@ -989,6 +1026,7 @@ class PromptComposer:
 			'history': history,
 			'data_artifact_notice': data_artifact_notice,
 			'download_recovery_notice': download_recovery_notice,
+			'analysis_not_ready_recovery': analysis_not_ready_recovery,
 			'repair_diagnostic': repair_diagnostic,
 			'previous_invalid_decision': previous_invalid_decision,
 		}
@@ -1027,6 +1065,15 @@ class PromptComposer:
 ===== END DOWNLOAD RECOVERY NOTICE =====
 """
 				if bounded['download_recovery_notice'].text
+				else ''
+			)
+			analysis_not_ready_recovery_block = (
+				f"""
+===== DATA ANALYSIS RECOVERY STATUS =====
+{bounded['analysis_not_ready_recovery'].text}
+===== END DATA ANALYSIS RECOVERY STATUS =====
+"""
+				if bounded['analysis_not_ready_recovery'].text
 				else ''
 			)
 			path_tree_block = (
@@ -1140,7 +1187,7 @@ Previous action outcome:
 {bounded['last_outcome'].text or '(none)'}
 
 			{data_artifact_block}
-{download_recovery_block}
+{download_recovery_block}{analysis_not_ready_recovery_block}
 
 Recent trajectory (compact; latest detail: Previous action outcome):
 {bounded['history'].text}

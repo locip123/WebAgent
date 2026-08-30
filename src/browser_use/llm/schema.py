@@ -80,6 +80,7 @@ class SchemaOptimizer:
 		contracts: Mapping[str, Any],
 		*,
 		action_branch_variants: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
+		action_field_enums: Mapping[str, Mapping[str, tuple[Any, ...]]] | None = None,
 	) -> dict[str, Any]:
 		"""Constrain a flat action schema without changing its wire shape.
 
@@ -100,6 +101,9 @@ class SchemaOptimizer:
 		properties = schema.get('properties')
 		if not isinstance(properties, dict) or 'action' not in properties:
 			raise ValueError('action-branch schemas require an action property')
+		if action_field_enums is not None and not isinstance(action_field_enums, Mapping):
+			raise ValueError('action field enums must be a mapping')
+		properties['action'] = {'enum': list(contracts), 'type': 'string'}
 
 		parameter_names = frozenset(
 			field_name
@@ -110,6 +114,9 @@ class SchemaOptimizer:
 		all_property_names = list(properties)
 		branches: list[dict[str, Any]] = []
 		for action, contract in contracts.items():
+			action_enums = action_field_enums.get(action, {}) if action_field_enums is not None else {}
+			if not isinstance(action_enums, Mapping):
+				raise ValueError(f'action field enums for {action!r} must be a mapping')
 			variants = action_branch_variants.get(action) if action_branch_variants is not None else None
 			if not variants:
 				variants = ({},)
@@ -118,6 +125,12 @@ class SchemaOptimizer:
 				required
 				| getattr(contract, 'optional', frozenset())
 			)
+			unknown_enum_fields = set(action_enums) - set(properties)
+			if unknown_enum_fields:
+				raise ValueError(f'action field enums do not exist: {", ".join(sorted(unknown_enum_fields))}')
+			unsupported_enum_fields = set(action_enums) - set(allowed)
+			if unsupported_enum_fields:
+				raise ValueError(f'action field enums are not allowed for {action!r}: {", ".join(sorted(unsupported_enum_fields))}')
 			for variant in variants:
 				fixed_values = variant.get('fixed_values', {})
 				non_nullable_fields = variant.get('non_nullable_fields', frozenset())
@@ -136,6 +149,11 @@ class SchemaOptimizer:
 				for field_name, field_schema in properties.items():
 					if field_name == 'action':
 						branch_properties[field_name] = {'enum': [action], 'type': 'string'}
+					elif field_name in action_enums:
+						values = action_enums[field_name]
+						if not isinstance(values, tuple) or not values or any(not isinstance(value, str) for value in values):
+							raise ValueError(f'action field enum {action}.{field_name} must be a non-empty tuple of strings')
+						branch_properties[field_name] = {'enum': list(values), 'type': 'string'}
 					elif field_name in fixed_values:
 						branch_properties[field_name] = SchemaOptimizer._fixed_value_schema(fixed_values[field_name])
 					elif field_name in non_nullable_fields or field_name in required:
@@ -311,10 +329,14 @@ class SchemaOptimizer:
 			action_branch_variants = getattr(model, '__structured_action_branch_variants__', None)
 			if action_branch_variants is not None and not isinstance(action_branch_variants, Mapping):
 				raise ValueError('action-branch variants must be a mapping')
+			action_field_enums = getattr(model, '__structured_action_field_enums__', None)
+			if action_field_enums is not None and not isinstance(action_field_enums, Mapping):
+				raise ValueError('action field enums must be a mapping')
 			properties[action_field] = SchemaOptimizer._add_action_parameter_branches(
 				field_schema,
 				action_contracts,
 				action_branch_variants=action_branch_variants,
+				action_field_enums=action_field_enums,
 			)
 
 		# Additional pass to ensure ALL objects have additionalProperties: false

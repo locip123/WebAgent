@@ -106,12 +106,17 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 }
 
 
-def render_action_parameter_contracts() -> str:
+def render_action_parameter_contracts(
+	contracts: Mapping[str, ActionParameterContract] | None = None,
+) -> str:
 	"""Render the validator's field map as concise model-facing instructions."""
 
+	active_contracts = ACTION_PARAMETER_CONTRACTS if contracts is None else contracts
 	lines: list[str] = []
 	for action in get_args(ActionName):
-		contract = ACTION_PARAMETER_CONTRACTS[action]
+		contract = active_contracts.get(action)
+		if contract is None:
+			continue
 		field_parts: list[str] = []
 		if contract.required:
 			field_parts.append('required: ' + ', '.join(sorted(contract.required)))
