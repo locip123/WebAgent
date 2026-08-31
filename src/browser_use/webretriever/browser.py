@@ -95,7 +95,12 @@ _MAX_ARCHIVE_WARNINGS = 100
 _MAX_RECENT_DIALOGS = 8
 _MAX_DIALOG_MESSAGE = 2_000
 _MAX_ACTION_RESULT_OUTPUT = 20_000
-_SCREENSHOT_RETRY_DELAY_SECONDS = 3 * 60
+# A screenshot timeout already spends up to 20s in Playwright and another 20s
+# in the bounded CDP fallback.  Waiting minutes before the one permitted retry
+# starves the task deadline and, for a crashed target, only retries a dead page.
+# Keep the delay short enough to absorb a transient compositor stall while
+# letting the agent's session-recovery path handle closed/crashed targets.
+_SCREENSHOT_RETRY_DELAY_SECONDS = 3.0
 _STATE_CHANGING_ACTIONS = frozenset(
 	{
 		'click',
@@ -224,6 +229,7 @@ def redact_cdp_url(cdp_url: str) -> str:
 _BROWSER_SESSION_CLOSED_MARKERS = (
 	'targetclosederror',
 	'target closed',
+	'target crashed',
 	'context or browser has been closed',
 	'browser context has been closed',
 	'browser has been closed',
@@ -823,6 +829,79 @@ class BrowserRuntime:
 		await self._enforce_search_policy()
 		return page
 
+	async def restart_task_page(self, website: str | None = None, *, timeout_seconds: float = 60.0) -> Page:
+		"""Recreate the task page while preserving this browser context.
+
+		This is intentionally narrower than :meth:`start`: it is only a recovery
+		operation for a runtime that was started but lost its task page before any
+		task action.  All pages owned by this runtime are discarded, while the
+		worker context (cookies, permissions, and storage state) remains intact.
+		"""
+
+		if self._closed:
+			raise RuntimeError('BrowserRuntime is closed')
+		if not self._started:
+			raise RuntimeError('Call BrowserRuntime.start(website) first')
+		if timeout_seconds <= 0:
+			raise ValueError('timeout_seconds must be greater than 0')
+		url = str(website or self.website).strip()
+		if not url:
+			raise ValueError('task website must not be empty')
+		self._validate_navigation_url(url)
+		if is_forbidden_search_url(url):
+			raise ValueError('The designated start URL is a prohibited external search engine')
+		deadline = time.monotonic() + timeout_seconds
+
+		# Invalidate all page-local state before closing pages.  Keep request and URL
+		# history so recovery remains auditable in capture.json.
+		self._element_bindings.clear()
+		self._legacy_marker_bindings_active = False
+		await self._cancel_pending_navigations(timeout_seconds=self._cleanup_remaining_seconds(deadline))
+		for page in list(self._owned_pages):
+			page_id = id(page)
+			self._last_safe_urls.pop(page_id, None)
+			for event, handler in self._page_handlers.pop(id(page), []):
+				with contextlib.suppress(Exception):
+					page.remove_listener(event, handler)
+			remaining = self._cleanup_remaining_seconds(deadline)
+			if remaining <= 0:
+				raise TimeoutError('task page restart exceeded its recovery budget')
+			if page.is_closed():
+				continue
+			try:
+				await asyncio.wait_for(page.close(run_before_unload=False), timeout=remaining)
+			except asyncio.CancelledError:
+				raise
+			except Exception as exc:
+				self.logger.warning('Could not close stale task page during recovery: %s', exc)
+				# A page that cannot be closed is unsafe to reuse.  The caller will
+				# escalate to a clean worker replacement.
+				raise
+		self._owned_pages.clear()
+		self._page_ids.clear()
+		self._page_document_generations.clear()
+		self.page = None
+
+		remaining = self._cleanup_remaining_seconds(deadline)
+		if remaining <= 0:
+			raise TimeoutError('task page restart exceeded its recovery budget')
+		page = await asyncio.wait_for(self.context.new_page(), timeout=remaining)
+		self.website = url
+		self._register_page(page, make_active=True)
+		remaining = self._cleanup_remaining_seconds(deadline)
+		if remaining <= 0:
+			raise TimeoutError('task page restart exceeded its recovery budget')
+		await asyncio.wait_for(self._configure_owned_page(page), timeout=remaining)
+		remaining = self._cleanup_remaining_seconds(deadline)
+		if remaining <= 0:
+			raise TimeoutError('task page restart exceeded its recovery budget')
+		download_started = await asyncio.wait_for(self._goto_exact(page, url), timeout=remaining)
+		self._record_url(url if download_started or id(page) in self._pending_navigations else page.url, unless_last=True)
+		if not is_forbidden_search_url(page.url):
+			self._last_safe_urls[id(page)] = page.url
+		await self._enforce_search_policy()
+		return page
+
 	async def observe(self, step: int) -> BrowserObservation:
 		"""Capture raw/annotated screenshots plus a cross-frame textual state."""
 
@@ -844,6 +923,13 @@ class BrowserRuntime:
 		except asyncio.CancelledError:
 			raise
 		except Exception as first_capture_error:
+			# A closed/crashed target is a session lifecycle failure, not a
+			# transient screenshot problem.  Propagate it immediately so the agent
+			# can re-ground on a surviving owned page (or fail fast and recycle the
+			# worker).  Retrying the same dead target after a long sleep was the
+			# source of the 180-second stalls seen in evaluation logs.
+			if is_browser_session_closed_error(first_capture_error):
+				raise
 			self.logger.warning(
 				'Observation screenshot failed for step %s; retrying the full capture chain after %gs: %s',
 				step_name,
@@ -857,7 +943,9 @@ class BrowserRuntime:
 			except asyncio.CancelledError:
 				raise
 			except Exception as retry_capture_error:
-				raw_path.unlink(missing_ok=True)
+				if is_browser_session_closed_error(retry_capture_error):
+					raise
+					raw_path.unlink(missing_ok=True)
 				visual_path.unlink(missing_ok=True)
 				self.logger.warning(
 					'Observation screenshot retry failed for step %s; continuing this step without a screenshot: %s',
@@ -880,7 +968,9 @@ class BrowserRuntime:
 					screenshot = self._annotate_element_screenshot(visual_screenshot, elements, viewport)
 					if screenshot != visual_screenshot:
 						visual_path.write_bytes(screenshot)
-			except Exception:
+			except Exception as annotation_error:
+				if is_browser_session_closed_error(annotation_error):
+					raise
 				self.logger.exception('Could not capture annotated screenshot for step %s', step_name)
 				screenshot = raw_screenshot
 
@@ -3789,6 +3879,13 @@ class BrowserRuntime:
 			return self.page
 		live = [page for page in self._live_owned_pages() if not is_forbidden_search_url(page.url)]
 		if not live:
+			if self.page is not None:
+				try:
+					page_closed = self.page.is_closed()
+				except Exception:
+					page_closed = False
+				if page_closed:
+					raise RuntimeError('BrowserRuntime active task page is closed')
 			raise RuntimeError('BrowserRuntime has no live safe page')
 		self.page = live[-1]
 		return self.page

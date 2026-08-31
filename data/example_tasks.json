@@ -1,72 +1,72 @@
 [
   {
-    "task_idx": 60,
-    "task_id": "ab957ad53d024bc290719a09cf2d2293",
-    "website": "https://www.usaspending.gov/",
-    "task": "在USASpending.gov的Award Search页面中，设置筛选：Time Period=FY 2022、Awarding Agency=Department of Education、Award Type=Grants，满足条件的记录共有多少个？",
-    "answer": "26257"
+    "task_idx": 90,
+    "task_id": "8f06f590245049f8982d47b0cc347536",
+    "website": "https://www.royalmail.com/",
+    "task": "在Royal Mail的国际邮资计算器中,选择寄往Japan,包裹重量1.5kg,选择International Tracked服务,运费是多少GBP?",
+    "answer": "27.1"
   },
   {
-    "task_idx": 61,
-    "task_id": "1fc91519a75a4a3a89e729631a879519",
-    "website": "https://www.globalforestwatch.org/",
-    "task": "在Global Forest Watch的Country Dashboard中,选择Country=Cambodia,在Tree Cover Loss柱状图中,find Year=2018对应的树木覆盖损失面积是多少公顷(ha)?",
-    "answer": "110 kha /110,000"
+    "task_idx": 91,
+    "task_id": "6aed20be626c4c6abe51f894c996e805",
+    "website": "https://www.nmpa.gov.cn/datasearch/home-index.html#category=yp",
+    "task": "在国家药监局数据查询中,选择\"国家基本药物（2018年版）\"数据库,搜索\"清热\",结果共有多少条?",
+    "answer": "125"
   },
   {
-    "task_idx": 62,
-    "task_id": "ddeda0f53e064d2695a025836a99a90f",
-    "website": "https://www.transtats.bts.gov",
-    "task": "在BTS的Airline On-Time Statistics中,选择Carrier=JetBlue Airways、Airport=Boston, MA (BOS)、Time Period=October 2019,On-Time Arrival Percentage是多少?",
-    "answer": "0.7753"
+    "task_idx": 92,
+    "task_id": "391e8411c5044392be590a4cbc4aecdf",
+    "website": "https://pubmed.ncbi.nlm.nih.gov/",
+    "task": "在PubMed高级搜索中,设置Title/Abstract=\"CRISPR-Cas9\"、Journal=\"Nature\"、Published Date=2020/01/01-2020/12/31,结果共有多少篇?",
+    "answer": "17"
   },
   {
-    "task_idx": 63,
-    "task_id": "2dd800c4249f4a46978e250ea6ed9ad2",
-    "website": "https://wid.world/",
-    "task": "在WID中选择Country=Mongolia、Indicator=Top 10% income share、Year=2010,图表上hover显示的值是多少(%)?",
-    "answer": "0.437"
+    "task_idx": 93,
+    "task_id": "35092d7bd317408da94dc1351d2872d8",
+    "website": "https://www.szse.cn/index/index.html",
+    "task": "在深圳证券交易所信息披露中,搜索公告标题含\"业绩预告\",日期=2023-01-15至2023-01-31、板块=创业板,公告共多少条?",
+    "answer": "652"
   },
   {
-    "task_idx": 64,
-    "task_id": "c85152cb6c7a4576850f4d9ecce2854a",
-    "website": "https://atlas.hks.harvard.edu/",
-    "task": "在Harvard Atlas of Economic Complexity中,选择Country=Laos、Year=2019,找到ECI Ranking值是多少?",
-    "answer": "111th"
+    "task_idx": 94,
+    "task_id": "168767547cc94638a0a5fbd5dc44f995",
+    "website": "https://www.canadapost-postescanada.ca/cpc/en/home.page?name=tgt#",
+    "task": "在Canada Post的Find a Rate中,输入From=410-410 Adelaide St W Toronto M5V 1S8、To=Germany、Size=20x10x10、Weight=2kg、Rate=Tracked Packet International,运费是多少CAD?",
+    "answer": "104.48"
   },
   {
-    "task_idx": 65,
-    "task_id": "90d9566aaddf4098ab897dd84b2ee9f2",
-    "website": "https://globalcarbonatlas.org/",
-    "task": "在Global Carbon Atlas中,选择Country=Peru、Units=tCO₂/person, 在图表中hover到Year=2018,人均碳排放值是多少tCO2/person?",
-    "answer": "1.8 tCO2/person"
+    "task_idx": 95,
+    "task_id": "de7ae5ba9cc249ffa3512eb016152fe8",
+    "website": "https://www.hkexnews.hk/",
+    "task": "在港交所披露易中，搜索 Headline Category = Announcements and Notices、Stock Code = 01766（中国中车）、日期 = 2023-07-01 至 2023-12-31，公告共多少条？",
+    "answer": "43"
   },
   {
-    "task_idx": 66,
-    "task_id": "cbb22de8559d4a29bf5a90b7fabcd5c3",
-    "website": "https://www.footprintnetwork.org/",
-    "task": "在Global Footprint Network中,选择Country=Paraguay、Year=2018,找到Ecological Footprint of Consumption per Capita值是多少gha/person?",
-    "answer": "3.24 gha /3.2 gha"
+    "task_idx": 96,
+    "task_id": "290a42c5220c4ca5bab1a64a04e246ad",
+    "website": "https://ilostat.ilo.org/",
+    "task": "在ILO ILOSTAT的数据浏览器中,选择Indicator=Mean weekly hours actually worked per employee、Country=Mongolia、Sex=Total、Economic Activity=Manufacturing(ISIC Rev.4 Section C),查看2022年(或最新可用年份)的数值是多少小时?",
+    "answer": "46.5"
   },
   {
-    "task_idx": 67,
-    "task_id": "3644a4828fe142dcaccaf583fd155759",
-    "website": "https://v-dem.net/",
-    "task": "在V-Dem的Variable Graph中,选择Country=Laos、Indicators=Liberal Democracy Index (v2x_libdem)、hover Year=2015,指数值是多少?",
-    "answer": "0.09"
+    "task_idx": 97,
+    "task_id": "fa3c9ed396d8415ea5ea1d3d5dd6066b",
+    "website": "https://www.ssb.no/en",
+    "task": "在Statistics Norway的StatBank中,搜索Table 07459 'Population by sex and one-year age groups',选择Region=0301 Oslo、Year=2023、Age=30 years,分别查看Females和Males的人口数,两者之和是多少?",
+    "answer": "F:8101；M:7874；total:15,975"
   },
   {
-    "task_idx": 68,
-    "task_id": "41491a22df3240e18117e07979ae35dd",
-    "website": "https://pageviews.wmcloud.org/",
-    "task": "在Wikimedia Pageviews Analysis中,输入Article=Eli Manning (en.wikipedia)、Date range=2024-02-01 to 2024-02-29,当月总浏览量是多少?",
-    "answer": "210007"
+    "task_idx": 98,
+    "task_id": "243920cbeefd42a480787899ef8f24ce",
+    "website": "https://www.qianzhan.com/",
+    "task": "在前瞻网首页,进入经济学人栏目,找到关于\"2026年中国机器人灵巧手行业竞争格局\"的分析文章,在文中的灵巧手产品参数对比表中,找到戴盟企业的\"DM-Hand1\"产品,其拇指夹力是多少N?",
+    "answer": "14"
   },
   {
-    "task_idx": 69,
-    "task_id": "714f9fbc74a94c8ebbacfc72f223c85f",
-    "website": "https://iiag.online/",
-    "task": "在Ibrahim Index的Interactive Data中,选择Country=Senegal、Category=Human Development、Sub-category=Health,在图表中找到Year=2020,得分是多少(0-100)?",
-    "answer": "59.1"
+    "task_idx": 99,
+    "task_id": "6f58b004757145ee9fe0b81751f1a4a7",
+    "website": "https://www.thepaper.cn/",
+    "task": "在澎湃新闻首页,找到《五张图看清美国对伊之战代价有多大》一文,在文中关于油价影响的图表中,\"无战争\"预估2026/5/27的汽油价格是多少美元/加仑?",
+    "answer": "3.493"
   }
 ]

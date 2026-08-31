@@ -33,7 +33,7 @@ from browser_use.webretriever.artifacts import (
 	model_prompt_log_metadata,
 	prompt_text_lines,
 )
-from browser_use.webretriever.browser import is_browser_session_closed_error
+from browser_use.webretriever.browser import is_browser_session_closed_error, redact_cdp_url
 from browser_use.webretriever.browser_failures import BrowserFailurePhase, classify_browser_failure
 from browser_use.webretriever.exploration_paths import (
 	ExplorationPathError,
@@ -84,12 +84,24 @@ _RUNTIME_NOT_STARTED_RECOVERY_NOTICE = (
 	'Browser runtime was restarted after its initial observation found it unstarted. '
 	'The page below is a fresh observation; reassess it before acting.'
 )
+_TASK_PAGE_RECOVERY_NOTICE = (
+	'Browser task page was rebuilt before any task action. '
+	'The page below is a fresh observation in the same task context; reassess it before acting.'
+)
+_TASK_PAGE_RESTART_MAX_SECONDS = 60.0
+_CLEAN_WORKER_RECOVERY_MAX_SECONDS = 160.0
 _ANALYSIS_NOT_READY_RECOVERY = (
 	'数据分析助手当前不可用：本任务没有可用的 ready_data_dir。\n'
 	'downloads/ 下的文档不是可分析数据工件；禁止再次调用 call_data_analysis_assistant，'
 	'直到观察中出现新的、完整的 ready_data_dir。\n'
 	'请改用文档取证：find_text / read_element，或继续在官方一方来源中查找任务所需证据。'
 )
+
+
+def _recovery_error_text(error: BaseException) -> str:
+	"""Bound and redact recovery diagnostics before persisting them."""
+
+	return redact_cdp_url(f'{type(error).__name__}: {error}')[:500]
 
 
 def _action_contracts_for_data_capability(
@@ -1026,6 +1038,7 @@ class ProtocolIIIAgent:
 		data_analysis_assistant: Any | None = None,
 		task_deadline_monotonic: float | None = None,
 		recover_unstarted_runtime: Callable[[], Awaitable[Any]] | None = None,
+		recover_missing_task_page: Callable[[], Awaitable[Any]] | None = None,
 	):
 		if not 1 <= max_steps <= 100:
 			raise ValueError('max_steps must be between 1 and the competition limit of 100')
@@ -1069,6 +1082,8 @@ class ProtocolIIIAgent:
 		self._model_service_event_start = llm.event_count if isinstance(llm, ModelServiceRouter) else 0
 		self.task_deadline_monotonic = task_deadline_monotonic
 		self._recover_unstarted_runtime = recover_unstarted_runtime
+		self._recover_missing_task_page = recover_missing_task_page or recover_unstarted_runtime
+		self._task_page_recovery_stages: list[dict[str, Any]] = []
 		self._trusted_data_manifests: dict[str, str] = {}
 		self._ready_data_dirs: set[str] = set()
 		self._unavailable_analysis_data_dirs: set[str] = set()
@@ -1160,6 +1175,130 @@ class ProtocolIIIAgent:
 		if replacement_runtime is None:
 			return False, attempted
 		self.runtime = replacement_runtime
+		return True, attempted
+
+	@staticmethod
+	def _is_task_page_unavailable_error(error: BaseException) -> bool:
+		message = str(error).casefold()
+		return (
+			'browserruntime has no active task page' in message
+			or 'browserruntime active task page is closed' in message
+		)
+
+	@staticmethod
+	def _task_page_state(runtime: Any) -> str | None:
+		"""Return a small runtime-independent state hint for failure taxonomy."""
+
+		page = getattr(runtime, 'page', None)
+		if page is None:
+			return 'missing'
+		try:
+			if page.is_closed():
+				return 'closed'
+		except Exception:
+			return None
+		return 'active'
+
+	async def _await_bounded_recovery(self, awaitable: Awaitable[Any], maximum_seconds: float) -> Any:
+		"""Await one recovery stage without extending the task deadline."""
+
+		remaining = self._remaining_task_seconds()
+		if remaining <= 0:
+			raise TimeoutError('task deadline expired before browser recovery')
+		return await _await_with_hard_timeout(awaitable, min(maximum_seconds, remaining))
+
+	async def _recover_initially_missing_task_page(self, *, skip_same_context: bool = False) -> tuple[bool, bool]:
+		"""Recreate a missing task page, then escalate to a clean worker once."""
+
+		attempted = False
+		restart = getattr(self.runtime, 'restart_task_page', None)
+		if not skip_same_context and callable(restart):
+			attempted = True
+			started_at = time.monotonic()
+			try:
+				await self._await_bounded_recovery(
+					restart(self.task.website, timeout_seconds=_TASK_PAGE_RESTART_MAX_SECONDS),
+					_TASK_PAGE_RESTART_MAX_SECONDS,
+				)
+			except TimeoutError as exc:
+				self._task_page_recovery_stages.append(
+					{
+						'stage': 'same_context_page',
+						'status': 'timeout',
+						'elapsed_seconds': round(time.monotonic() - started_at, 3),
+						'error': _recovery_error_text(exc),
+					}
+				)
+				if self._remaining_task_seconds() <= 0:
+					raise
+			except Exception as exc:
+				self._task_page_recovery_stages.append(
+					{
+						'stage': 'same_context_page',
+						'status': 'failed',
+						'elapsed_seconds': round(time.monotonic() - started_at, 3),
+						'error': _recovery_error_text(exc),
+					}
+				)
+			else:
+				self._task_page_recovery_stages.append(
+					{
+						'stage': 'same_context_page',
+						'status': 'recovered',
+						'elapsed_seconds': round(time.monotonic() - started_at, 3),
+					}
+				)
+				return True, attempted
+
+		if self._recover_missing_task_page is None:
+			return False, attempted
+		attempted = True
+		started_at = time.monotonic()
+		try:
+			replacement_runtime = await self._await_bounded_recovery(
+				self._recover_missing_task_page(),
+				_CLEAN_WORKER_RECOVERY_MAX_SECONDS,
+			)
+		except TimeoutError as exc:
+			self._task_page_recovery_stages.append(
+				{
+					'stage': 'clean_cdp_worker',
+					'status': 'timeout',
+					'elapsed_seconds': round(time.monotonic() - started_at, 3),
+					'error': _recovery_error_text(exc),
+				}
+			)
+			if self._remaining_task_seconds() <= 0:
+				raise
+			return False, attempted
+		except Exception as exc:
+			self._task_page_recovery_stages.append(
+				{
+					'stage': 'clean_cdp_worker',
+					'status': 'failed',
+					'elapsed_seconds': round(time.monotonic() - started_at, 3),
+					'error': _recovery_error_text(exc),
+				}
+			)
+			return False, attempted
+		if replacement_runtime is None:
+			self._task_page_recovery_stages.append(
+				{
+					'stage': 'clean_cdp_worker',
+					'status': 'failed',
+					'elapsed_seconds': round(time.monotonic() - started_at, 3),
+					'error': 'recovery callback returned no runtime',
+				}
+			)
+			return False, attempted
+		self.runtime = replacement_runtime
+		self._task_page_recovery_stages.append(
+			{
+				'stage': 'clean_cdp_worker',
+				'status': 'recovered',
+				'elapsed_seconds': round(time.monotonic() - started_at, 3),
+			}
+		)
 		return True, attempted
 
 	def _chart_action_budget(self, action: str, *, cursor: bool = False) -> float:
@@ -1912,10 +2051,13 @@ class ProtocolIIIAgent:
 
 		step_counter = _RefundableStepCounter(self.max_steps)
 		runtime_not_started_recovery_attempted = False
+		task_page_recovery_attempted = False
+		task_page_same_context_recovered = False
 		for step in step_counter:
 			try:
 				observation = await self.runtime.observe(step)
 			except Exception as exc:
+				task_page_state = self._task_page_state(self.runtime)
 				session_closed = is_browser_session_closed_error(exc)
 				if session_closed:
 					try:
@@ -1923,8 +2065,42 @@ class ProtocolIIIAgent:
 					except Exception:
 						recovered = False
 					if recovered:
+						# The old observation and any action-failure streak refer to a
+						# page that is no longer trustworthy.  Re-grounding is a zero-
+						# quota recovery, so discard those guards before observing the
+						# surviving page again.
+						consecutive_errors = 0
+						last_action_signature = None
+						repeated_action_count = 0
+						recent_signatures.clear()
+						no_change_counts.clear()
+						blocked_no_change_signatures.clear()
+						blocked_loop_intents.clear()
 						step_counter.refund_last()
 						last_outcome = 'Browser target closed; a surviving task page was re-grounded. Observe it before deciding again.'
+						continue
+				if (
+					step == 0
+					and not outcome.steps
+					and self._is_task_page_unavailable_error(exc)
+					and (not task_page_recovery_attempted or task_page_same_context_recovered)
+				):
+					recovered, recovery_attempted = await self._recover_initially_missing_task_page(
+						skip_same_context=task_page_same_context_recovered,
+					)
+					task_page_recovery_attempted = task_page_recovery_attempted or recovery_attempted
+					if task_page_same_context_recovered:
+						# The clean-worker stage is single-use, regardless of whether it
+						# returns a runtime or fails.
+						task_page_same_context_recovered = False
+					if recovered:
+						task_page_same_context_recovered = bool(
+							self._task_page_recovery_stages
+							and self._task_page_recovery_stages[-1]['stage'] == 'same_context_page'
+							and self._task_page_recovery_stages[-1]['status'] == 'recovered'
+						)
+						step_counter.refund_last()
+						last_outcome = _TASK_PAGE_RECOVERY_NOTICE
 						continue
 				if (
 					step == 0
@@ -1942,12 +2118,19 @@ class ProtocolIIIAgent:
 					exc,
 					phase=BrowserFailurePhase.OBSERVATION,
 					session_closed=session_closed,
+					task_page_state=task_page_state,
+					recovery_exhausted=task_page_recovery_attempted
+					and not any(stage.get('status') == 'recovered' for stage in self._task_page_recovery_stages),
 				)
 				outcome.status = browser_failure.status
 				outcome.error = f'Observation failed: {type(exc).__name__}: {exc}'
-				outcome.browser_failure = browser_failure.payload(
+				failure_payload = browser_failure.payload(
 					recovery_attempted=session_closed or runtime_not_started_recovery_attempted
 				)
+				if task_page_recovery_attempted:
+					failure_payload['recovery_attempted'] = True
+					failure_payload['recovery_stages'] = list(self._task_page_recovery_stages)
+				outcome.browser_failure = failure_payload
 				break
 			try:
 				exploration_tracker.ensure_system_initial_path(start_url=observation.url)
@@ -2024,8 +2207,75 @@ class ProtocolIIIAgent:
 				}
 				try:
 					runtime_result = await self.runtime.execute(payload)
+					if _is_closed_browser_runtime_result(runtime_result):
+						try:
+							recovered = await self.runtime.recover_live_task_page()
+						except Exception:
+							recovered = False
+						if recovered:
+							if outcome.actions:
+								outcome.actions.pop()
+							if outcome.thoughts:
+								outcome.thoughts.pop()
+							consecutive_errors = 0
+							last_action_signature = None
+							repeated_action_count = 0
+							recent_signatures.clear()
+							no_change_counts.clear()
+							blocked_no_change_signatures.clear()
+							blocked_loop_intents.clear()
+							step_counter.refund_last()
+							last_outcome = (
+								'Browser target closed during the verification action; a surviving task page was re-grounded. '
+								'Observe it before deciding again.'
+							)
+							continue
+						browser_failure = classify_browser_failure(
+							runtime_result.error or runtime_result.summary,
+							phase=BrowserFailurePhase.ACTION,
+							session_closed=True,
+						)
+						outcome.status = browser_failure.status
+						outcome.error = (
+							'Browser session closed with no surviving task pages: '
+							f'{runtime_result.error or runtime_result.summary}'
+						)
+						outcome.browser_failure = browser_failure.payload(recovery_attempted=True)
+						break
 					last_outcome, action_result_payload, action_failed = _format_runtime_action_result(runtime_result)
 				except Exception as exc:
+					if is_browser_session_closed_error(exc):
+						try:
+							recovered = await self.runtime.recover_live_task_page()
+						except Exception:
+							recovered = False
+						if recovered:
+							if outcome.actions:
+								outcome.actions.pop()
+							if outcome.thoughts:
+								outcome.thoughts.pop()
+							consecutive_errors = 0
+							last_action_signature = None
+							repeated_action_count = 0
+							recent_signatures.clear()
+							no_change_counts.clear()
+							blocked_no_change_signatures.clear()
+							blocked_loop_intents.clear()
+							step_counter.refund_last()
+							last_outcome = (
+								'Browser target closed during the verification action; a surviving task page was re-grounded. '
+								'Observe it before deciding again.'
+							)
+							continue
+						browser_failure = classify_browser_failure(
+							exc,
+							phase=BrowserFailurePhase.ACTION,
+							session_closed=True,
+						)
+						outcome.status = browser_failure.status
+						outcome.error = f'Browser session closed with no surviving task pages: {exc}'
+						outcome.browser_failure = browser_failure.payload(recovery_attempted=True)
+						break
 					last_outcome = f'ERROR: {type(exc).__name__}: {exc}'
 					action_result_payload = None
 					action_failed = True
@@ -2057,8 +2307,7 @@ class ProtocolIIIAgent:
 			structured_decision_repair_feedback: StructuredDecisionRepairFeedback | None = None
 			excluded_model_service_groups: set[str] = set()
 			temporarily_hidden_actions: set[str] = set()
-			last_action_contract_error: str | None = None
-			consecutive_action_contract_errors = 0
+			action_contract_error_counts: dict[str, int] = {}
 			while not path_tree_ready:
 				try:
 					decision, model_usage, prompt_index, model_call_started_at = await self._request_model_decision(
@@ -2106,19 +2355,15 @@ class ProtocolIIIAgent:
 					)
 					consecutive_model_output_errors += 1
 					action_contract_error = _action_name_from_contract_diagnostic(exc.diagnostic)
-					if action_contract_error is None:
-						last_action_contract_error = None
-						consecutive_action_contract_errors = 0
-					elif action_contract_error == last_action_contract_error:
-						consecutive_action_contract_errors += 1
-					else:
-						last_action_contract_error = action_contract_error
-						consecutive_action_contract_errors = 1
+					if action_contract_error is not None:
+						action_contract_error_counts[action_contract_error] = (
+							action_contract_error_counts.get(action_contract_error, 0) + 1
+					)
 
 					repair_diagnostic = exc.diagnostic
 					if (
 						action_contract_error is not None
-						and consecutive_action_contract_errors >= _ACTION_CONTRACT_ERRORS_BEFORE_HIDE
+						and action_contract_error_counts[action_contract_error] >= _ACTION_CONTRACT_ERRORS_BEFORE_HIDE
 					):
 						temporarily_hidden_actions.add(action_contract_error)
 						repair_diagnostic = _temporarily_hidden_action_diagnostic(
@@ -2128,8 +2373,6 @@ class ProtocolIIIAgent:
 						# Filtering the repeatedly malformed action creates a new choice
 						# space. Give that repaired schema a fresh bounded error budget.
 						consecutive_model_output_errors = 0
-						last_action_contract_error = None
-						consecutive_action_contract_errors = 0
 					if exc.source_service_group is not None:
 						excluded_model_service_groups.add(exc.source_service_group)
 					structured_decision_repair_feedback = StructuredDecisionRepairFeedback(
@@ -2237,8 +2480,6 @@ class ProtocolIIIAgent:
 					continue
 
 				if decision.action == 'call_data_analysis_assistant' and decision.data_dir not in eligible_data_dirs:
-					last_action_contract_error = None
-					consecutive_action_contract_errors = 0
 					diagnostic = 'data_dir must be one of the current eligible ready_data_dir values'
 					model_error = f'Model response omitted or violated the data-directory contract: {diagnostic}'
 					self._record_model_result(
@@ -2302,8 +2543,6 @@ class ProtocolIIIAgent:
 						path_error = '路径树状态无法应用。请根据当前可信路径树和 `add`/`update` 契约，仅提交本轮有效增量。'
 
 				if path_error is not None:
-					last_action_contract_error = None
-					consecutive_action_contract_errors = 0
 					root_update_repair = _requires_root_update_repair_protocol(path_action_result)
 					model_error = f'Model response omitted or invalidated exploration-path state: {path_error}'
 					self._record_model_result(
@@ -2615,6 +2854,11 @@ class ProtocolIIIAgent:
 								recent_signatures.pop()
 							last_action_signature = None
 							repeated_action_count = 0
+							consecutive_errors = 0
+							recent_signatures.clear()
+							no_change_counts.clear()
+							blocked_no_change_signatures.clear()
+							blocked_loop_intents.clear()
 							step_counter.refund_last()
 							last_outcome = (
 								'Browser target closed during the previous action; a surviving task page was re-grounded. '
@@ -2646,6 +2890,11 @@ class ProtocolIIIAgent:
 							recent_signatures.pop()
 						last_action_signature = None
 						repeated_action_count = 0
+						consecutive_errors = 0
+						recent_signatures.clear()
+						no_change_counts.clear()
+						blocked_no_change_signatures.clear()
+						blocked_loop_intents.clear()
 						step_counter.refund_last()
 						last_outcome = (
 							'Browser target closed during the previous action; a surviving task page was re-grounded. '

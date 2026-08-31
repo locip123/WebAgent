@@ -159,6 +159,47 @@ class TaskRunResult:
 	status: str
 	retire_worker: bool = False
 	recover_worker: bool = False
+	requeue_task: bool = False
+
+
+@dataclass(slots=True)
+class _WorkerPoolState:
+	"""Coordinate idle workers while another worker may return a task."""
+
+	starting_workers: int
+	ready_workers: int = 0
+	inflight_tasks: int = 0
+	_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+	async def startup_finished(self, *, succeeded: bool) -> None:
+		async with self._condition:
+			self.starting_workers = max(0, self.starting_workers - 1)
+			if succeeded:
+				self.ready_workers += 1
+			self._condition.notify_all()
+
+	def task_claimed(self) -> None:
+		# This is intentionally synchronous: the queue item has just been
+		# removed, so increment the in-flight count before yielding control to
+		# another worker that may observe an empty queue.
+		self.inflight_tasks += 1
+
+	async def task_finished(self) -> None:
+		async with self._condition:
+			self.inflight_tasks = max(0, self.inflight_tasks - 1)
+			self._condition.notify_all()
+
+	async def task_requeued(self) -> None:
+		async with self._condition:
+			self._condition.notify_all()
+
+	async def wait_for_work(self, queue: asyncio.Queue[CompetitionTask]) -> bool:
+		"""Wait until a task is queued or every claimed task is finished."""
+
+		async with self._condition:
+			while queue.empty() and self.inflight_tasks > 0:
+				await self._condition.wait()
+			return not queue.empty()
 
 
 def normalize_sec_user_agent(value: str | None) -> str | None:
@@ -416,11 +457,19 @@ def _log_diagnostic_task_failure(
 
 	if not outcome.status.startswith('FAIL_') or not outcome.error:
 		return
+	diagnostic = outcome.browser_failure
+	diagnostic_suffix = ''
+	if isinstance(diagnostic, Mapping):
+		category = diagnostic.get('category')
+		subtype = diagnostic.get('subtype')
+		if isinstance(category, str) and isinstance(subtype, str):
+			diagnostic_suffix = f'; browser_failure={category}/{subtype}'
 	logger.error(
-		'Task %s/%s failed with status %s; error:\n%s',
+		'Task %s/%s failed with status %s%s; error:\n%s',
 		task.task_idx,
 		task.task_id,
 		outcome.status,
+		diagnostic_suffix,
 		redact_cdp_url(outcome.error),
 	)
 
@@ -429,6 +478,13 @@ def _is_browser_disconnect_error(error: BaseException | str | None) -> bool:
 	"""Backward-compatible name for the shared narrow session-close predicate."""
 
 	return is_browser_session_closed_error(error)
+
+
+def _is_cdp_connection_unavailable_error(error: BaseException | str | None) -> bool:
+	"""Recognize connection failures that happen before a task can start."""
+
+	message = str(error).casefold() if error is not None else ''
+	return any(marker in message for marker in ('cdp connection unavailable', 'connect_over_cdp'))
 
 
 async def _run_task(
@@ -465,6 +521,7 @@ async def _run_task(
 		cleanup: dict[str, Any] | None = None
 		retire_worker = False
 		recover_worker = False
+		requeue_task = False
 		browser_startup_in_progress = False
 		try:
 			if config.rerun_failed and existing_status not in {None, 'PENDING'}:
@@ -566,17 +623,33 @@ async def _run_task(
 				_remaining_task_seconds(task_started_monotonic, config.task_timeout_seconds),
 			)
 			runtime = getattr(agent, 'runtime', runtime)
-			if browser_session is not None and _is_browser_disconnect_error(outcome.error):
+			if browser_session is not None and (
+				_is_browser_disconnect_error(outcome.error)
+				or outcome.status == 'FAIL_BROWSER_TASK_PAGE_UNAVAILABLE'
+			):
 				recover_worker = True
 		except BrowserRecoveryDeadlineExceeded:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 			outcome.error = 'Browser recovery exhausted the task deadline'
+			# A task that has not completed browser startup has no observable
+			# side-effects yet.  Return it to the shared queue so a healthy CDP
+			# worker can take over instead of persisting a terminal timeout.
+			if browser_session is not None and browser_startup_in_progress:
+				requeue_task = True
+				recover_worker = True
 			retire_worker = True
 		except TimeoutError:
 			outcome = _task_timeout_outcome(agent, config.task_timeout_seconds)
 		except Exception as exc:
 			if browser_session is not None and _is_browser_disconnect_error(exc):
 				recover_worker = True
+			if (
+				browser_session is not None
+				and browser_startup_in_progress
+				and _is_cdp_connection_unavailable_error(exc)
+			):
+				requeue_task = True
+				retire_worker = True
 			logger.exception('Task %s/%s crashed', task.task_idx, task.task_id)
 			if browser_startup_in_progress:
 				browser_failure = classify_browser_failure(
@@ -631,6 +704,18 @@ async def _run_task(
 				logger.warning('Could not discard the interrupted CDP session: %s', redact_cdp_url(str(exc)))
 				recover_worker = False
 				retire_worker = True
+		if requeue_task:
+			logger.warning(
+				'CDP startup failed before task %s/%s began; returning it to the shared queue',
+				task.task_idx,
+				task.task_id,
+			)
+			return TaskRunResult(
+				'REQUEUED',
+				retire_worker=retire_worker,
+				recover_worker=recover_worker,
+				requeue_task=True,
+			)
 
 		urls = list(runtime.visited_urls) if runtime is not None else []
 		capture = runtime.capture_payload() if runtime is not None else None
@@ -680,6 +765,7 @@ async def _consume_tasks(
 	endpoint_label: str | None = None,
 	browser: Browser | None = None,
 	browser_session: CdpWorkerSession | None = None,
+	worker_pool: _WorkerPoolState | None = None,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
@@ -698,7 +784,11 @@ async def _consume_tasks(
 		try:
 			task = queue.get_nowait()
 		except asyncio.QueueEmpty:
-			return
+			if worker_pool is None or not await worker_pool.wait_for_work(queue):
+				return
+			continue
+		if worker_pool is not None:
+			worker_pool.task_claimed()
 		try:
 			is_sec_task = is_sec_url(task.website)
 			acquired_sec_slot = False
@@ -727,7 +817,12 @@ async def _consume_tasks(
 					endpoint_label=endpoint_label,
 					browser_session=browser_session,
 				)
-				statuses[task.task_id] = task_result.status
+				if task_result.requeue_task:
+					queue.put_nowait(task)
+					if worker_pool is not None:
+						await worker_pool.task_requeued()
+				else:
+					statuses[task.task_id] = task_result.status
 				if task_result.retire_worker:
 					logger.error('Browser session became unusable; retiring worker %s', worker_id)
 					return
@@ -756,6 +851,8 @@ async def _consume_tasks(
 						logger.warning('Could not close isolated experiment context: %s', exc)
 		finally:
 			queue.task_done()
+			if worker_pool is not None:
+				await worker_pool.task_finished()
 
 
 async def _cdp_worker(
@@ -767,11 +864,14 @@ async def _cdp_worker(
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
 	llm: BaseChatModel,
+	worker_pool: _WorkerPoolState | None = None,
 ) -> None:
 	logger = _worker_logger(config.output_dir, worker_id)
 	logger.info('Connecting to CDP browser %s', redact_cdp_url(cdp_url))
 	connection = None
 	browser_session: CdpWorkerSession | None = None
+	startup_reported = False
+	startup_succeeded = False
 	try:
 		headers = (
 			config.cdp_headers_provider(cdp_url)
@@ -799,6 +899,10 @@ async def _cdp_worker(
 				connector=connector,
 				connection=connection,
 			)
+		startup_succeeded = True
+		if worker_pool is not None:
+			await worker_pool.startup_finished(succeeded=startup_succeeded)
+			startup_reported = True
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
@@ -813,12 +917,16 @@ async def _cdp_worker(
 			rebrowser_runtime_fix_mode=connection.rebrowser_runtime_fix_mode,
 			endpoint_label=config.experiment_endpoint_label or f'cdp-{worker_id}',
 			browser_session=browser_session,
+			worker_pool=worker_pool,
 		)
 	except Exception as exc:
 		# Playwright connection errors may repeat the endpoint verbatim.  Avoid
 		# traceback logging here so evaluator access tokens never reach artifacts.
 		logger.error('CDP worker failed for %s: %s', redact_cdp_url(cdp_url), redact_cdp_url(str(exc)))
 	finally:
+		if worker_pool is not None and not startup_reported:
+			with contextlib.suppress(Exception):
+				await worker_pool.startup_finished(succeeded=startup_succeeded)
 		if browser_session is not None:
 			try:
 				await browser_session.close()
@@ -840,6 +948,7 @@ async def _local_worker(
 	statuses: dict[str, str],
 	sec_task_semaphore: asyncio.Semaphore,
 	llm: BaseChatModel,
+	worker_pool: _WorkerPoolState | None = None,
 ) -> None:
 	"""Run one isolated local browser context for each concurrent worker."""
 
@@ -847,6 +956,8 @@ async def _local_worker(
 	context: BrowserContext | None = None
 	try:
 		context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
+		if worker_pool is not None:
+			await worker_pool.startup_finished(succeeded=True)
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
@@ -856,9 +967,13 @@ async def _local_worker(
 			llm=llm,
 			statuses=statuses,
 			sec_task_semaphore=sec_task_semaphore,
+			worker_pool=worker_pool,
 		)
 	except Exception:
 		logger.exception('Local browser worker failed')
+		if worker_pool is not None and context is None:
+			with contextlib.suppress(Exception):
+				await worker_pool.startup_finished(succeeded=False)
 	finally:
 		if context is not None:
 			try:
@@ -893,6 +1008,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	# run. Local VLM endpoints deliberately retain their worker-specific routing.
 	shared_model_router = build_llm(config) if config.model_services else None
 	if config.local_browser:
+		worker_pool = _WorkerPoolState(worker_count)
 		async with async_playwright() as playwright:
 			browser = await playwright.chromium.launch(headless=config.headless)
 			try:
@@ -908,6 +1024,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 						llm=shared_model_router
 						if shared_model_router is not None
 						else build_llm(config, worker_id),
+						worker_pool=worker_pool,
 						)
 						for worker_id in range(worker_count)
 					)
@@ -917,6 +1034,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 	else:
 		worker_urls = config.cdp_urls[:worker_count]
 		worker_count = len(worker_urls)
+		worker_pool = _WorkerPoolState(worker_count)
 		await asyncio.gather(
 			*(
 				_cdp_worker(
@@ -929,6 +1047,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 					llm=shared_model_router
 					if shared_model_router is not None
 					else build_llm(config, worker_id),
+					worker_pool=worker_pool,
 				)
 				for worker_id, cdp_url in enumerate(worker_urls)
 			)
@@ -963,6 +1082,7 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		'total_selected': len(tasks),
 		'max_concurrency': config.max_concurrency,
 		'workers_started': worker_count,
+		'workers_ready': worker_pool.ready_workers,
 		'counts': counts,
 		'statuses': statuses,
 	}

@@ -37,6 +37,29 @@ def test_diagnostic_failure_log_preserves_multiline_error_and_redacts_cdp_token(
 	assert 'secret-token' not in record.getMessage()
 
 
+def test_diagnostic_failure_log_includes_browser_failure_subtype(caplog: pytest.LogCaptureFixture) -> None:
+	logger = logging.getLogger('test.webretriever.failure-log.browser')
+	outcome = AgentRunOutcome(
+		status='FAIL_BROWSER_TASK_PAGE_UNAVAILABLE',
+		error='Observation failed: RuntimeError: BrowserRuntime has no active task page',
+		browser_failure={
+			'category': 'task_page_unavailable',
+			'subtype': 'task_page_recovery_exhausted',
+			'phase': 'observation',
+			'exception_type': 'RuntimeError',
+			'recovery_attempted': True,
+		},
+	)
+
+	with caplog.at_level(logging.ERROR, logger=logger.name):
+		_log_diagnostic_task_failure(logger, _task(), outcome)
+
+	assert caplog.records[0].getMessage().startswith(
+		'Task 28/task-28 failed with status FAIL_BROWSER_TASK_PAGE_UNAVAILABLE; '
+		'browser_failure=task_page_unavailable/task_page_recovery_exhausted; error:'
+	)
+
+
 @pytest.mark.parametrize(
 	('status', 'error'),
 	[

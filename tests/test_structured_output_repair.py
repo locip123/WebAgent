@@ -766,6 +766,53 @@ def test_repeated_action_contract_error_hides_action_only_for_the_current_step(t
     assert '已从当前步骤剩余的修复请求中暂时移除' in model.user_prompts[2]
 
 
+def test_action_contract_hide_survives_intervening_generic_structured_error(tmp_path: Path) -> None:
+    invalid_inspect_network = ModelStructuredOutputError(
+        'inspect_network does not accept: analysis_query',
+        raw_completion='{"decision":{"action":"inspect_network","analysis_query":"THEFT"}}',
+    )
+    intervening_generic_error = ModelStructuredOutputError(
+        'Extra data: line 2 column 1 (char 80018)',
+    )
+
+    async def scenario() -> tuple[Any, _FakeModel, dict[str, Any]]:
+        model = _FakeModel(
+            'direct',
+            [invalid_inspect_network, intervening_generic_error, invalid_inspect_network, _initial_wait(), _successful_finish()],
+        )
+        task_dir = tmp_path / 'action-contract-hide-after-generic-error'
+        agent = ProtocolIIIAgent(
+            task=CompetitionTask(
+                task_idx=0,
+                task_id='action-contract-hide-after-generic-error',
+                website='https://example.test/start',
+                task='根据当前页面回答测试问题。',
+            ),
+            llm=model,  # type: ignore[arg-type]
+            runtime=_ExplorationRuntime(),
+            task_dir=task_dir,
+            max_steps=2,
+            model_timeout_seconds=1.0,
+            structured_prompt_log=True,
+            chart_network_inspector=object(),
+        )
+        outcome = await agent.run()
+        prompt_log = json.loads((task_dir / 'model_prompts.json').read_text(encoding='utf-8'))
+        return outcome, model, prompt_log
+
+    outcome, model, prompt_log = asyncio.run(scenario())
+
+    assert outcome.status == 'SUCCESS'
+    assert len(model.output_formats) == 5
+    hidden_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(model.output_formats[3]), ensure_ascii=False)
+    restored_schema = json.dumps(SchemaOptimizer.create_optimized_json_schema(model.output_formats[4]), ensure_ascii=False)
+    assert 'inspect_network' not in hidden_schema
+    assert 'finish' in hidden_schema
+    assert 'inspect_network' in restored_schema
+    assert prompt_log['steps'][3]['temporarily_hidden_actions'] == ['inspect_network']
+    assert '已从当前步骤剩余的修复请求中暂时移除' in model.user_prompts[3]
+
+
 def test_bare_json_decode_error_in_structured_call_returns_to_agent_without_router_fallback(
     tmp_path: Path,
 ) -> None:
