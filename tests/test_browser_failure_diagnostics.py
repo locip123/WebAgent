@@ -13,7 +13,12 @@ from browser_use.webretriever.browser import BrowserObservation, BrowserRuntime
 from browser_use.webretriever.browser_failures import BrowserFailurePhase, classify_browser_failure
 from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.webretriever.model_services import ModelServiceConfig
-from browser_use.webretriever.models import CompetitionTask, InitialPageAgentDecisionEnvelope
+from browser_use.webretriever.models import (
+	AgentDecisionEnvelope,
+	CompetitionTask,
+	InitialPageAgentDecisionEnvelope,
+	WebRetrieverActionResult,
+)
 from browser_use.webretriever.runner import RunnerConfig, _run_task
 
 
@@ -175,9 +180,10 @@ class _RecoveryModel:
 			completion=InitialPageAgentDecisionEnvelope.model_validate(
 				{
 					'decision': {
-						'action': 'finish',
-						'thought': 'The replacement task page has the answer.',
-						'success': True,
+					'action': 'finish',
+					'thought': 'The replacement task page has the answer.',
+					'decision_summary': '起始页尚未执行动作；下一步提交当前页已确认的答案，以完成任务。',
+					'success': True,
 						'answer': 'Recovered answer',
 						'evidence': ['The replacement task page contains the answer.'],
 						'path_json_action': {'operations': []},
@@ -330,6 +336,123 @@ def test_missing_task_page_escalates_after_restart_observation_still_fails(tmp_p
 	assert runtime.observed_steps == [0, 0]
 	assert callback_calls == 1
 	assert replacement.observed_steps == [0]
+
+
+@pytest.mark.parametrize(
+	('has_surviving_task_page', 'expected_restart_calls'),
+	[(True, 0), (False, 1)],
+)
+def test_missing_task_page_after_an_action_prefers_a_surviving_task_page(
+	tmp_path: Path,
+	has_surviving_task_page: bool,
+	expected_restart_calls: int,
+) -> None:
+	class Runtime:
+		def __init__(self) -> None:
+			self.page_lost = False
+			self.observed_steps: list[int] = []
+			self.restart_calls = 0
+			self.live_recovery_calls = 0
+			self.executed_actions: list[str] = []
+
+		async def observe(self, step: int) -> BrowserObservation:
+			self.observed_steps.append(step)
+			if self.page_lost and self.restart_calls == 0:
+				raise RuntimeError('BrowserRuntime has no active task page')
+			return _recovered_observation()
+
+		async def execute(self, decision: Any) -> WebRetrieverActionResult:
+			self.executed_actions.append(decision.action)
+			self.page_lost = True
+			return WebRetrieverActionResult(
+				action=decision.action,
+				status='ok',
+				executed=True,
+				state_changed=True,
+				summary='The task page accepted the action before it disappeared.',
+			)
+
+		async def restart_task_page(self, _website: str, *, timeout_seconds: float) -> None:
+			assert timeout_seconds == pytest.approx(60.0)
+			self.restart_calls += 1
+
+		async def recover_live_task_page(self) -> bool:
+			self.live_recovery_calls += 1
+			if has_surviving_task_page:
+				self.page_lost = False
+				return True
+			return False
+
+	class Model:
+		def __init__(self) -> None:
+			self._responses = iter(
+				[
+					ChatInvokeCompletion(
+						completion=InitialPageAgentDecisionEnvelope.model_validate(
+							{
+								'decision': {
+									'action': 'click',
+									'thought': 'Open the visible task entry.',
+									'current_path_id': '1->1',
+									'decision_summary': '起始页尚未执行动作；下一步打开可见的任务入口，以继续查找答案。',
+									'element_id': 0,
+									'path_json_action': {
+										'operations': [
+											{
+												'op': 'add',
+												'parent_path_id': '1',
+												'location': '可见任务入口',
+												'strategy_description': '打开入口以继续取证。',
+											}
+										]
+									},
+								}
+							}
+						),
+						raw_completion='{"decision":{"action":"click"}}',
+						usage=None,
+					),
+					ChatInvokeCompletion(
+						completion=AgentDecisionEnvelope.model_validate(
+							{
+								'decision': {
+									'action': 'finish',
+									'thought': 'The rebuilt page provides the answer.',
+									'decision_summary': '任务页已重建；下一步提交新页面中已确认的答案，以完成任务。',
+									'success': True,
+									'answer': 'Recovered answer',
+									'evidence': ['The rebuilt task page contains the answer.'],
+								}
+							}
+						),
+						raw_completion='{"decision":{"action":"finish"}}',
+						usage=None,
+					),
+				]
+			)
+
+		async def ainvoke(self, *_args: Any, **_kwargs: Any) -> ChatInvokeCompletion[Any]:
+			return next(self._responses)
+
+	runtime = Runtime()
+	agent = ProtocolIIIAgent(
+		task=_task(),
+		llm=Model(),  # type: ignore[arg-type]
+		runtime=runtime,
+		task_dir=tmp_path,
+		max_steps=2,
+		model_timeout_seconds=1.0,
+		chart_network_inspector=object(),
+	)
+
+	outcome = asyncio.run(agent.run())
+
+	assert outcome.status == 'SUCCESS'
+	assert runtime.observed_steps == [0, 1, 1]
+	assert runtime.live_recovery_calls == 1
+	assert runtime.restart_calls == expected_restart_calls
+	assert runtime.executed_actions == ['click']
+	assert [step['action']['action'] for step in outcome.steps] == ['click', 'finish']
 
 
 def test_unstarted_observation_restarts_the_current_runtime_once(tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ tests/*
 !tests/test_runner_failure_logging.py
 !tests/test_structured_output_repair.py
 !tests/test_browser_failure_diagnostics.py
+!tests/test_stale_click_recovery.py
 CONTEXT.md
 聊天记录.md
 data/example_tasks.json
@@ -35,3 +36,5 @@ CLAUDE.md
 test_model_service_routing.py
 data/protocol3.json
 data/example_tasks.json
+scripts/count_data_analysis_assistant.py
+scripts/find_close_tab_tasks.py

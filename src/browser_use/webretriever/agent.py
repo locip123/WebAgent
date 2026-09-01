@@ -85,8 +85,12 @@ _RUNTIME_NOT_STARTED_RECOVERY_NOTICE = (
 	'The page below is a fresh observation; reassess it before acting.'
 )
 _TASK_PAGE_RECOVERY_NOTICE = (
-	'Browser task page was rebuilt before any task action. '
+	'Browser task page was rebuilt after it became unavailable. Any previous action was not replayed. '
 	'The page below is a fresh observation in the same task context; reassess it before acting.'
+)
+_SURVIVING_TASK_PAGE_RECOVERY_NOTICE = (
+	'Browser task page was unavailable, but a surviving task-owned page was re-grounded. '
+	'Any previous action was not replayed; reassess this fresh observation before acting.'
 )
 _TASK_PAGE_RESTART_MAX_SECONDS = 60.0
 _CLEAN_WORKER_RECOVERY_MAX_SECONDS = 160.0
@@ -95,6 +99,10 @@ _ANALYSIS_NOT_READY_RECOVERY = (
 	'downloads/ 下的文档不是可分析数据工件；禁止再次调用 call_data_analysis_assistant，'
 	'直到观察中出现新的、完整的 ready_data_dir。\n'
 	'请改用文档取证：find_text / read_element，或继续在官方一方来源中查找任务所需证据。'
+)
+_STALE_CLICK_RECOVERY_LAST_OUTCOME = (
+	'A previous semantic click could not complete because its current element reference expired. '
+	'A fresh browser observation and screenshot are required before one bounded recovery action.'
 )
 
 
@@ -123,6 +131,35 @@ def _action_contracts_for_data_capability(
 		if action != 'finish':
 			contracts.pop(action, None)
 	return contracts
+
+
+def _is_stale_click_recovery_candidate(
+	*,
+	action: str,
+	action_result_payload: Mapping[str, Any] | None,
+) -> bool:
+	"""Whether the action-error threshold may use the bounded click fallback."""
+
+	return bool(
+		action == 'click'
+		and isinstance(action_result_payload, Mapping)
+		and action_result_payload.get('status') == 'error'
+		and action_result_payload.get('error_type') == 'StaleElement'
+	)
+
+
+def _stale_click_recovery_history(history: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+	"""Keep the stale failure durable without forwarding its raw details to recovery."""
+
+	if not history:
+		return ()
+	redacted_history = list(history)
+	latest = dict(redacted_history[-1])
+	latest['action'] = {'action': 'click'}
+	latest.pop('action_result', None)
+	latest['outcome'] = _STALE_CLICK_RECOVERY_LAST_OUTCOME
+	redacted_history[-1] = latest
+	return tuple(redacted_history)
 
 
 @lru_cache(maxsize=256)
@@ -948,11 +985,15 @@ def _record_exploration_decision(
 	tracker: ExplorationPathTracker,
 	*,
 	decision: AgentDecision,
+	path_action_result: PathJsonActionResult,
 ) -> None:
-	"""Record a decision summary after a completed action."""
+	"""Record a completed decision and its applied path-tree progress."""
 	if tracker.answer_priority_mode:
 		return
-	tracker.record_decision(current_path_id=decision.current_path_id, decision_summary=decision.decision_summary)
+	tracker.record_decision(
+		current_path_id=decision.current_path_id,
+		path_action_result=path_action_result,
+	)
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -1207,7 +1248,7 @@ class ProtocolIIIAgent:
 			raise TimeoutError('task deadline expired before browser recovery')
 		return await _await_with_hard_timeout(awaitable, min(maximum_seconds, remaining))
 
-	async def _recover_initially_missing_task_page(self, *, skip_same_context: bool = False) -> tuple[bool, bool]:
+	async def _recover_task_page(self, *, skip_same_context: bool = False) -> tuple[bool, bool]:
 		"""Recreate a missing task page, then escalate to a clean worker once."""
 
 		attempted = False
@@ -2049,11 +2090,20 @@ class ProtocolIIIAgent:
 		atomic_write_json(exploration_paths_path, exploration_tracker.payload())
 		verification = VerificationController(target_url=self.task.website)
 
-		step_counter = _RefundableStepCounter(self.max_steps)
+		# A stale semantic click may consume one explicitly bounded recovery action.
+		# The regular loop guard below keeps the additional slot unavailable unless
+		# the immediately prior terminal-threshold failure qualified for recovery.
+		step_counter = _RefundableStepCounter(self.max_steps + 1)
+		stale_click_recovery_pending = False
 		runtime_not_started_recovery_attempted = False
 		task_page_recovery_attempted = False
 		task_page_same_context_recovered = False
 		for step in step_counter:
+			if step >= self.max_steps and not stale_click_recovery_pending:
+				outcome.status = 'FAIL_MAX_STEPS'
+				outcome.error = f'Reached the competition limit of {self.max_steps} steps without a final answer'
+				break
+			stale_click_recovery_step = stale_click_recovery_pending
 			try:
 				observation = await self.runtime.observe(step)
 			except Exception as exc:
@@ -2079,29 +2129,53 @@ class ProtocolIIIAgent:
 						step_counter.refund_last()
 						last_outcome = 'Browser target closed; a surviving task page was re-grounded. Observe it before deciding again.'
 						continue
-				if (
-					step == 0
-					and not outcome.steps
-					and self._is_task_page_unavailable_error(exc)
-					and (not task_page_recovery_attempted or task_page_same_context_recovered)
-				):
-					recovered, recovery_attempted = await self._recover_initially_missing_task_page(
-						skip_same_context=task_page_same_context_recovered,
-					)
-					task_page_recovery_attempted = task_page_recovery_attempted or recovery_attempted
-					if task_page_same_context_recovered:
-						# The clean-worker stage is single-use, regardless of whether it
-						# returns a runtime or fails.
-						task_page_same_context_recovered = False
+				if self._is_task_page_unavailable_error(exc):
+					# A missing active-page pointer can coexist with another live page
+					# already owned by this task.  Re-ground on that page before changing
+					# navigation state or replacing the worker.
+					try:
+						recovered = await self.runtime.recover_live_task_page()
+					except Exception:
+						recovered = False
 					if recovered:
-						task_page_same_context_recovered = bool(
-							self._task_page_recovery_stages
-							and self._task_page_recovery_stages[-1]['stage'] == 'same_context_page'
-							and self._task_page_recovery_stages[-1]['status'] == 'recovered'
-						)
+						consecutive_errors = 0
+						last_action_signature = None
+						repeated_action_count = 0
+						recent_signatures.clear()
+						no_change_counts.clear()
+						blocked_no_change_signatures.clear()
+						blocked_loop_intents.clear()
 						step_counter.refund_last()
-						last_outcome = _TASK_PAGE_RECOVERY_NOTICE
+						last_outcome = _SURVIVING_TASK_PAGE_RECOVERY_NOTICE
 						continue
+					if not task_page_recovery_attempted or task_page_same_context_recovered:
+						recovered, recovery_attempted = await self._recover_task_page(
+							skip_same_context=task_page_same_context_recovered,
+						)
+						task_page_recovery_attempted = task_page_recovery_attempted or recovery_attempted
+						if task_page_same_context_recovered:
+							# The clean-worker stage is single-use, regardless of whether it
+							# returns a runtime or fails.
+							task_page_same_context_recovered = False
+						if recovered:
+							task_page_same_context_recovered = bool(
+								self._task_page_recovery_stages
+								and self._task_page_recovery_stages[-1]['stage'] == 'same_context_page'
+								and self._task_page_recovery_stages[-1]['status'] == 'recovered'
+							)
+							# The rebuilt page has no valid element bindings or loop guards from
+							# the lost page.  Keep completed action records intact: their effects
+							# may be externally visible and must never be replayed automatically.
+							consecutive_errors = 0
+							last_action_signature = None
+							repeated_action_count = 0
+							recent_signatures.clear()
+							no_change_counts.clear()
+							blocked_no_change_signatures.clear()
+							blocked_loop_intents.clear()
+							step_counter.refund_last()
+							last_outcome = _TASK_PAGE_RECOVERY_NOTICE
+							continue
 				if (
 					step == 0
 					and not outcome.steps
@@ -2147,8 +2221,15 @@ class ProtocolIIIAgent:
 			if screenshot and not raw_path.exists():
 				raw_path.write_bytes(screenshot)
 
-			verification_decision = verification.decide(observation)
-			if verification_decision.action is VerificationAction.BLOCKED:
+			if stale_click_recovery_step and not screenshot:
+				outcome.status = 'FAIL_ACTIONS'
+				outcome.error = 'Stale click recovery requires a fresh screenshot; coordinate recovery was not attempted.'
+				break
+
+			# Recovery must reach the model with the fresh screenshot; an automatic
+			# verification click would consume its one browser-action opportunity.
+			verification_decision = None if stale_click_recovery_step else verification.decide(observation)
+			if verification_decision is not None and verification_decision.action is VerificationAction.BLOCKED:
 				step_record = {
 					'step': step,
 					'url': observation.url,
@@ -2162,7 +2243,7 @@ class ProtocolIIIAgent:
 				outcome.status = 'FAIL_VERIFICATION'
 				outcome.error = verification_decision.reason
 				break
-			if verification_decision.action in {
+			if verification_decision is not None and verification_decision.action in {
 				VerificationAction.CLICK,
 				VerificationAction.CLICK_XY,
 				VerificationAction.DRAG,
@@ -2292,7 +2373,11 @@ class ProtocolIIIAgent:
 					outcome.error = f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
 					break
 				continue
-			if verification_decision.state.value == 'passed' and not last_outcome.startswith(_FINISH_FALSE_RETRY_PREFIX):
+			if (
+				verification_decision is not None
+				and verification_decision.state.value == 'passed'
+				and not last_outcome.startswith(_FINISH_FALSE_RETRY_PREFIX)
+			):
 				last_outcome = 'Visible verification completed; continue in the same browser context.'
 
 			downloads = list(getattr(observation, 'downloads', []) or [])
@@ -2306,7 +2391,7 @@ class ProtocolIIIAgent:
 			root_update_repair = False
 			structured_decision_repair_feedback: StructuredDecisionRepairFeedback | None = None
 			excluded_model_service_groups: set[str] = set()
-			temporarily_hidden_actions: set[str] = set()
+			temporarily_hidden_actions: set[str] = {'click'} if stale_click_recovery_step else set()
 			action_contract_error_counts: dict[str, int] = {}
 			while not path_tree_ready:
 				try:
@@ -2315,7 +2400,11 @@ class ProtocolIIIAgent:
 						context=StepContext(
 							step_index=step,
 							observation=observation,
-							history=tuple(outcome.steps),
+							history=(
+								_stale_click_recovery_history(outcome.steps)
+								if stale_click_recovery_step
+								else tuple(outcome.steps)
+							),
 							last_outcome=last_outcome,
 							structured_decision_repair_feedback=structured_decision_repair_feedback,
 							exploration_paths=None if answer_priority_mode else exploration_tracker.payload(),
@@ -2330,6 +2419,7 @@ class ProtocolIIIAgent:
 							data_artifact_notice=data_artifact_notice,
 							download_recovery_notice=download_recovery_notice,
 							analysis_not_ready_recovery=self._analysis_not_ready_recovery_notice(),
+							stale_click_recovery=stale_click_recovery_step,
 						),
 						screenshot=screenshot,
 						raw_path=raw_path if screenshot else None,
@@ -2577,6 +2667,17 @@ class ProtocolIIIAgent:
 
 			if not path_tree_ready:
 				break
+			recovery_action_active = stale_click_recovery_step
+			if recovery_action_active:
+				# The fresh recovery action gets one real browser attempt even if normal
+				# loop guards still remember the pre-recovery page generation.
+				stale_click_recovery_pending = False
+				last_action_signature = None
+				repeated_action_count = 0
+				recent_signatures.clear()
+				no_change_counts.clear()
+				blocked_no_change_signatures.clear()
+				blocked_loop_intents.clear()
 			action_text = _action_string(decision)
 			_save_visual_screenshot(
 				screenshot,
@@ -2618,6 +2719,7 @@ class ProtocolIIIAgent:
 					_record_exploration_decision(
 						exploration_tracker,
 						decision=decision,
+						path_action_result=path_action_result,
 					)
 					last_outcome = _finish_false_retry_message(self.task.task)
 					continue
@@ -2627,6 +2729,7 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
+					path_action_result=path_action_result,
 				)
 				continue
 
@@ -2656,6 +2759,7 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
+					path_action_result=path_action_result,
 				)
 				consecutive_errors += 1
 				if consecutive_errors >= self.max_consecutive_action_errors:
@@ -2698,6 +2802,7 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
+					path_action_result=path_action_result,
 				)
 				# A detected loop is a planning stall, not a browser failure, so it
 				# must not consume the consecutive-action-error budget.
@@ -2926,6 +3031,7 @@ class ProtocolIIIAgent:
 			_record_exploration_decision(
 				exploration_tracker,
 				decision=decision,
+				path_action_result=path_action_result,
 			)
 			if browser_session_interrupted is not None:
 				browser_failure = classify_browser_failure(
@@ -2945,7 +3051,20 @@ class ProtocolIIIAgent:
 			else:
 				consecutive_errors = 0
 
+			if recovery_action_active and action_failed:
+				outcome.status = 'FAIL_ACTIONS'
+				outcome.error = f'Stale click recovery action failed; last error: {last_outcome}'
+				break
+
 			if consecutive_errors >= self.max_consecutive_action_errors:
+				if _is_stale_click_recovery_candidate(
+					action=decision.action,
+					action_result_payload=action_result_payload,
+				):
+					stale_click_recovery_pending = True
+					consecutive_errors = 0
+					last_outcome = _STALE_CLICK_RECOVERY_LAST_OUTCOME
+					continue
 				outcome.status = 'FAIL_ACTIONS'
 				outcome.error = f'{consecutive_errors} consecutive browser actions failed; last error: {last_outcome}'
 				break

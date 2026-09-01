@@ -622,8 +622,6 @@ class ExplorationPathTracker:
             return self._blocked_result(action, 'decision_summary must be provided during exploration')
         if not isinstance(decision_summary, str) or not decision_summary.strip():
             return self._blocked_result(action, 'decision_summary must be a non-empty string')
-        if self._current_observation_is_unseen_page and decision_summary.strip() == '无':
-            return self._blocked_result(action, 'a previously unseen page must be recorded in decision_summary, not "无"')
         if not isinstance(current_path_id, str) or not current_path_id.strip():
             return self._blocked_result(action, 'current_path_id must be a non-empty string')
 
@@ -677,25 +675,29 @@ class ExplorationPathTracker:
         self._active_path_id = path_id
         self._changed()
 
-    def record_decision(self, *, current_path_id: str, decision_summary: str) -> ExplorationDecisionRecord:
-        """Record a completed decision without mutating node-local route state."""
+    def record_decision(
+        self,
+        *,
+        current_path_id: str,
+        path_action_result: PathJsonActionResult,
+    ) -> ExplorationDecisionRecord:
+        """Record a completed decision from its successfully applied path delta."""
 
         if current_path_id != self._active_path_id:
             raise ExplorationPathError('recorded current_path_id is not active')
         node = self._find_path(current_path_id)
         if node is None:
             raise ExplorationPathError(f'current_path_id does not exist: {current_path_id!r}')
-        if not isinstance(decision_summary, str) or not decision_summary.strip():
-            raise ExplorationPathError('decision_summary must be a non-empty string')
-        normalized_summary = decision_summary.strip()
+        if not isinstance(path_action_result, PathJsonActionResult):
+            raise ExplorationPathError('recorded path_action_result must be a PathJsonActionResult')
 
         if self._stagnation_path_id != current_path_id:
             self._stagnation_path_id = current_path_id
             self._consecutive_no_progress = 0
-        if normalized_summary == '无':
-            self._consecutive_no_progress += 1
-        else:
+        if self._has_applied_progress_operation(path_action_result):
             self._consecutive_no_progress = 0
+        else:
+            self._consecutive_no_progress += 1
 
         self._completed_decisions += 1
         return ExplorationDecisionRecord(
@@ -703,6 +705,20 @@ class ExplorationPathTracker:
             consecutive_no_progress=self._consecutive_no_progress,
             consider_switch=self._consecutive_no_progress >= 5,
         )
+
+    @staticmethod
+    def _has_applied_progress_operation(path_action_result: PathJsonActionResult) -> bool:
+        """Whether this decision added a route or wrote verified route progress."""
+
+        for operation in path_action_result.operations:
+            canonical = operation.canonical_operation
+            if not operation.applied or not isinstance(canonical, Mapping):
+                continue
+            if canonical.get('op') == 'add':
+                return True
+            if canonical.get('op') == 'update' and isinstance(canonical.get('progress'), str):
+                return True
+        return False
 
     def _blocked_result(self, action: PathJsonAction, reason: str) -> PathJsonActionResult:
         results: list[PathJsonOperationResult] = []

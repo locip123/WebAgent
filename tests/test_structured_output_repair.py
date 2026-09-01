@@ -169,6 +169,7 @@ def _successful_finish() -> ChatInvokeCompletion[Any]:
                 "decision": {
                     "action": "finish",
                     "thought": "页面中已经有可验证的答案。",
+                    "decision_summary": "起始页尚未执行动作；下一步提交当前页已确认的答案，以完成任务。",
                     "success": True,
                     "answer": "测试答案",
                     "evidence": ["测试页面中的可见事实。"],

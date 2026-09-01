@@ -297,10 +297,18 @@ class AgentDecision(BaseModel):
 	action: ActionName
 	thought: str = ''
 	# Path-tree metadata is deliberately separate from browser action parameters.
-	# Empty defaults preserve construction compatibility for local callers; the
-	# Protocol III agent requires these fields only while exploration mode is active.
+	# decision_summary is required on every decision so the next agent can receive
+	# an unbroken, human-readable trajectory handoff.
 	current_path_id: str = Field(default='', max_length=128)
-	decision_summary: str = Field(default='无', min_length=1, max_length=4_000)
+	decision_summary: str = Field(
+		min_length=1,
+		max_length=4_000,
+		description=(
+			'用一至两句简短、通俗的简体中文说明：上一步在什么网站的什么位置做了什么及实际结果；'
+			'下一步将在什么网站的什么位置做什么，以及目的。首轮说明尚未执行上一步动作。'
+			'只能使用用户可理解的页面和控件名称，不得出现 URL、元素 ID 或 action/API 名称，且不得填写“无”。'
+		),
+	)
 	path_json_action: PathJsonAction = Field(default_factory=PathJsonAction)
 	element_id: int | None = Field(default=None, ge=0)
 	text: str | None = None
@@ -390,6 +398,13 @@ class AgentDecision(BaseModel):
 	def _non_empty_optional_string(cls, value: str | None) -> str | None:
 		if value is not None and not value:
 			raise ValueError('value must not be empty')
+		return value
+
+	@field_validator('decision_summary')
+	@classmethod
+	def _decision_summary_is_a_handoff(cls, value: str) -> str:
+		if value == '无':
+			raise ValueError('decision_summary must be a plain-language handoff, not "无"')
 		return value
 
 	@field_validator('evidence')

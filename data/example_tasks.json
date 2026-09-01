@@ -1,72 +1,16 @@
 [
   {
-    "task_idx": 90,
-    "task_id": "8f06f590245049f8982d47b0cc347536",
-    "website": "https://www.royalmail.com/",
-    "task": "在Royal Mail的国际邮资计算器中,选择寄往Japan,包裹重量1.5kg,选择International Tracked服务,运费是多少GBP?",
-    "answer": "27.1"
+    "task_idx": 78,
+    "task_id": "3d719b55e21148eab28fa0c9d8ba6223",
+    "website": "https://www.americashealthrankings.org/",
+    "task": "在America's Health Rankings中,选择Measure=Drug Deaths、State=Wyoming、Year=2021,读取Value(deaths per 100,000)是多少?",
+    "answer": "19.1"
   },
-  {
-    "task_idx": 91,
-    "task_id": "6aed20be626c4c6abe51f894c996e805",
-    "website": "https://www.nmpa.gov.cn/datasearch/home-index.html#category=yp",
-    "task": "在国家药监局数据查询中,选择\"国家基本药物（2018年版）\"数据库,搜索\"清热\",结果共有多少条?",
-    "answer": "125"
-  },
-  {
-    "task_idx": 92,
-    "task_id": "391e8411c5044392be590a4cbc4aecdf",
-    "website": "https://pubmed.ncbi.nlm.nih.gov/",
-    "task": "在PubMed高级搜索中,设置Title/Abstract=\"CRISPR-Cas9\"、Journal=\"Nature\"、Published Date=2020/01/01-2020/12/31,结果共有多少篇?",
-    "answer": "17"
-  },
-  {
-    "task_idx": 93,
-    "task_id": "35092d7bd317408da94dc1351d2872d8",
-    "website": "https://www.szse.cn/index/index.html",
-    "task": "在深圳证券交易所信息披露中,搜索公告标题含\"业绩预告\",日期=2023-01-15至2023-01-31、板块=创业板,公告共多少条?",
-    "answer": "652"
-  },
-  {
-    "task_idx": 94,
-    "task_id": "168767547cc94638a0a5fbd5dc44f995",
-    "website": "https://www.canadapost-postescanada.ca/cpc/en/home.page?name=tgt#",
-    "task": "在Canada Post的Find a Rate中,输入From=410-410 Adelaide St W Toronto M5V 1S8、To=Germany、Size=20x10x10、Weight=2kg、Rate=Tracked Packet International,运费是多少CAD?",
-    "answer": "104.48"
-  },
-  {
-    "task_idx": 95,
-    "task_id": "de7ae5ba9cc249ffa3512eb016152fe8",
-    "website": "https://www.hkexnews.hk/",
-    "task": "在港交所披露易中，搜索 Headline Category = Announcements and Notices、Stock Code = 01766（中国中车）、日期 = 2023-07-01 至 2023-12-31，公告共多少条？",
-    "answer": "43"
-  },
-  {
-    "task_idx": 96,
-    "task_id": "290a42c5220c4ca5bab1a64a04e246ad",
-    "website": "https://ilostat.ilo.org/",
-    "task": "在ILO ILOSTAT的数据浏览器中,选择Indicator=Mean weekly hours actually worked per employee、Country=Mongolia、Sex=Total、Economic Activity=Manufacturing(ISIC Rev.4 Section C),查看2022年(或最新可用年份)的数值是多少小时?",
-    "answer": "46.5"
-  },
-  {
-    "task_idx": 97,
-    "task_id": "fa3c9ed396d8415ea5ea1d3d5dd6066b",
-    "website": "https://www.ssb.no/en",
-    "task": "在Statistics Norway的StatBank中,搜索Table 07459 'Population by sex and one-year age groups',选择Region=0301 Oslo、Year=2023、Age=30 years,分别查看Females和Males的人口数,两者之和是多少?",
-    "answer": "F:8101；M:7874；total:15,975"
-  },
-  {
-    "task_idx": 98,
-    "task_id": "243920cbeefd42a480787899ef8f24ce",
-    "website": "https://www.qianzhan.com/",
-    "task": "在前瞻网首页,进入经济学人栏目,找到关于\"2026年中国机器人灵巧手行业竞争格局\"的分析文章,在文中的灵巧手产品参数对比表中,找到戴盟企业的\"DM-Hand1\"产品,其拇指夹力是多少N?",
-    "answer": "14"
-  },
-  {
-    "task_idx": 99,
-    "task_id": "6f58b004757145ee9fe0b81751f1a4a7",
-    "website": "https://www.thepaper.cn/",
-    "task": "在澎湃新闻首页,找到《五张图看清美国对伊之战代价有多大》一文,在文中关于油价影响的图表中,\"无战争\"预估2026/5/27的汽油价格是多少美元/加仑?",
-    "answer": "3.493"
+    {
+    "task_idx": 46,
+    "task_id": "b11a693cbb5b4d8186a06055427df7e6",
+    "website": "https://data.cityofchicago.org/",
+    "task": "查询2024年6月芝加哥THEFT类型犯罪总数。",
+    "answer": "5489（件）"
   }
 ]

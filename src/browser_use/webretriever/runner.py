@@ -57,6 +57,8 @@ DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES = PATCHRIGHT_EXPERIMENT_TASK_INDICES
 DEFAULT_REBROWSER_EXPERIMENT_TASK_INDICES = REBROWSER_EXPERIMENT_TASK_INDICES
 _SEC_USER_AGENT_EMAIL_RE = re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
 _MAX_SEC_USER_AGENT_LENGTH = 512
+_FAILURE_LOG_DETAIL_CHUNK_CHARS = 160
+_FAILURE_LOG_DETAIL_MAX_CHARS = 2_400
 
 
 @dataclass(slots=True)
@@ -453,7 +455,7 @@ def _log_diagnostic_task_failure(
 	task: CompetitionTask,
 	outcome: AgentRunOutcome,
 ) -> None:
-	"""Emit the persisted error for a failed task without exposing CDP credentials."""
+	"""Emit failure diagnostics in export-friendly, credential-safe log records."""
 
 	if not outcome.status.startswith('FAIL_') or not outcome.error:
 		return
@@ -464,14 +466,43 @@ def _log_diagnostic_task_failure(
 		subtype = diagnostic.get('subtype')
 		if isinstance(category, str) and isinstance(subtype, str):
 			diagnostic_suffix = f'; browser_failure={category}/{subtype}'
+	detail_chunks = _failure_log_detail_chunks(redact_cdp_url(outcome.error))
 	logger.error(
-		'Task %s/%s failed with status %s%s; error:\n%s',
+		'Task %s/%s failed with status %s%s; error: detail_chunks=%s',
 		task.task_idx,
 		task.task_id,
 		outcome.status,
 		diagnostic_suffix,
-		redact_cdp_url(outcome.error),
+		len(detail_chunks),
 	)
+	for chunk_index, detail_chunk in enumerate(detail_chunks, start=1):
+		# The competition's error-log export searches individual lines and truncates
+		# long ones.  A separate bounded ERROR record keeps every useful detail
+		# searchable instead of hiding it after a newline in the heading record.
+		logger.error(
+			'Task %s/%s error: detail[%s/%s]: %s',
+			task.task_idx,
+			task.task_id,
+			chunk_index,
+			len(detail_chunks),
+			detail_chunk,
+		)
+
+
+def _failure_log_detail_chunks(error: str) -> list[str]:
+	"""Return bounded one-line chunks suitable for a line-oriented log export."""
+
+	compact_error = ' '.join(error.split()) or '<empty error text>'
+	if len(compact_error) > _FAILURE_LOG_DETAIL_MAX_CHARS:
+		omitted_characters = len(compact_error) - _FAILURE_LOG_DETAIL_MAX_CHARS
+		compact_error = (
+			f'{compact_error[:_FAILURE_LOG_DETAIL_MAX_CHARS]} '
+			f'[detail truncated; {omitted_characters} additional characters omitted]'
+		)
+	return [
+		compact_error[start : start + _FAILURE_LOG_DETAIL_CHUNK_CHARS]
+		for start in range(0, len(compact_error), _FAILURE_LOG_DETAIL_CHUNK_CHARS)
+	]
 
 
 def _is_browser_disconnect_error(error: BaseException | str | None) -> bool:

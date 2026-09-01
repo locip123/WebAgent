@@ -118,8 +118,8 @@ class VerificationController:
 	def __init__(
 		self,
 		*,
-		max_clicks: int = 2,
-		max_drags: int = 3,
+		max_clicks: int = 5,
+		max_drags: int = 5,
 		max_wait_observations: int = 16,
 		wait_seconds: float = 3.0,
 		processing_wait_seconds: float = 5.0,

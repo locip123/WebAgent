@@ -464,6 +464,7 @@ def _recovery_successful_finish() -> ChatInvokeCompletion[Any]:
 				'decision': {
 					'action': 'finish',
 					'thought': 'The recovered page contains the answer.',
+					'decision_summary': '已在恢复后的页面确认答案；下一步提交该答案，以完成任务。',
 					'success': True,
 					'answer': 'Recovered answer',
 					'evidence': ['The recovered task-owned page.'],
