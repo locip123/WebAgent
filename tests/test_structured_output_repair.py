@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,14 @@ from types import SimpleNamespace
 from browser_use.llm.exceptions import ModelStructuredOutputError
 from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.llm.schema import SchemaOptimizer
-from browser_use.webretriever.agent import ProtocolIIIAgent
+from browser_use.webretriever.agent import ProtocolIIIAgent, _ANALYSIS_NOT_READY_RECOVERY, _finish_false_retry_message
 from browser_use.webretriever.browser import BrowserObservation
+from browser_use.webretriever.exploration_paths import (
+    SYSTEM_INITIAL_PATH_LOCATION,
+    SYSTEM_INITIAL_PATH_PROGRESS,
+    SYSTEM_INITIAL_PATH_STRATEGY,
+    ExplorationPathTracker,
+)
 from browser_use.webretriever.model_services import (
     ModelServiceConfig,
     ModelServiceRouter,
@@ -20,11 +27,21 @@ from browser_use.webretriever.model_services import (
 from browser_use.webretriever.model_retry import is_retryable_model_error
 from browser_use.webretriever.models import (
     ACTION_PARAMETER_CONTRACTS,
+    AgentDecision,
     AgentDecisionEnvelope,
     CompetitionTask,
     InitialPageAgentDecisionEnvelope,
     WebRetrieverActionResult,
 )
+from browser_use.webretriever.prompts import (
+    DEFAULT_THOUGHT_LANGUAGE,
+    PromptComposer,
+    PromptTarget,
+    StepContext,
+    StructuredDecisionRepairFeedback,
+)
+
+_HAN_TEXT = re.compile(r'[\u3400-\u9fff]')
 
 
 class _FakeModel:
@@ -162,6 +179,83 @@ class _ReadyRuntime:
         )
 
 
+def _language_policy_composer(task: str) -> PromptComposer:
+    return PromptComposer(
+        CompetitionTask(
+            task_idx=0,
+            task_id='prompt-language-policy',
+            website='https://example.test/start',
+            task=task,
+        ),
+        PromptTarget(model_id='gpt-5.4'),
+        max_steps=10,
+        thought_language=DEFAULT_THOUGHT_LANGUAGE,
+    )
+
+
+def _language_policy_observation(*, title: str = 'Test page', page_text: str = '') -> BrowserObservation:
+    return BrowserObservation(
+        screenshot=b'',
+        url='https://example.test/start',
+        title=title,
+        tabs=[{'index': 0, 'url': 'https://example.test/start', 'title': title, 'active': True}],
+        viewport_width=1280,
+        viewport_height=720,
+        elements=[],
+        page_text=page_text,
+        recent_network=[],
+        downloads=[],
+    )
+
+
+def test_model_owned_prompt_text_defaults_to_english() -> None:
+    composer = _language_policy_composer('Find the requested value.')
+    tracker = ExplorationPathTracker(task_id='prompt-language-policy')
+    tracker.ensure_system_initial_path(start_url='https://example.test/start')
+
+    step_prompt = composer.compose_step(
+        StepContext(
+            step_index=1,
+            observation=_language_policy_observation(page_text='A source page with no matching result.'),
+            history=(),
+            last_outcome='The prior action did not change page state.',
+            structured_decision_repair_feedback=StructuredDecisionRepairFeedback(
+                diagnostic='The decision omitted a required field.',
+                previous_invalid_decision='{"decision":{"action":"wait"}}',
+            ),
+            exploration_paths=tracker.payload(),
+            path_consecutive_no_progress=5,
+            analysis_not_ready_recovery=_ANALYSIS_NOT_READY_RECOVERY,
+            stale_click_recovery=True,
+        ),
+    ).text
+
+    assert DEFAULT_THOUGHT_LANGUAGE == 'English'
+    assert _HAN_TEXT.search(composer.system.text) is None
+    assert _HAN_TEXT.search(step_prompt) is None
+    assert _HAN_TEXT.search(_finish_false_retry_message('Find the requested value.')) is None
+    assert _HAN_TEXT.search(SYSTEM_INITIAL_PATH_LOCATION) is None
+    assert _HAN_TEXT.search(SYSTEM_INITIAL_PATH_STRATEGY) is None
+    assert _HAN_TEXT.search(SYSTEM_INITIAL_PATH_PROGRESS) is None
+    assert AgentDecision.model_json_schema()['properties']['decision_summary']['default'] == 'none'
+
+
+def test_external_chinese_text_is_preserved_in_the_prompt() -> None:
+    composer = _language_policy_composer('查找页面中显示的正式名称。')
+    step_prompt = composer.compose_step(
+        StepContext(
+            step_index=0,
+            observation=_language_policy_observation(title='示例页面', page_text='正式名称：示例机构'),
+            history=(),
+            last_outcome='The task has just started.',
+        ),
+    ).text
+
+    assert '查找页面中显示的正式名称。' in step_prompt
+    assert '示例页面' in step_prompt
+    assert '正式名称：示例机构' in step_prompt
+
+
 def _successful_finish() -> ChatInvokeCompletion[Any]:
     return ChatInvokeCompletion(
         completion=InitialPageAgentDecisionEnvelope.model_validate(
@@ -169,7 +263,6 @@ def _successful_finish() -> ChatInvokeCompletion[Any]:
                 "decision": {
                     "action": "finish",
                     "thought": "页面中已经有可验证的答案。",
-                    "decision_summary": "起始页尚未执行动作；下一步提交当前页已确认的答案，以完成任务。",
                     "success": True,
                     "answer": "测试答案",
                     "evidence": ["测试页面中的可见事实。"],
@@ -454,7 +547,7 @@ def test_unavailable_analysis_attempt_is_rejected_before_path_updates_and_recove
     assert outcome.status == 'SUCCESS'
     assert len(model.output_formats) == 2
     assert len(model.system_prompts) == 2
-    assert '数据分析助手当前不可用' in model.user_prompts[1]
+    assert 'The data analysis assistant is currently unavailable' in model.user_prompts[1]
     rejected_step = outcome.steps[0]
     assert rejected_step['gate_rejected'] is True
     assert json.loads(rejected_step['outcome'])['status'] == 'analysis_not_ready'
@@ -764,7 +857,7 @@ def test_repeated_action_contract_error_hides_action_only_for_the_current_step(t
     assert 'inspect_network' not in model.system_prompts[2]
     assert 'inspect_network' in model.system_prompts[3]
     assert prompt_log['steps'][2]['temporarily_hidden_actions'] == ['inspect_network']
-    assert '已从当前步骤剩余的修复请求中暂时移除' in model.user_prompts[2]
+    assert 'has been temporarily removed from the remaining repair requests' in model.user_prompts[2]
 
 
 def test_action_contract_hide_survives_intervening_generic_structured_error(tmp_path: Path) -> None:
@@ -811,7 +904,7 @@ def test_action_contract_hide_survives_intervening_generic_structured_error(tmp_
     assert 'finish' in hidden_schema
     assert 'inspect_network' in restored_schema
     assert prompt_log['steps'][3]['temporarily_hidden_actions'] == ['inspect_network']
-    assert '已从当前步骤剩余的修复请求中暂时移除' in model.user_prompts[3]
+    assert 'has been temporarily removed from the remaining repair requests' in model.user_prompts[3]
 
 
 def test_bare_json_decode_error_in_structured_call_returns_to_agent_without_router_fallback(

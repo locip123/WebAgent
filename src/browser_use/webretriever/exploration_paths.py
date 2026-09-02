@@ -24,9 +24,17 @@ EXPLORATION_REVIEW_RECENT_DECISION_WINDOW = 10
 EXPLORATION_REVIEW_MAX_IN_WINDOW = 3
 EXPLORATION_PATH_STATUSES = frozenset({'pending', 'in_progress', 'failed', 'succeeded'})
 SYSTEM_INITIAL_PATH_ID = '1'
-SYSTEM_INITIAL_PATH_LOCATION = '任务起始页面'
-SYSTEM_INITIAL_PATH_STRATEGY = '这是探索路径树的根节点，你没有任何权限修改根节点的任何值，你的任务是添加子路径，构建路径探索树'
-SYSTEM_INITIAL_PATH_PROGRESS = '准备分析任务起始页面寻找所有可到达任务目的地或正确页面的路线,并将其添加到子路径中'
+SYSTEM_INITIAL_PATH_LOCATION = 'Task starting page'
+SYSTEM_INITIAL_PATH_STRATEGY = (
+    'This is the root of the exploration path tree. You may not modify any root-node value; '
+    'add child paths to build the exploration tree.'
+)
+SYSTEM_INITIAL_PATH_PROGRESS = (
+    'Ready to analyze the task starting page, identify every route that could reach the task destination '
+    'or correct page, and add those routes as child paths.'
+)
+NO_PROGRESS_SENTINEL = 'none'
+_LEGACY_NO_PROGRESS_SENTINELS = frozenset({'无'})
 
 ExplorationPathStatus = Literal['pending', 'in_progress', 'failed', 'succeeded']
 ExplorationReviewTrigger = Literal['initial_page', 'unseen_page', 'periodic']
@@ -622,6 +630,11 @@ class ExplorationPathTracker:
             return self._blocked_result(action, 'decision_summary must be provided during exploration')
         if not isinstance(decision_summary, str) or not decision_summary.strip():
             return self._blocked_result(action, 'decision_summary must be a non-empty string')
+        if self._current_observation_is_unseen_page and self._is_no_progress_summary(decision_summary):
+            return self._blocked_result(
+                action,
+                f'a previously unseen page must be recorded in decision_summary, not "{NO_PROGRESS_SENTINEL}"',
+            )
         if not isinstance(current_path_id, str) or not current_path_id.strip():
             return self._blocked_result(action, 'current_path_id must be a non-empty string')
 
@@ -675,29 +688,25 @@ class ExplorationPathTracker:
         self._active_path_id = path_id
         self._changed()
 
-    def record_decision(
-        self,
-        *,
-        current_path_id: str,
-        path_action_result: PathJsonActionResult,
-    ) -> ExplorationDecisionRecord:
-        """Record a completed decision from its successfully applied path delta."""
+    def record_decision(self, *, current_path_id: str, decision_summary: str) -> ExplorationDecisionRecord:
+        """Record a completed decision without mutating node-local route state."""
 
         if current_path_id != self._active_path_id:
             raise ExplorationPathError('recorded current_path_id is not active')
         node = self._find_path(current_path_id)
         if node is None:
             raise ExplorationPathError(f'current_path_id does not exist: {current_path_id!r}')
-        if not isinstance(path_action_result, PathJsonActionResult):
-            raise ExplorationPathError('recorded path_action_result must be a PathJsonActionResult')
+        if not isinstance(decision_summary, str) or not decision_summary.strip():
+            raise ExplorationPathError('decision_summary must be a non-empty string')
+        normalized_summary = decision_summary.strip()
 
         if self._stagnation_path_id != current_path_id:
             self._stagnation_path_id = current_path_id
             self._consecutive_no_progress = 0
-        if self._has_applied_progress_operation(path_action_result):
-            self._consecutive_no_progress = 0
-        else:
+        if self._is_no_progress_summary(normalized_summary):
             self._consecutive_no_progress += 1
+        else:
+            self._consecutive_no_progress = 0
 
         self._completed_decisions += 1
         return ExplorationDecisionRecord(
@@ -705,20 +714,6 @@ class ExplorationPathTracker:
             consecutive_no_progress=self._consecutive_no_progress,
             consider_switch=self._consecutive_no_progress >= 5,
         )
-
-    @staticmethod
-    def _has_applied_progress_operation(path_action_result: PathJsonActionResult) -> bool:
-        """Whether this decision added a route or wrote verified route progress."""
-
-        for operation in path_action_result.operations:
-            canonical = operation.canonical_operation
-            if not operation.applied or not isinstance(canonical, Mapping):
-                continue
-            if canonical.get('op') == 'add':
-                return True
-            if canonical.get('op') == 'update' and isinstance(canonical.get('progress'), str):
-                return True
-        return False
 
     def _blocked_result(self, action: PathJsonAction, reason: str) -> PathJsonActionResult:
         results: list[PathJsonOperationResult] = []
@@ -746,6 +741,13 @@ class ExplorationPathTracker:
                 )
             )
         return PathJsonActionResult(tuple(results), reason)
+
+    @staticmethod
+    def _is_no_progress_summary(value: str) -> bool:
+        """Recognize the English sentinel and legacy persisted Chinese value."""
+
+        normalized = value.strip()
+        return normalized == NO_PROGRESS_SENTINEL or normalized in _LEGACY_NO_PROGRESS_SENTINELS
 
     def _canonicalize_operation(
         self, index: int, operation: PathJsonOperationWire
@@ -848,7 +850,7 @@ class ExplorationPathTracker:
                     return None, self._invalid_operation_result(
                         index, requested_op, ignored, normalized, f'{field_name} must be a non-empty string or omitted'
                     )
-                if value == '无':
+                if self._is_no_progress_summary(value):
                     return None, self._invalid_operation_result(
                         index,
                         requested_op,
@@ -1139,6 +1141,7 @@ __all__ = [
     'EXPLORATION_PATH_FILENAME',
     'EXPLORATION_PATH_SCHEMA_VERSION',
     'EXPLORATION_PATH_STATUSES',
+    'NO_PROGRESS_SENTINEL',
     'SYSTEM_INITIAL_PATH_ID',
     'SYSTEM_INITIAL_PATH_LOCATION',
     'SYSTEM_INITIAL_PATH_PROGRESS',

@@ -38,3 +38,5 @@ data/protocol3.json
 data/example_tasks.json
 scripts/count_data_analysis_assistant.py
 scripts/find_close_tab_tasks.py
+scripts/compare_smoke_answers.py
+data/local-smoke-3_answer_comparison.json

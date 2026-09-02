@@ -180,10 +180,9 @@ class _RecoveryModel:
 			completion=InitialPageAgentDecisionEnvelope.model_validate(
 				{
 					'decision': {
-					'action': 'finish',
-					'thought': 'The replacement task page has the answer.',
-					'decision_summary': '起始页尚未执行动作；下一步提交当前页已确认的答案，以完成任务。',
-					'success': True,
+						'action': 'finish',
+						'thought': 'The replacement task page has the answer.',
+						'success': True,
 						'answer': 'Recovered answer',
 						'evidence': ['The replacement task page contains the answer.'],
 						'path_json_action': {'operations': []},

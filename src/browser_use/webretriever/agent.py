@@ -73,8 +73,11 @@ from browser_use.webretriever.verification import VerificationAction, Verificati
 _FIND_CHART_MAX_SECONDS = 60.0
 _ANALYSIS_MAX_SECONDS = 90.0
 _FINISH_RESERVE_SECONDS = 30.0
-_FINISH_FALSE_RETRY_PREFIX = '你拥有强大的浏览器操作能力，你的任务是：'
-_FINISH_FALSE_RETRY_SUFFIX = '这个任务是一定可以完成的，当前尚未完成，如果当前方法不可行，请寻找其他解决方案或途径，继续完成任务。'
+_FINISH_FALSE_RETRY_PREFIX = 'You have powerful browser interaction capabilities. Your task is:'
+_FINISH_FALSE_RETRY_SUFFIX = (
+	'This task can be completed, but it is not complete yet. If the current approach does not work, '
+	'find another solution or route and continue working on the task.'
+)
 _NON_RETRYABLE_ANALYSIS_STATUSES = frozenset({'analysis_unavailable', 'invalid_manifest', 'no_tabular_data'})
 _INVALID_DECISION_SNAPSHOT_MAX_CHARACTERS = 8_000
 _INVALID_DECISION_SNAPSHOT_TRUNCATION_MARKER = '\n...[previous_invalid_decision truncated]...\n'
@@ -95,10 +98,11 @@ _SURVIVING_TASK_PAGE_RECOVERY_NOTICE = (
 _TASK_PAGE_RESTART_MAX_SECONDS = 60.0
 _CLEAN_WORKER_RECOVERY_MAX_SECONDS = 160.0
 _ANALYSIS_NOT_READY_RECOVERY = (
-	'数据分析助手当前不可用：本任务没有可用的 ready_data_dir。\n'
-	'downloads/ 下的文档不是可分析数据工件；禁止再次调用 call_data_analysis_assistant，'
-	'直到观察中出现新的、完整的 ready_data_dir。\n'
-	'请改用文档取证：find_text / read_element，或继续在官方一方来源中查找任务所需证据。'
+	'The data analysis assistant is currently unavailable because this task has no usable ready_data_dir.\n'
+	'Documents under downloads/ are not analyzable data artifacts. Do not call call_data_analysis_assistant '
+	'again until an observation contains a new, complete ready_data_dir.\n'
+	'Use document evidence actions such as find_text or read_element instead, or continue searching '
+	'official first-party sources for the evidence required by the task.'
 )
 _STALE_CLICK_RECOVERY_LAST_OUTCOME = (
 	'A previous semantic click could not complete because its current element reference expired. '
@@ -270,7 +274,7 @@ def _model_output_protocol(
 def _finish_false_retry_message(task: str) -> str:
 	"""Build the authoritative continuation prompt after ``finish(false)``."""
 
-	return f'{_FINISH_FALSE_RETRY_PREFIX}{task.strip()}。{_FINISH_FALSE_RETRY_SUFFIX}'
+	return f'{_FINISH_FALSE_RETRY_PREFIX}\n{task.strip()}\n{_FINISH_FALSE_RETRY_SUFFIX}'
 
 
 class _DecisionTaskDeadline(TimeoutError):
@@ -396,8 +400,8 @@ def _temporarily_hidden_action_diagnostic(diagnostic: str, action: str) -> str:
 	"""Explain that a repeatedly malformed action was removed from this repair."""
 
 	return (
-		f"{diagnostic}。动作 {action!r} 已从当前步骤剩余的修复请求中暂时移除；"
-		'请从仍在动作契约中的其他动作重新选择。'
+		f'{diagnostic}. Action {action!r} has been temporarily removed from the remaining repair requests '
+		'for this step. Choose another action that remains in the action contract.'
 	)
 
 
@@ -751,26 +755,26 @@ def _normalized_path_repair_diagnostic(
 
 	reasons = tuple(operation.reason or '' for operation in path_action_result.operations)
 	if path_action_result.blocked_reason == 'initial page exploration review requires at least one add operation':
-		return '首轮路径审查必须在 `path_json_action.operations` 中至少包含一个 `add`，以创建具体探索路径后再继续。'
+		return 'The initial path review must include at least one `add` in `path_json_action.operations` to create a concrete exploration path before continuing.'
 	if path_action_result.blocked_reason == 'initial page exploration review accepts add operations only':
-		return '首轮路径审查的 `path_json_action.operations` 只能包含 `add`；删除所有 `update` 后重试。'
+		return 'The initial path review accepts only `add` operations in `path_json_action.operations`. Remove every `update` and retry.'
 	if path_action_result.blocked_reason == 'initial page exploration review adds must use system initial root "1" as parent_path_id':
-		return '首轮创建的每条路径必须使用 `parent_path_id="1"`，以作为系统根的直接子路径。'
+		return 'Every path created during the initial review must use `parent_path_id="1"` so it is a direct child of the system root.'
 	if any('system initial root "1" is immutable' in reason for reason in reasons):
-		return '删除所有 `path_id="1"` 的 `update`；至少保留一个 `add`，现在需要你使用 `add`将当前页面内所有可能的找到答案的探索路径添加到路径树中。'
+		return 'Remove every `update` whose `path_id` is `"1"`. Keep at least one `add`, and use `add` now to place every route visible on the current page that could lead to the answer into the path tree.'
 	if any('marking a path failed requires' in reason for reason in reasons):
-		return '将路径标记为 `failed` 时必须在同一个 `update` 中用 `progress` 写明该路径无法到达任务目的地或答案页面的具体证据，然后再切换到新的探索路径。'
+		return 'When marking a path `failed`, the same `update` must use `progress` to record concrete evidence that the path cannot reach the task destination or answer page. Then switch to a new exploration path.'
 	if any('marking a path succeeded requires' in reason for reason in reasons):
-		return '将路径标记为 `succeeded` 时必须在同一个 `update` 中用 `progress` 写明已到达正确页面或答案位置的具体证据。'
+		return 'When marking a path `succeeded`, the same `update` must use `progress` to record concrete evidence that the correct page or answer location has been reached.'
 	if path_action_result.blocked_reason == 'exploration path tree is missing required system initial root "1"':
-		return '探索路径树缺少执行器创建的系统根路径 `1`，本轮决策未执行。'
+		return 'The exploration path tree is missing executor-created system root path `1`; this decision was not executed.'
 	if any('path_id does not exist' in reason for reason in reasons):
-		return '路径更新引用了当前可信路径树中不存在的路径。`update` 只能使用树中已有的 `path_id`；新路径请使用 `add`。'
+		return 'A path update referenced a path that is absent from the current trusted tree. `update` may use only an existing `path_id`; use `add` for a new path.'
 	if path_action_result.blocked and (path_action_result.blocked_reason or '').startswith('current_path_id does not exist'):
-		return '`current_path_id` 必须是当前可信路径树中已有且未终态的路径。请根据完整路径树重新选择。'
+		return '`current_path_id` must be an existing non-terminal path in the current trusted tree. Select it again from the complete path tree.'
 	if path_action_result.blocked and 'terminal' in (path_action_result.blocked_reason or ''):
-		return '`current_path_id` 不能指向已终态路径。请根据完整路径树选择一个未终态路径。'
-	return '一个或多个路径增量未被应用。请根据当前可信路径树和 `add`/`update` 契约，仅提交本轮有效增量。'
+		return '`current_path_id` cannot reference a terminal path. Select a non-terminal path from the complete path tree.'
+	return 'One or more path deltas were not applied. Using the current trusted path tree and the `add`/`update` contract, submit only valid deltas for this decision.'
 
 
 def _requires_root_update_repair_protocol(path_action_result: PathJsonActionResult) -> bool:
@@ -985,15 +989,11 @@ def _record_exploration_decision(
 	tracker: ExplorationPathTracker,
 	*,
 	decision: AgentDecision,
-	path_action_result: PathJsonActionResult,
 ) -> None:
-	"""Record a completed decision and its applied path-tree progress."""
+	"""Record a decision summary after a completed action."""
 	if tracker.answer_priority_mode:
 		return
-	tracker.record_decision(
-		current_path_id=decision.current_path_id,
-		path_action_result=path_action_result,
-	)
+	tracker.record_decision(current_path_id=decision.current_path_id, decision_summary=decision.decision_summary)
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -2233,7 +2233,7 @@ class ProtocolIIIAgent:
 				step_record = {
 					'step': step,
 					'url': observation.url,
-					'thought': '验证状态机：可见验证在有界等待后仍未完成。',
+					'thought': 'Verification state machine: the visible challenge did not complete within the bounded wait.',
 					'action': {'action': 'verification_blocked'},
 					'path_json_action': {'operations': []},
 					'outcome': verification_decision.reason,
@@ -2269,7 +2269,7 @@ class ProtocolIIIAgent:
 				action_text = json.dumps(
 					{**payload, 'source': 'verification_controller'}, ensure_ascii=False, separators=(',', ':')
 				)
-				thought = f'验证状态机：{verification_decision.reason}。'
+				thought = f'Verification state machine: {verification_decision.reason}.'
 				_save_visual_screenshot(
 					screenshot,
 					self.task_dir / 'trajectory_visual' / f'{step}.png',
@@ -2630,7 +2630,7 @@ class ProtocolIIIAgent:
 							exploration_tracker.accept_review(exploration_review)
 					except ExplorationPathError as exc:
 						path_action_result = PathJsonActionResult((), str(exc))
-						path_error = '路径树状态无法应用。请根据当前可信路径树和 `add`/`update` 契约，仅提交本轮有效增量。'
+						path_error = 'The path-tree state could not be applied. Using the current trusted path tree and the `add`/`update` contract, submit only valid deltas for this decision.'
 
 				if path_error is not None:
 					root_update_repair = _requires_root_update_repair_protocol(path_action_result)
@@ -2719,7 +2719,6 @@ class ProtocolIIIAgent:
 					_record_exploration_decision(
 						exploration_tracker,
 						decision=decision,
-						path_action_result=path_action_result,
 					)
 					last_outcome = _finish_false_retry_message(self.task.task)
 					continue
@@ -2729,7 +2728,6 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
-					path_action_result=path_action_result,
 				)
 				continue
 
@@ -2759,7 +2757,6 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
-					path_action_result=path_action_result,
 				)
 				consecutive_errors += 1
 				if consecutive_errors >= self.max_consecutive_action_errors:
@@ -2802,7 +2799,6 @@ class ProtocolIIIAgent:
 				_record_exploration_decision(
 					exploration_tracker,
 					decision=decision,
-					path_action_result=path_action_result,
 				)
 				# A detected loop is a planning stall, not a browser failure, so it
 				# must not consume the consecutive-action-error budget.
@@ -3031,7 +3027,6 @@ class ProtocolIIIAgent:
 			_record_exploration_decision(
 				exploration_tracker,
 				decision=decision,
-				path_action_result=path_action_result,
 			)
 			if browser_session_interrupted is not None:
 				browser_failure = classify_browser_failure(
