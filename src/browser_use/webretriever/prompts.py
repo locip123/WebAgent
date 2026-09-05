@@ -1160,7 +1160,7 @@ At least one exploration path has reached the correct page or answer location. S
 					}[review.trigger]
 					review_instruction = (
 					'''INITIAL PATH REVIEW — HARD RULES:
-1. The current path tree contains only the immutable system anchor `"1"`; no concrete exploration path exists yet. For a normal browser action, this decision's output schema exposes only one or more root-child `add` operations in `path_json_action.operations`. Add every task-relevant route reachable through a visible element on the current page that could lead to the correct page or answer location as a concrete exploration path under root `"1"` (`parent_path_id: "1"`). A successful finish with complete answer and evidence is the only no-path exception.
+1. The current path tree contains only the immutable system anchor `"1"`; no concrete exploration path exists yet. For a normal browser action, this decision's output schema exposes only one or more root-child `add` operations in `path_json_action.operations`. Add every task-relevant route reachable through a visible element on the current page that could lead to the correct page or answer location as a concrete exploration path under root `"1"` (`parent_path_id: "1"`). Submitting a complete answer candidate for executor verification is the only no-path exception.
 2. Operations are applied in array order. The executor generates a path ID after each `add`; therefore, within the same decision, you may select only a path in the current trusted tree or a path created by an earlier `add` in this decision.
 3. The system anchor `"1"` is never edited or marked failed. The normal `add`/`update` protocol becomes available only after this initial review succeeds.'''
 					if review.trigger == 'initial_page'

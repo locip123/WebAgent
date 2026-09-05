@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import inspect
 import json
+import logging
 import re
 import time
 from collections import deque
@@ -35,6 +37,13 @@ from browser_use.webretriever.artifacts import (
 )
 from browser_use.webretriever.browser import is_browser_session_closed_error, redact_cdp_url
 from browser_use.webretriever.browser_failures import BrowserFailurePhase, classify_browser_failure
+from browser_use.webretriever.completion import (
+	AnswerCandidate,
+	CompletionGate,
+	CompletionVerificationError,
+	LLMCompletionReviewer,
+	RequirementLedgerError,
+)
 from browser_use.webretriever.exploration_paths import (
 	ExplorationPathError,
 	ExplorationPathTracker,
@@ -67,6 +76,13 @@ from browser_use.webretriever.prompts import (
 	StepContext,
 	StructuredDecisionRepairFeedback,
 	normalize_thought_language,
+)
+from browser_use.webretriever.run_control import (
+	CancellationToken,
+	NoOpRunObserver,
+	RunObserver,
+	RunnerEvent,
+	emit_safely,
 )
 from browser_use.webretriever.verification import VerificationAction, VerificationController
 
@@ -110,6 +126,18 @@ _STALE_CLICK_RECOVERY_LAST_OUTCOME = (
 )
 
 
+def _supports_completion_protocol(llm: Any) -> bool:
+	"""Avoid consuming legacy decision-only model seams during capability setup."""
+
+	if isinstance(llm, ModelServiceRouter):
+		return all(_supports_completion_protocol(state.client) for state in llm._states)
+	try:
+		parameters = inspect.signature(llm.ainvoke).parameters
+	except (AttributeError, TypeError, ValueError):
+		return False
+	return 'output_format' in parameters
+
+
 def _recovery_error_text(error: BaseException) -> str:
 	"""Bound and redact recovery diagnostics before persisting them."""
 
@@ -124,15 +152,16 @@ def _action_contracts_for_data_capability(
 	"""Return one request-local action set without mutating the global contract.
 
 	``hidden_actions`` only applies to same-step structured-output repair.  The
-	``finish`` action always remains available so the model can return an honest
-	terminal result instead of being left with an empty action space.
+	``finish`` and ``submit_answer_candidate`` always remain available so the
+	model can report a terminal failure or submit its candidate instead of being
+	left with an empty action space.
 	"""
 
 	contracts = dict(ACTION_PARAMETER_CONTRACTS)
 	if not eligible_data_dirs:
 		contracts.pop('call_data_analysis_assistant')
 	for action in hidden_actions:
-		if action != 'finish':
+		if action not in {'finish', 'submit_answer_candidate'}:
 			contracts.pop(action, None)
 	return contracts
 
@@ -705,6 +734,12 @@ class AgentRunOutcome:
 	status: str
 	agent_answer: str = ''
 	evidence: list[str] = field(default_factory=list)
+	evidence_records: list[dict[str, Any]] = field(default_factory=list)
+	requirement_ledger: dict[str, Any] | None = None
+	answer_candidate: dict[str, Any] | None = None
+	completion_verification: dict[str, Any] | None = None
+	completion_receipt: dict[str, Any] | None = None
+	completion_feedback: str | None = None
 	actions: list[str] = field(default_factory=list)
 	thoughts: list[str] = field(default_factory=list)
 	steps: list[dict[str, Any]] = field(default_factory=list)
@@ -1077,6 +1112,10 @@ class ProtocolIIIAgent:
 		structured_prompt_log: bool = False,
 		chart_network_inspector: Any | None = None,
 		data_analysis_assistant: Any | None = None,
+		completion_gate: CompletionGate | None = None,
+		cancellation: CancellationToken | None = None,
+		observer: RunObserver | None = None,
+		worker_id: int | None = None,
 		task_deadline_monotonic: float | None = None,
 		recover_unstarted_runtime: Callable[[], Awaitable[Any]] | None = None,
 		recover_missing_task_page: Callable[[], Awaitable[Any]] | None = None,
@@ -1143,6 +1182,22 @@ class ProtocolIIIAgent:
 		# its action.  Ordinary browser tasks and unit tests therefore do not pay
 		# its import/dependency cost.
 		self.data_analysis_assistant = data_analysis_assistant
+		self.completion_gate = completion_gate or CompletionGate(
+			task=self.task,
+			task_dir=self.task_dir,
+			reviewer=LLMCompletionReviewer(
+				llm=self.llm,
+				task_dir=self.task_dir,
+				task_deadline_monotonic=self.task_deadline_monotonic,
+				model_timeout_seconds=self.model_timeout_seconds,
+				affinity_key=self.task.task_id,
+			),
+		)
+		self.cancellation = cancellation or CancellationToken()
+		self.observer = observer or NoOpRunObserver()
+		self.worker_id = worker_id
+		self._completion_usage_accounted: dict[str, int] = {}
+		self._completion_enabled = _supports_completion_protocol(llm)
 		# The runner can enforce a task-wide deadline while this coroutine is in
 		# flight.  Retain the mutable outcome so it can persist all completed work
 		# if that outer deadline cancels ``run`` before it returns.
@@ -1173,6 +1228,51 @@ class ProtocolIIIAgent:
 		if self.task_deadline_monotonic is None:
 			return float('inf')
 		return max(0.0, self.task_deadline_monotonic - time.monotonic())
+
+	async def _emit(self, event_type: str, *, payload: Mapping[str, Any]) -> None:
+		await emit_safely(
+			self.observer,
+			RunnerEvent(
+				type=event_type,
+				worker_id=self.worker_id,
+				task_id=self.task.task_id,
+				task_idx=self.task.task_idx,
+				payload=payload,
+			),
+			logger=logging.getLogger('webretriever.agent'),
+		)
+
+	async def _emit_completed_step(self, *, step: int, action: str, outcome: str) -> None:
+		await self._emit(
+			'task.step.completed',
+			payload={
+				'step': step,
+				'max_steps': self.max_steps,
+				'action': action,
+				'outcome': outcome,
+			},
+		)
+
+	def _sync_completion_outcome(self, outcome: AgentRunOutcome) -> None:
+		"""Copy executor-owned completion data into the evaluator-facing outcome."""
+
+		snapshot = self.completion_gate.snapshot()
+		outcome.requirement_ledger = snapshot.get('requirement_ledger')
+		outcome.answer_candidate = snapshot.get('answer_candidate')
+		outcome.evidence = list(snapshot.get('evidence') or [])
+		outcome.evidence_records = list(snapshot.get('evidence_records') or [])
+		outcome.completion_verification = snapshot.get('completion_verification')
+		outcome.completion_receipt = snapshot.get('completion_receipt')
+		outcome.completion_feedback = snapshot.get('completion_feedback')
+		usage = getattr(self.completion_gate, 'usage', {})
+		if isinstance(usage, Mapping):
+			for key, total in usage.items():
+				if type(total) is not int:
+					continue
+				accounted = self._completion_usage_accounted.get(str(key), 0)
+				if total > accounted:
+					outcome.usage[str(key)] = outcome.usage.get(str(key), 0) + total - accounted
+				self._completion_usage_accounted[str(key)] = total
 
 	async def _await_runtime_recovery(self, awaitable: Awaitable[Any]) -> Any:
 		"""Await a recovery operation without extending the task deadline."""
@@ -1850,7 +1950,11 @@ class ProtocolIIIAgent:
 		review = context.exploration_review
 		initial_page = not context.answer_priority_mode and review is not None and review.trigger == 'initial_page'
 		normalized_hidden_actions = tuple(
-			sorted(action for action in set(hidden_actions) if action in ACTION_PARAMETER_CONTRACTS and action != 'finish')
+			sorted(
+				action
+				for action in set(hidden_actions)
+				if action in ACTION_PARAMETER_CONTRACTS and action not in {'finish', 'submit_answer_candidate'}
+			)
 		)
 		if eligible_data_dirs is None and not normalized_hidden_actions:
 			if initial_page:
@@ -1937,7 +2041,11 @@ class ProtocolIIIAgent:
 			)
 		eligible_data_dirs = self._eligible_data_dirs()
 		normalized_hidden_actions = tuple(
-			sorted(action for action in set(hidden_actions) if action in ACTION_PARAMETER_CONTRACTS and action != 'finish')
+			sorted(
+				action
+				for action in set(hidden_actions)
+				if action in ACTION_PARAMETER_CONTRACTS and action not in {'finish', 'submit_answer_candidate'}
+			)
 		)
 		action_contracts = _action_contracts_for_data_capability(
 			eligible_data_dirs,
@@ -2090,6 +2198,27 @@ class ProtocolIIIAgent:
 		atomic_write_json(exploration_paths_path, exploration_tracker.payload())
 		verification = VerificationController(target_url=self.task.website)
 
+		def cancellation_requested() -> bool:
+			if not self.cancellation.cancelled:
+				return False
+			outcome.status = 'FAIL_CANCELLED'
+			outcome.error = self.cancellation.reason
+			return True
+
+		if self._completion_enabled:
+			try:
+				await self.completion_gate.prepare()
+			except RequirementLedgerError as exc:
+				outcome.status = 'FAIL_REQUIREMENT_LEDGER'
+				outcome.error = str(exc)
+				self._sync_completion_outcome(outcome)
+				outcome.duration_seconds = round(time.monotonic() - started_at, 3)
+				outcome.verification = verification.summary()
+				self._update_timing_summary(outcome)
+				return outcome
+			else:
+				self._sync_completion_outcome(outcome)
+
 		# A stale semantic click may consume one explicitly bounded recovery action.
 		# The regular loop guard below keeps the additional slot unavailable unless
 		# the immediately prior terminal-threshold failure qualified for recovery.
@@ -2099,14 +2228,21 @@ class ProtocolIIIAgent:
 		task_page_recovery_attempted = False
 		task_page_same_context_recovered = False
 		for step in step_counter:
+			if cancellation_requested():
+				break
 			if step >= self.max_steps and not stale_click_recovery_pending:
 				outcome.status = 'FAIL_MAX_STEPS'
 				outcome.error = f'Reached the competition limit of {self.max_steps} steps without a final answer'
 				break
 			stale_click_recovery_step = stale_click_recovery_pending
 			try:
+				await self._emit('task.phase_changed', payload={'phase': 'observing'})
+				if cancellation_requested():
+					break
 				observation = await self.runtime.observe(step)
 			except Exception as exc:
+				if cancellation_requested():
+					break
 				task_page_state = self._task_page_state(self.runtime)
 				session_closed = is_browser_session_closed_error(exc)
 				if session_closed:
@@ -2205,6 +2341,8 @@ class ProtocolIIIAgent:
 					failure_payload['recovery_attempted'] = True
 					failure_payload['recovery_stages'] = list(self._task_page_recovery_stages)
 				outcome.browser_failure = failure_payload
+				break
+			if cancellation_requested():
 				break
 			try:
 				exploration_tracker.ensure_system_initial_path(start_url=observation.url)
@@ -2394,7 +2532,12 @@ class ProtocolIIIAgent:
 			temporarily_hidden_actions: set[str] = {'click'} if stale_click_recovery_step else set()
 			action_contract_error_counts: dict[str, int] = {}
 			while not path_tree_ready:
+				if cancellation_requested():
+					break
 				try:
+					await self._emit('task.phase_changed', payload={'phase': 'model_wait'})
+					if cancellation_requested():
+						break
 					decision, model_usage, prompt_index, model_call_started_at = await self._request_model_decision(
 						step=step,
 						context=StepContext(
@@ -2667,6 +2810,8 @@ class ProtocolIIIAgent:
 
 			if not path_tree_ready:
 				break
+			if cancellation_requested():
+				break
 			recovery_action_active = stale_click_recovery_step
 			if recovery_action_active:
 				# The fresh recovery action gets one real browser attempt even if normal
@@ -2704,6 +2849,7 @@ class ProtocolIIIAgent:
 				if decision.success is True and answer and evidence:
 					step_record['outcome'] = 'Task completed with an answer and origin explanation.'
 					outcome.steps.append(step_record)
+					await self._emit_completed_step(step=step, action=decision.action, outcome='ok')
 					outcome.status = 'SUCCESS'
 					outcome.agent_answer = answer
 					outcome.evidence = evidence
@@ -2729,6 +2875,39 @@ class ProtocolIIIAgent:
 					exploration_tracker,
 					decision=decision,
 				)
+				continue
+
+			if decision.action == 'submit_answer_candidate':
+				if not self._completion_enabled:
+					outcome.status = 'FAIL_COMPLETION_VERIFICATION'
+					outcome.error = 'Completion protocol is unavailable for this decision-only model seam.'
+					step_record['outcome'] = outcome.error
+					outcome.steps.append(step_record)
+					break
+				candidate = AnswerCandidate(
+					answer=decision.answer or '',
+					answer_items=decision.answer_items or [],
+					claims=decision.claims or [],
+				)
+				try:
+					gate_result = await self.completion_gate.submit(candidate)
+				except CompletionVerificationError as exc:
+					outcome.status = 'FAIL_COMPLETION_VERIFICATION'
+					outcome.error = str(exc)
+					self._sync_completion_outcome(outcome)
+					step_record['outcome'] = 'Completion verification could not return a valid result.'
+					outcome.steps.append(step_record)
+					break
+				self._sync_completion_outcome(outcome)
+				if gate_result.accepted:
+					step_record['outcome'] = 'Completion gate accepted the answer candidate.'
+					outcome.steps.append(step_record)
+					outcome.status = 'SUCCESS'
+					outcome.agent_answer = candidate.answer
+					break
+				step_record['outcome'] = gate_result.feedback
+				outcome.steps.append(step_record)
+				last_outcome = gate_result.feedback
 				continue
 
 			action_intent = _action_intent(decision)
@@ -2808,11 +2987,15 @@ class ProtocolIIIAgent:
 			# Persist the initiated action before awaiting the browser.  A task-wide
 			# watchdog may cancel a slow browser operation, but its action, thought,
 			# and step still belong in the final timeout artifact.
+			await self._emit('task.phase_changed', payload={'phase': 'browser_action'})
+			if cancellation_requested():
+				break
 			step_record['outcome'] = 'Action started; browser result was not recorded yet.'
 			outcome.steps.append(step_record)
 			action_failed = False
 			action_result_payload: dict[str, Any] | None = None
 			browser_session_interrupted: str | None = None
+			runtime_result: WebRetrieverActionResult | str | None = None
 			try:
 				if decision.action == 'find_chart_data_requests':
 					budget = self._chart_action_budget(decision.action, cursor=decision.chart_cursor is not None)
@@ -3010,6 +3193,22 @@ class ProtocolIIIAgent:
 			if path_action_feedback:
 				last_outcome = _append_path_action_feedback(last_outcome, path_action_feedback)
 
+			if self._completion_enabled and not action_failed and browser_session_interrupted is None:
+				evidence_output = (
+					runtime_result.extracted_content
+					if isinstance(runtime_result, WebRetrieverActionResult) and runtime_result.extracted_content is not None
+					else last_outcome
+				)
+				self.completion_gate.register_action(
+					action=decision.action,
+					step=step + 1,
+					source_url=observation.url,
+					output=evidence_output,
+					parameters=decision.action_payload(),
+					screenshot=screenshot,
+				)
+				self._sync_completion_outcome(outcome)
+
 			if action_result_payload is not None:
 				step_record['action_result'] = action_result_payload
 				if action_result_payload.get('status') == 'no_change':
@@ -3024,6 +3223,12 @@ class ProtocolIIIAgent:
 				if len(last_outcome) <= 20_000
 				else f'{last_outcome[:14_000]}\n...[action result truncated]...\n{last_outcome[-6_000:]}'
 			)
+			telemetry_outcome = (
+				action_result_payload.get('status')
+				if isinstance(action_result_payload, Mapping) and isinstance(action_result_payload.get('status'), str)
+				else ('error' if action_failed else 'ok')
+			)
+			await self._emit_completed_step(step=step, action=decision.action, outcome=telemetry_outcome)
 			_record_exploration_decision(
 				exploration_tracker,
 				decision=decision,

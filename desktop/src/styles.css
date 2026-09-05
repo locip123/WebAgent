@@ -1,0 +1,21 @@
+:root {
+  color: #172033;
+  background: #f5f7fb;
+  font-family: Inter, "Noto Sans CJK SC", system-ui, sans-serif;
+}
+
+body { margin: 0; }
+
+.desktop-workspace { max-width: 1040px; margin: 0 auto; padding: 32px; }
+
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; }
+
+section { display: grid; gap: 16px; margin-top: 24px; padding: 24px; background: #fff; border: 1px solid #d9e0ea; border-radius: 12px; }
+
+label { display: grid; gap: 6px; font-weight: 600; }
+
+input { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid #aeb8c8; border-radius: 6px; }
+
+button { padding: 8px 14px; border: 0; border-radius: 6px; background: #175cd3; color: #fff; font: inherit; cursor: pointer; }
+
+button:disabled { cursor: not-allowed; opacity: 0.5; }

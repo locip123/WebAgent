@@ -14,29 +14,41 @@ __pycache__/
 .vscode/
 .idea/
 
+# Desktop shell build products
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/gen/
+desktop/src-tauri/target/
+
 # 评测输出（不要提交）
 test_results/
 logs/
 outputs/
 docs/
+!/docs/
+/docs/*
+!/docs/adr/
+!/docs/adr/*.md
+!/docs/desktop-runtime.md
 tests/*
 !tests/analyze_model_calls.py
-!tests/test_cdp_worker_session.py
-!tests/test_runner_browser_recovery.py
-!tests/test_runner_failure_logging.py
-!tests/test_structured_output_repair.py
-!tests/test_browser_failure_diagnostics.py
-!tests/test_stale_click_recovery.py
+!tests/test_*.py
 CONTEXT.md
+!/CONTEXT.md
 聊天记录.md
 data/example_tasks.json
 Real-game_evaluation_log
 会话记录.txt
 CLAUDE.md
 test_model_service_routing.py
+!/tests/test_model_service_routing.py
 data/protocol3.json
 data/example_tasks.json
 scripts/count_data_analysis_assistant.py
 scripts/find_close_tab_tasks.py
 scripts/compare_smoke_answers.py
 data/local-smoke-3_answer_comparison.json
+.ruff_cache
+.pytest_cache
+聊天记录.md
+

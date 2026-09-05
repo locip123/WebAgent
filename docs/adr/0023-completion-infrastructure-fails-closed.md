@@ -1,0 +1,3 @@
+# 完成基础设施不可用时失败关闭
+
+Requirement Compiler、Requirement Auditor 和 Completion Verifier 复用任务级模型服务恢复机制，但在任务期限内仍不可用或持续返回非法结构时必须失败关闭：账本不能建立使用 `FAIL_REQUIREMENT_LEDGER`，候选不能完成验证使用 `FAIL_COMPLETION_VERIFICATION`，不确定逐项判定按证据不足处理。任何一种情况都不得退回非空答案与自由文本 evidence 的旧成功逻辑。该选择以可用性换取成功精度，并保证完成回执只来自完整执行的门禁。

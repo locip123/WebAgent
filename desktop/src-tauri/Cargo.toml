@@ -1,0 +1,34 @@
+[package]
+name = "wr-desktop-shell"
+version = "0.1.0"
+description = "WebRetriever Linux desktop shell"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "wr_desktop_shell"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "wr-desktop-shell"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog"]
+
+[dependencies]
+async-trait = "0.1.88"
+rand = "0.9.1"
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls"] }
+nix = { version = "0.30.1", features = ["process", "signal"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tauri = { version = "2.11.5", features = [], optional = true }
+tauri-plugin-dialog = { version = "2.7.3", optional = true }
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }

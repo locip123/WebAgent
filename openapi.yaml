@@ -1,0 +1,655 @@
+openapi: 3.1.0
+info:
+  title: WebRetriever Local Control Plane
+  version: 1.0.0
+  description: Versioned contract for the loopback desktop sidecar. This document is authoritative before FastAPI implementation.
+servers:
+  - url: http://127.0.0.1:{port}
+    variables:
+      port:
+        default: '43127'
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/health/live:
+    get:
+      operationId: getLiveHealth
+      responses:
+        '204':
+          description: HTTP event loop is alive.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/health/ready:
+    get:
+      operationId: getReadyHealth
+      responses:
+        '200':
+          description: Control plane is ready to accept a run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/runtime/capabilities:
+    get:
+      operationId: getRuntimeCapabilities
+      responses:
+        '200':
+          description: Supported local runtime limits and protocol version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeCapabilities'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/run-preflights:
+    post:
+      operationId: preflightRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunSpec'
+      responses:
+        '200':
+          description: Side-effect-free validation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreflightResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/runs:
+    get:
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/PageCursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Local run-history page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createRun
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunSpec'
+      responses:
+        '202':
+          description: Run was accepted and has begun asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAccepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A run is active or this idempotency key names a different request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Authoritative run snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+  /api/v1/runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+      responses:
+        '200':
+          description: The run was already terminal or cancellation was previously requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResult'
+        '202':
+          description: Cooperative cancellation was accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/runs/{run_id}/events:
+    get:
+      operationId: streamRunEvents
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Non-sensitive replay cursor; Last-Event-ID takes precedence.
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Journal replay followed by live Server-Sent Events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE id is RunEvent.event_id and data is a RunEvent JSON document.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '410':
+          description: Requested cursor is older than retained journal events.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/EventsExpiredProblem'
+  /api/v1/runs/{run_id}/artifacts:
+    get:
+      operationId: listArtifacts
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/PageCursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Opaque artifact identifiers under this run's canonical output root.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+  /api/v1/runs/{run_id}/artifacts/{artifact_id}:
+    get:
+      operationId: getArtifact
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - name: artifact_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        '200':
+          description: A sidecar-indexed artifact response. Range support is additive.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+  /api/v1/control/shutdown:
+    post:
+      operationId: requestShutdown
+      responses:
+        '202':
+          description: Sidecar entered draining shutdown coordination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShutdownAccepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PageCursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+    PageSize:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+  responses:
+    Unauthorized:
+      description: Missing, malformed, or incorrect launch bearer token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    RunNotFound:
+      description: No local run has this identifier.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ValidationFailed:
+      description: Request did not satisfy the stable v1 contract.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ServiceUnavailable:
+      description: The control plane cannot currently accept this request.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+  schemas:
+    CredentialProfileReference:
+      type: object
+      additionalProperties: false
+      required: [profile_id]
+      properties:
+        profile_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+    LocalBrowserSpec:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          const: local
+        headed:
+          type: boolean
+          default: false
+    RunnerLimits:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrency:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 3
+        max_steps:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        model_timeout_seconds:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 180
+          default: 180
+        task_timeout_seconds:
+          type: number
+          exclusiveMinimum: 0
+          default: 600
+    TaskSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        task_indices:
+          type: [array, 'null']
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 0
+        limit:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 100
+    RunSpec:
+      type: object
+      additionalProperties: false
+      required: [schema_version, input_path, output_root, model, browser]
+      properties:
+        schema_version:
+          const: 1
+        input_path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        output_root:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        model:
+          $ref: '#/components/schemas/CredentialProfileReference'
+        browser:
+          $ref: '#/components/schemas/LocalBrowserSpec'
+        limits:
+          $ref: '#/components/schemas/RunnerLimits'
+        selection:
+          $ref: '#/components/schemas/TaskSelection'
+    RunAccepted:
+      type: object
+      additionalProperties: false
+      required: [schema_version, run_id, status, created_at, snapshot_url, events_url]
+      properties:
+        schema_version:
+          const: 1
+        run_id:
+          type: string
+          format: uuid
+        status:
+          const: STARTING
+        created_at:
+          type: string
+          format: date-time
+        snapshot_url:
+          type: string
+        events_url:
+          type: string
+    RunStatus:
+      type: string
+      enum: [STARTING, RUNNING, CANCELLING, COMPLETED, CANCELLED, FAILED, INTERRUPTED]
+    RunSnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema_version, run_id, status, created_at, output_dir, last_event_id]
+      properties:
+        schema_version:
+          const: 1
+        run_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        output_dir:
+          type: string
+        last_event_id:
+          type: integer
+          minimum: 0
+        summary:
+          type: [object, 'null']
+        error:
+          type: [object, 'null']
+    EventTaskReference:
+      type: object
+      additionalProperties: false
+      required: [task_id, task_idx]
+      properties:
+        task_id:
+          type: string
+        task_idx:
+          type: integer
+          minimum: 0
+    RunEvent:
+      type: object
+      additionalProperties: false
+      required: [schema, run_id, event_id, type, occurred_at, level, payload]
+      properties:
+        schema:
+          const: webretriever.run-event/v1
+        run_id:
+          type: string
+          format: uuid
+        event_id:
+          type: integer
+          minimum: 1
+        type:
+          type: string
+          enum:
+            - run.accepted
+            - run.started
+            - worker.state_changed
+            - task.started
+            - task.phase_changed
+            - task.step.completed
+            - task.recovery
+            - artifact.available
+            - task.finished
+            - run.cancel_requested
+            - run.cancelled
+            - run.completed
+            - run.failed
+            - run.interrupted
+            - telemetry.warning
+        occurred_at:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum: [debug, info, warning, error]
+        task:
+          anyOf:
+            - $ref: '#/components/schemas/EventTaskReference'
+            - type: 'null'
+        payload:
+          type: object
+    ProblemDetails:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, detail, instance, error_code]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+        error_code:
+          type: string
+          pattern: '^[a-z][a-z0-9_]*$'
+        trace_id:
+          type: [string, 'null']
+        run_id:
+          type: [string, 'null']
+          format: uuid
+        errors:
+          type: [object, 'null']
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    EventsExpiredProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          required: [minimum_event_id, snapshot_url]
+          properties:
+            minimum_event_id:
+              type: integer
+              minimum: 1
+            snapshot_url:
+              type: string
+    ReadyInfo:
+      type: object
+      additionalProperties: false
+      required: [schema_version, sidecar_build, api_protocol, runner_build, pid, status]
+      properties:
+        schema_version:
+          const: 1
+        sidecar_build:
+          type: string
+        api_protocol:
+          const: 1
+        runner_build:
+          type: string
+        pid:
+          type: integer
+          minimum: 1
+        status:
+          const: READY
+    RuntimeCapabilities:
+      type: object
+      additionalProperties: false
+      required: [schema_version, browser_modes, limits]
+      properties:
+        schema_version:
+          const: 1
+        browser_modes:
+          type: array
+          const: [local]
+        limits:
+          $ref: '#/components/schemas/RunnerLimits'
+    PreflightResult:
+      type: object
+      additionalProperties: false
+      required: [schema_version, task_count, warnings]
+      properties:
+        schema_version:
+          const: 1
+        task_count:
+          type: integer
+          minimum: 1
+          maximum: 100
+        warnings:
+          type: array
+          items:
+            type: string
+    RunPage:
+      type: object
+      additionalProperties: false
+      required: [schema_version, items, next_cursor]
+      properties:
+        schema_version:
+          const: 1
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunSnapshot'
+        next_cursor:
+          type: [string, 'null']
+    CancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+    CancelResult:
+      type: object
+      additionalProperties: false
+      required: [schema_version, run_id, status, cancel_applied]
+      properties:
+        schema_version:
+          const: 1
+        run_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        cancel_applied:
+          type: boolean
+    Artifact:
+      type: object
+      additionalProperties: false
+      required: [artifact_id, kind, mime_type, size]
+      properties:
+        artifact_id:
+          type: string
+        kind:
+          type: string
+        task_id:
+          type: [string, 'null']
+        mime_type:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+    ArtifactPage:
+      type: object
+      additionalProperties: false
+      required: [schema_version, items, next_cursor]
+      properties:
+        schema_version:
+          const: 1
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+        next_cursor:
+          type: [string, 'null']
+    ShutdownAccepted:
+      type: object
+      additionalProperties: false
+      required: [schema_version, status]
+      properties:
+        schema_version:
+          const: 1
+        status:
+          const: DRAINING

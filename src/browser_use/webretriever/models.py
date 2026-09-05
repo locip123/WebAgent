@@ -42,6 +42,8 @@ ActionName: TypeAlias = Literal[
 	'find_chart_data_requests',
 	'call_data_analysis_assistant',
 	'calculate',
+	'capture_visual_evidence',
+	'submit_answer_candidate',
 	'finish',
 ]
 ScrollDirection: TypeAlias = Literal['up', 'down', 'left', 'right']
@@ -56,6 +58,36 @@ CalculationOperation: TypeAlias = Literal[
 Evidence: TypeAlias = list[str]
 ActionResultStatus: TypeAlias = Literal['ok', 'error', 'no_change', 'uncertain']
 ActionResultRecovery: TypeAlias = Literal['none', 'observe', 're_ground', 'replan']
+_EVIDENCE_ID = re.compile(r'^ev-[0-9]{6}$')
+
+
+class AnswerItem(BaseModel):
+	"""One structured item in an answer candidate."""
+
+	model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
+
+	label: str | None = Field(default=None, max_length=1_000)
+	value: str = Field(min_length=1, max_length=8_000)
+	unit: str | None = Field(default=None, max_length=500)
+
+
+class AnswerClaim(BaseModel):
+	"""A candidate assertion mapped to one frozen requirement and registered evidence."""
+
+	model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
+
+	requirement_id: str = Field(pattern=r'^R[1-9][0-9]{0,2}$')
+	statement: str = Field(min_length=1, max_length=8_000)
+	evidence_ids: list[str] = Field(min_length=1, max_length=32)
+
+	@field_validator('evidence_ids')
+	@classmethod
+	def _evidence_ids_are_structured_and_unique(cls, value: list[str]) -> list[str]:
+		if any(_EVIDENCE_ID.fullmatch(item) is None for item in value):
+			raise ValueError('evidence_ids must use executor-issued ev-NNNNNN identifiers')
+		if len(value) != len(set(value)):
+			raise ValueError('evidence_ids must not contain duplicates')
+		return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +130,15 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 		frozenset({'analysis_query', 'data_dir'}), description='analyze a validated task-local data artifact'
 	),
 	'calculate': ActionParameterContract(
-		frozenset({'operation', 'text'}), description='calculate over browser-observed JSON numbers'
+		frozenset({'operation', 'text', 'evidence_ids'}), description='calculate over browser-observed JSON numbers'
+	),
+	'capture_visual_evidence': ActionParameterContract(
+		frozenset({'x', 'y', 'end_x', 'end_y'}),
+		description='register a bounded region of the current trusted screenshot as visual evidence',
+	),
+	'submit_answer_candidate': ActionParameterContract(
+		frozenset({'answer', 'answer_items', 'claims'}),
+		description='submit a non-terminal answer candidate for the executor-owned completion gate',
 	),
 	'finish': ActionParameterContract(
 		frozenset({'success'}), frozenset({'answer', 'evidence'}), 'finish with answer and origin explanation, or explicit failure'
@@ -316,7 +356,10 @@ class AgentDecision(BaseModel):
 	tab_index: int | None = Field(default=None, ge=0)
 	request_id: int | None = Field(default=None, ge=0)
 	answer: str | None = None
+	answer_items: list[AnswerItem] | None = Field(default=None, min_length=1, max_length=100)
+	claims: list[AnswerClaim] | None = Field(default=None, min_length=1, max_length=100)
 	evidence: Evidence | None = None
+	evidence_ids: list[str] | None = Field(default=None, min_length=1, max_length=32)
 	success: bool | None = None
 	operation: CalculationOperation | None = None
 	network_cursor: str | None = None
@@ -401,6 +444,17 @@ class AgentDecision(BaseModel):
 			raise ValueError('evidence entries must not be empty')
 		return value
 
+	@field_validator('evidence_ids')
+	@classmethod
+	def _evidence_ids_are_executor_issued(cls, value: list[str] | None) -> list[str] | None:
+		if value is None:
+			return None
+		if any(_EVIDENCE_ID.fullmatch(item) is None for item in value):
+			raise ValueError('evidence_ids must use executor-issued ev-NNNNNN identifiers')
+		if len(value) != len(set(value)):
+			raise ValueError('evidence_ids must not contain duplicates')
+		return value
+
 	@model_validator(mode='after')
 	def _validate_action_parameters(self) -> AgentDecision:
 		parameter_names = frozenset(
@@ -427,6 +481,8 @@ class AgentDecision(BaseModel):
 			if self.text is not None and self.network_cursor is not None:
 				raise ValueError('inspect_network network_cursor cannot be combined with text')
 		if self.action == 'finish' and self.success:
+			if not self._allows_legacy_finish_success:
+				raise ValueError('finish(success=true) is not part of the model contract; submit an answer candidate instead')
 			if self.answer is None:
 				raise ValueError('a successful finish requires answer')
 			if self.evidence is None:
@@ -440,6 +496,18 @@ class AgentDecision(BaseModel):
 		for field_name in ('current_path_id', 'decision_summary', 'path_json_action'):
 			payload.pop(field_name, None)
 		return payload
+
+	@property
+	def _allows_legacy_finish_success(self) -> bool:
+		return False
+
+
+class LegacyFinishAgentDecision(AgentDecision):
+	"""Compatibility parser for persisted decision-envelope callers only."""
+
+	@property
+	def _allows_legacy_finish_success(self) -> bool:
+		return True
 
 
 class InitialPathJsonAddOperation(PathJsonAddOperation):
@@ -472,6 +540,19 @@ class InitialPageAgentDecision(AgentDecision):
 	path_json_action: InitialPathJsonAction = Field(default_factory=InitialPathJsonAction)
 
 
+class LegacyInitialPageAgentDecision(InitialPageAgentDecision):
+	"""Compatibility parser for historical initial-page decision fixtures.
+
+	The schema advertised to a provider remains ``InitialPageAgentDecision``;
+	this parser only preserves readability of persisted trajectories and test
+	doubles during the completion-protocol migration.
+	"""
+
+	@property
+	def _allows_legacy_finish_success(self) -> bool:
+		return True
+
+
 class RootUpdateRepairPathJsonAction(PathJsonAction):
 	"""Add-only path delta used to repair a rejected system-root update.
 
@@ -496,17 +577,12 @@ _INITIAL_PAGE_ACTION_BRANCH_VARIANTS: dict[str, tuple[dict[str, Any], ...]] = {
 		},
 	)
 	for action in ACTION_PARAMETER_CONTRACTS
-	if action != 'finish'
+	if action != 'submit_answer_candidate'
 }
-_INITIAL_PAGE_ACTION_BRANCH_VARIANTS['finish'] = (
+
+_INITIAL_PAGE_ACTION_BRANCH_VARIANTS['submit_answer_candidate'] = (
 	{
-		'fixed_values': {'success': True},
-		'non_nullable_fields': frozenset({'answer', 'evidence'}),
 		'array_min_items': {'path_json_action.operations': 0},
-	},
-	{
-		'fixed_values': {'success': False},
-		'array_min_items': {'path_json_action.operations': 1},
 	},
 )
 
@@ -524,7 +600,7 @@ class AgentDecisionEnvelope(BaseModel):
 	__structured_action_parameter_field__: ClassVar[str] = 'decision'
 	__structured_decision_model__: ClassVar[type[AgentDecision]] = AgentDecision
 
-	decision: AgentDecision
+	decision: LegacyFinishAgentDecision
 
 
 class InitialPageAgentDecisionEnvelope(BaseModel):
@@ -543,7 +619,7 @@ class InitialPageAgentDecisionEnvelope(BaseModel):
 	)
 	__structured_decision_model__: ClassVar[type[AgentDecision]] = InitialPageAgentDecision
 
-	decision: InitialPageAgentDecision
+	decision: LegacyInitialPageAgentDecision
 
 
 class RootUpdateRepairAgentDecisionEnvelope(BaseModel):

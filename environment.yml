@@ -5,7 +5,8 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.11
+  # 桌面 sidecar 与本地开发回归的固定基线；正式比赛环境已结束。
+  - python=3.12
   - pip
   - pip:
       # 与 browser-use 当前生产源码的运行时版本保持一致。
@@ -21,6 +22,10 @@ dependencies:
       - psutil==7.2.2
       - pydantic==2.12.5
       - pydantic-settings==2.14.2
+      # 本地桌面控制面。固定版本以避免 FastAPI/Starlette 的 API 漂移。
+      - fastapi==0.115.6
+      - uvicorn==0.34.0
+      - sse-starlette==2.1.3
       - python-dotenv==1.2.2
       - requests==2.33.0
       - screeninfo==0.8.1
@@ -47,6 +52,8 @@ dependencies:
       - browser-use-sdk==3.4.2
       - browser-harness==0.1.6
       - playwright==1.61.0
+      # Linux 桌面发布 sidecar 的 onedir 打包器；由阶段 4 的 release CLI 调用。
+      - pyinstaller==6.22.2
       - xlrd==2.0.2
       - pandas>=2.3.3,<3.1
       - numpy==1.26.4

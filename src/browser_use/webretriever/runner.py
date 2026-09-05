@@ -32,6 +32,7 @@ from browser_use.webretriever.browser_session import (
 	CdpWorkerSession,
 	TaskBrowserRequest,
 )
+from browser_use.webretriever.completion import valid_completion_receipt
 from browser_use.webretriever.connection import BrowserConnector, BrowserDriver
 from browser_use.webretriever.experiment import (
 	PATCHRIGHT_EXPERIMENT_TASK_INDICES,
@@ -45,6 +46,13 @@ from browser_use.webretriever.experiment import (
 from browser_use.webretriever.model_services import ModelServiceConfig, ModelServiceRouter
 from browser_use.webretriever.models import CompetitionTask, load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE, normalize_thought_language
+from browser_use.webretriever.run_control import (
+	CancellationToken,
+	NoOpRunObserver,
+	RunObserver,
+	RunnerEvent,
+	emit_safely,
+)
 from browser_use.webretriever.verification import VerificationState
 
 ApiMode = Literal['auto', 'responses', 'chat-completions']
@@ -294,21 +302,21 @@ def build_llm(config: RunnerConfig, worker_id: int = 0) -> BaseChatModel:
 	raise ValueError('model_services must be configured for OpenAI-compatible model calls')
 
 
-def _load_existing_status(writer: TaskArtifactWriter) -> str | None:
+def _load_existing_result(writer: TaskArtifactWriter) -> Mapping[str, Any] | None:
 	try:
 		with writer.result_path.open(encoding='utf-8') as result_file:
 			payload = json.load(result_file)
 	except (FileNotFoundError, OSError, json.JSONDecodeError):
 		return None
-	status = payload.get('status')
-	return status if isinstance(status, str) else None
+	return payload if isinstance(payload, Mapping) else None
 
 
-def _should_skip(status: str | None, *, rerun_failed: bool) -> bool:
-	if status is None or status == 'PENDING':
+def _should_skip(result: Mapping[str, Any] | None, *, rerun_failed: bool) -> bool:
+	status = result.get('status') if isinstance(result, Mapping) else None
+	if not isinstance(status, str) or status == 'PENDING':
 		return False
 	if status == 'SUCCESS':
-		return True
+		return valid_completion_receipt(result)
 	return not rerun_failed
 
 
@@ -530,7 +538,12 @@ async def _run_task(
 	rebrowser_runtime_fix_mode: str | None = None,
 	endpoint_label: str | None = None,
 	browser_session: CdpWorkerSession | None = None,
+	observer: RunObserver | None = None,
+	cancellation: CancellationToken | None = None,
+	worker_id: int | None = None,
 ) -> TaskRunResult:
+	observer = observer or NoOpRunObserver()
+	cancellation = cancellation or CancellationToken()
 	writer = TaskArtifactWriter(config.output_dir, task)
 	writer.prepare()
 	if not writer.acquire_lock(blocking=False):
@@ -538,10 +551,21 @@ async def _run_task(
 		return TaskRunResult('LOCKED')
 
 	try:
+		if cancellation.cancelled:
+			outcome = AgentRunOutcome(
+				status='FAIL_CANCELLED',
+				error=f'cancelled_before_start: {cancellation.reason}',
+			)
+			writer.write_result(_result_payload(task, outcome, urls=[], model=config.model))
+			writer.write_capture()
+			return TaskRunResult(outcome.status)
 		# Re-read only after acquiring ownership, so two runners cannot both pass
 		# the resume check and execute the same formal task.
-		existing_status = _load_existing_status(writer)
-		if _should_skip(existing_status, rerun_failed=config.rerun_failed):
+		existing_result = _load_existing_result(writer)
+		existing_status = existing_result.get('status') if isinstance(existing_result, Mapping) else None
+		if not isinstance(existing_status, str):
+			existing_status = None
+		if _should_skip(existing_result, rerun_failed=config.rerun_failed):
 			logger.info('Skipping task %s/%s with existing status %s', task.task_idx, task.task_id, existing_status)
 			return TaskRunResult(existing_status or 'SKIPPED')
 
@@ -646,6 +670,9 @@ async def _run_task(
 				model_timeout_seconds=config.model_timeout_seconds,
 				thought_language=config.thought_language,
 				structured_prompt_log=config.structured_prompt_log,
+				cancellation=cancellation,
+				observer=observer,
+				worker_id=worker_id,
 				task_deadline_monotonic=task_started_monotonic + config.task_timeout_seconds,
 				recover_unstarted_runtime=recover_unstarted_runtime,
 			)
@@ -752,6 +779,17 @@ async def _run_task(
 		capture = runtime.capture_payload() if runtime is not None else None
 		writer.write_capture(capture)
 		writer.write_model_call(getattr(agent, 'model_call_timing_payload', None))
+		await emit_safely(
+			observer,
+			RunnerEvent(
+				type='task.phase_changed',
+				worker_id=worker_id,
+				task_id=task.task_id,
+				task_idx=task.task_idx,
+				payload={'phase': 'finalizing'},
+			),
+			logger=logger,
+		)
 		writer.write_result(
 			_result_payload(
 				task,
@@ -797,9 +835,15 @@ async def _consume_tasks(
 	browser: Browser | None = None,
 	browser_session: CdpWorkerSession | None = None,
 	worker_pool: _WorkerPoolState | None = None,
+	observer: RunObserver | None = None,
+	cancellation: CancellationToken | None = None,
 ) -> None:
+	observer = observer or NoOpRunObserver()
+	cancellation = cancellation or CancellationToken()
 	logger = _worker_logger(config.output_dir, worker_id)
 	while True:
+		if cancellation.cancelled:
+			return
 		if browser_session is not None and browser_session.recovery_required:
 			recovery_deadline = time.monotonic() + TASK_FINALIZATION_GRACE_SECONDS
 			try:
@@ -812,6 +856,8 @@ async def _consume_tasks(
 					redact_cdp_url(f'{type(exc).__name__}: {exc}'),
 				)
 				return
+		if cancellation.cancelled:
+			return
 		try:
 			task = queue.get_nowait()
 		except asyncio.QueueEmpty:
@@ -821,6 +867,17 @@ async def _consume_tasks(
 		if worker_pool is not None:
 			worker_pool.task_claimed()
 		try:
+			await emit_safely(
+				observer,
+				RunnerEvent(
+					type='task.started',
+					worker_id=worker_id,
+					task_id=task.task_id,
+					task_idx=task.task_idx,
+					payload={'website_display': task.website.split('?', maxsplit=1)[0].split('#', maxsplit=1)[0]},
+				),
+				logger=logger,
+			)
 			is_sec_task = is_sec_url(task.website)
 			acquired_sec_slot = False
 			task_context: BrowserContext | None = context
@@ -847,6 +904,9 @@ async def _consume_tasks(
 					rebrowser_runtime_fix_mode=rebrowser_runtime_fix_mode,
 					endpoint_label=endpoint_label,
 					browser_session=browser_session,
+					observer=observer,
+					cancellation=cancellation,
+					worker_id=worker_id,
 				)
 				if task_result.requeue_task:
 					queue.put_nowait(task)
@@ -854,6 +914,17 @@ async def _consume_tasks(
 						await worker_pool.task_requeued()
 				else:
 					statuses[task.task_id] = task_result.status
+					await emit_safely(
+						observer,
+						RunnerEvent(
+							type='task.finished',
+							worker_id=worker_id,
+							task_id=task.task_id,
+							task_idx=task.task_idx,
+							payload={'domain_status': task_result.status},
+						),
+						logger=logger,
+					)
 				if task_result.retire_worker:
 					logger.error('Browser session became unusable; retiring worker %s', worker_id)
 					return
@@ -872,6 +943,17 @@ async def _consume_tasks(
 					writer.write_capture()
 				except Exception:
 					logger.exception('Could not persist runner failure for task %s/%s', task.task_idx, task.task_id)
+				await emit_safely(
+					observer,
+					RunnerEvent(
+						type='task.finished',
+						worker_id=worker_id,
+						task_id=task.task_id,
+						task_idx=task.task_idx,
+						payload={'domain_status': failure.status},
+					),
+					logger=logger,
+				)
 			finally:
 				if acquired_sec_slot:
 					sec_task_semaphore.release()
@@ -896,7 +978,11 @@ async def _cdp_worker(
 	sec_task_semaphore: asyncio.Semaphore,
 	llm: BaseChatModel,
 	worker_pool: _WorkerPoolState | None = None,
+	observer: RunObserver | None = None,
+	cancellation: CancellationToken | None = None,
 ) -> None:
+	observer = observer or NoOpRunObserver()
+	cancellation = cancellation or CancellationToken()
 	logger = _worker_logger(config.output_dir, worker_id)
 	logger.info('Connecting to CDP browser %s', redact_cdp_url(cdp_url))
 	connection = None
@@ -904,6 +990,11 @@ async def _cdp_worker(
 	startup_reported = False
 	startup_succeeded = False
 	try:
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'STARTING'}),
+			logger=logger,
+		)
 		headers = (
 			config.cdp_headers_provider(cdp_url)
 			if config.cdp_headers_provider is not None
@@ -934,6 +1025,11 @@ async def _cdp_worker(
 		if worker_pool is not None:
 			await worker_pool.startup_finished(succeeded=startup_succeeded)
 			startup_reported = True
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'READY'}),
+			logger=logger,
+		)
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
@@ -949,6 +1045,8 @@ async def _cdp_worker(
 			endpoint_label=config.experiment_endpoint_label or f'cdp-{worker_id}',
 			browser_session=browser_session,
 			worker_pool=worker_pool,
+			observer=observer,
+			cancellation=cancellation,
 		)
 	except Exception as exc:
 		# Playwright connection errors may repeat the endpoint verbatim.  Avoid
@@ -968,6 +1066,11 @@ async def _cdp_worker(
 				await connection.close()
 			except Exception as exc:
 				logger.warning('Could not close CDP connection: %s', redact_cdp_url(str(exc)))
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'RETIRED'}),
+			logger=logger,
+		)
 
 
 async def _local_worker(
@@ -980,15 +1083,29 @@ async def _local_worker(
 	sec_task_semaphore: asyncio.Semaphore,
 	llm: BaseChatModel,
 	worker_pool: _WorkerPoolState | None = None,
+	observer: RunObserver | None = None,
+	cancellation: CancellationToken | None = None,
 ) -> None:
 	"""Run one isolated local browser context for each concurrent worker."""
 
+	observer = observer or NoOpRunObserver()
+	cancellation = cancellation or CancellationToken()
 	logger = _worker_logger(config.output_dir, worker_id)
 	context: BrowserContext | None = None
 	try:
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'STARTING'}),
+			logger=logger,
+		)
 		context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 900})
 		if worker_pool is not None:
 			await worker_pool.startup_finished(succeeded=True)
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'READY'}),
+			logger=logger,
+		)
 		await _consume_tasks(
 			worker_id=worker_id,
 			context=context,
@@ -999,6 +1116,8 @@ async def _local_worker(
 			statuses=statuses,
 			sec_task_semaphore=sec_task_semaphore,
 			worker_pool=worker_pool,
+			observer=observer,
+			cancellation=cancellation,
 		)
 	except Exception:
 		logger.exception('Local browser worker failed')
@@ -1011,6 +1130,11 @@ async def _local_worker(
 				await context.close()
 			except Exception as exc:
 				logger.warning('Could not close local browser context: %s', exc)
+		await emit_safely(
+			observer,
+			RunnerEvent(type='worker.state_changed', worker_id=worker_id, payload={'state': 'RETIRED'}),
+			logger=logger,
+		)
 
 
 def _select_tasks(tasks: list[CompetitionTask], config: RunnerConfig) -> list[CompetitionTask]:
@@ -1022,19 +1146,75 @@ def _select_tasks(tasks: list[CompetitionTask], config: RunnerConfig) -> list[Co
 	return selected
 
 
-async def run(config: RunnerConfig) -> dict[str, Any]:
+async def run(
+	config: RunnerConfig,
+	*,
+	observer: RunObserver | None = None,
+	cancellation: CancellationToken | None = None,
+) -> dict[str, Any]:
 	config.validate()
 	tasks = _select_tasks(load_tasks(config.input_path), config)
 	config.output_dir.mkdir(parents=True, exist_ok=True)
 	if not tasks:
 		raise ValueError('no tasks selected')
 
+	observer = observer or NoOpRunObserver()
+	cancellation = cancellation or CancellationToken()
 	queue: asyncio.Queue[CompetitionTask] = asyncio.Queue()
 	for task in tasks:
 		queue.put_nowait(task)
 	statuses: dict[str, str] = {}
 	sec_task_semaphore = asyncio.Semaphore(1)
 	worker_count = min(config.max_concurrency, len(tasks))
+	logger = logging.getLogger('webretriever.runner')
+	await emit_safely(
+		observer,
+		RunnerEvent(type='run.started', payload={'workers_planned': worker_count}),
+		logger=logger,
+	)
+	if cancellation.cancelled:
+		while not queue.empty():
+			task = queue.get_nowait()
+			writer = TaskArtifactWriter(config.output_dir, task)
+			writer.prepare()
+			outcome = AgentRunOutcome(
+				status='FAIL_CANCELLED',
+				error=f'cancelled_before_start: {cancellation.reason}',
+			)
+			writer.write_result(_result_payload(task, outcome, urls=[], model=config.model))
+			writer.write_capture()
+			statuses[task.task_id] = outcome.status
+			queue.task_done()
+			await emit_safely(
+				observer,
+				RunnerEvent(
+					type='task.finished',
+					task_id=task.task_id,
+					task_idx=task.task_idx,
+					payload={'domain_status': outcome.status, 'cancelled_before_start': True},
+				),
+				logger=logger,
+			)
+		counts: dict[str, int] = {}
+		for status in statuses.values():
+			counts[status] = counts.get(status, 0) + 1
+		summary = {
+			'created_at': datetime.now(timezone.utc).isoformat(),
+			'input': str(config.input_path),
+			'total_selected': len(tasks),
+			'max_concurrency': config.max_concurrency,
+			'workers_started': 0,
+			'workers_ready': 0,
+			'counts': counts,
+			'statuses': statuses,
+		}
+		atomic_write_json(config.output_dir / 'logs' / 'summary.json', summary)
+		await emit_safely(
+			observer,
+			RunnerEvent(type='run.cancelled', payload={'completed': 0, 'aborted': len(statuses)}),
+			logger=logger,
+		)
+		return summary
 	# Model-service clients and their state are shared by every worker in this
 	# run. Local VLM endpoints deliberately retain their worker-specific routing.
 	shared_model_router = build_llm(config) if config.model_services else None
@@ -1056,7 +1236,9 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 						if shared_model_router is not None
 						else build_llm(config, worker_id),
 						worker_pool=worker_pool,
-						)
+						observer=observer,
+						cancellation=cancellation,
+					)
 						for worker_id in range(worker_count)
 					)
 				)
@@ -1079,6 +1261,8 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 					if shared_model_router is not None
 					else build_llm(config, worker_id),
 					worker_pool=worker_pool,
+					observer=observer,
+					cancellation=cancellation,
 				)
 				for worker_id, cdp_url in enumerate(worker_urls)
 			)
@@ -1089,20 +1273,36 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		task = queue.get_nowait()
 		writer = TaskArtifactWriter(config.output_dir, task)
 		writer.prepare()
-		browser_failure = classify_browser_failure(
-			'No CDP worker was available for this task',
-			phase=BrowserFailurePhase.STARTUP,
-		)
-		failure = AgentRunOutcome(
-			status=browser_failure.status,
-			error='No CDP worker was available for this task',
-			browser_failure=browser_failure.payload(recovery_attempted=False),
-		)
+		if cancellation.cancelled:
+			failure = AgentRunOutcome(
+				status='FAIL_CANCELLED',
+				error=f'cancelled_before_start: {cancellation.reason}',
+			)
+		else:
+			browser_failure = classify_browser_failure(
+				'No CDP worker was available for this task',
+				phase=BrowserFailurePhase.STARTUP,
+			)
+			failure = AgentRunOutcome(
+				status=browser_failure.status,
+				error='No CDP worker was available for this task',
+				browser_failure=browser_failure.payload(recovery_attempted=False),
+			)
 		writer.write_result(_result_payload(task, failure, urls=[], model=config.model))
 		writer.write_capture()
 		_log_diagnostic_task_failure(_worker_logger(config.output_dir, -1), task, failure)
 		statuses[task.task_id] = failure.status
 		queue.task_done()
+		await emit_safely(
+			observer,
+			RunnerEvent(
+				type='task.finished',
+				task_id=task.task_id,
+				task_idx=task.task_idx,
+				payload={'domain_status': failure.status, 'cancelled_before_start': cancellation.cancelled},
+			),
+			logger=logger,
+		)
 
 	counts: dict[str, int] = {}
 	for status in statuses.values():
@@ -1118,6 +1318,18 @@ async def run(config: RunnerConfig) -> dict[str, Any]:
 		'statuses': statuses,
 	}
 	atomic_write_json(config.output_dir / 'logs' / 'summary.json', summary)
+	terminal_type = 'run.cancelled' if cancellation.cancelled else 'run.completed'
+	await emit_safely(
+		observer,
+		RunnerEvent(
+			type=terminal_type,
+			payload={
+				'completed': sum(status != 'FAIL_CANCELLED' for status in statuses.values()),
+				'aborted': sum(status == 'FAIL_CANCELLED' for status in statuses.values()),
+			},
+		),
+		logger=logger,
+	)
 	return summary
 
 
