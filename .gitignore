@@ -15,10 +15,13 @@ __pycache__/
 .idea/
 
 # Desktop shell build products
+dist/
 desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/gen/
 desktop/src-tauri/target/
+desktop/src-tauri/resources/sidecar/*
+!desktop/src-tauri/resources/sidecar/.gitkeep
 
 # 评测输出（不要提交）
 test_results/
@@ -30,7 +33,6 @@ docs/
 !/docs/adr/
 !/docs/adr/*.md
 !/docs/desktop-runtime.md
-tests/*
 !tests/analyze_model_calls.py
 !tests/test_*.py
 CONTEXT.md

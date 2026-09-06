@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
+import portalocker
 from pydantic import BaseModel
 
 from browser_use.webretriever.exploration_paths import EXPLORATION_PATH_FILENAME, EXPLORATION_PATH_SCHEMA_VERSION
@@ -74,11 +75,6 @@ def empty_model_call_timing_payload() -> dict[str, Any]:
 			'services': [],
 		},
 	}
-
-try:
-	import fcntl
-except ImportError:  # pragma: no cover - the official runner is Linux
-	fcntl = None  # type: ignore[assignment]
 
 
 def _json_default(value: Any) -> Any:
@@ -164,19 +160,19 @@ class TaskLock:
 	def acquire(self, *, blocking: bool = False) -> bool:
 		if self._handle is not None:
 			return True
-		if fcntl is None:  # pragma: no cover - official environment provides fcntl
-			raise RuntimeError('TaskLock requires fcntl support')
-
 		self.path.parent.mkdir(parents=True, exist_ok=True)
 		handle = self.path.open('a+', encoding='utf-8')
-		operation = fcntl.LOCK_EX
+		operation = portalocker.LOCK_EX
 		if not blocking:
-			operation |= fcntl.LOCK_NB
+			operation |= portalocker.LOCK_NB
 		try:
-			fcntl.flock(handle.fileno(), operation)
-		except BlockingIOError:
+			portalocker.lock(handle, operation)
+		except portalocker.exceptions.AlreadyLocked:
 			handle.close()
 			return False
+		except BaseException:
+			handle.close()
+			raise
 
 		self._handle = handle
 		try:
@@ -194,9 +190,7 @@ class TaskLock:
 			handle.flush()
 			os.fsync(handle.fileno())
 		except Exception:
-			self._handle = None
-			fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-			handle.close()
+			self.release()
 			raise
 		return True
 
@@ -204,9 +198,10 @@ class TaskLock:
 		handle = self._handle
 		if handle is not None:
 			self._handle = None
-			if fcntl is not None:
-				fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-			handle.close()
+			try:
+				portalocker.unlock(handle)
+			finally:
+				handle.close()
 		if remove:
 			try:
 				self.path.unlink()

@@ -4,17 +4,26 @@ use std::sync::{
     Arc,
 };
 use wr_desktop_shell::supervisor::{
-	BackendDescriptor, BackendState, SidecarChild, SidecarLaunch, SidecarLauncher, Supervisor,
-	SupervisorConfig,
+	bundled_sidecar_program, BackendDescriptor, BackendState, SidecarChild, SidecarLaunch,
+	SidecarLauncher, Supervisor, SupervisorConfig,
 };
 
 #[test]
 fn release_configuration_uses_only_the_fixed_bundled_sidecar() {
-	let program = std::path::PathBuf::from("/opt/WebRetriever/resources/sidecar/webretriever-sidecar");
+	let program = bundled_sidecar_program(std::path::Path::new("/opt/WebRetriever/resources"));
 	let config = SupervisorConfig::bundled(std::path::PathBuf::from("/var/lib/webretriever"), program.clone());
 
 	assert_eq!(config.allowed_origins, vec!["tauri://localhost"]);
 	assert!(matches!(config.launch, SidecarLaunch::BundledBinary { program: configured } if configured == program));
+}
+
+#[test]
+fn bundled_sidecar_uses_the_native_program_name() {
+	let program = bundled_sidecar_program(std::path::Path::new("C:/Program Files/WebRetriever/resources"));
+	#[cfg(windows)]
+	assert!(program.ends_with("sidecar/webretriever-sidecar.exe"));
+	#[cfg(not(windows))]
+	assert!(program.ends_with("sidecar/webretriever-sidecar"));
 }
 
 #[derive(Clone)]

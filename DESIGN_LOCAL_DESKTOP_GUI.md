@@ -81,7 +81,7 @@ GUI 不应直接把 `RunnerConfig` 暴露为 HTTP 模型，因为其中包含 `P
 
 ### 2.4 依赖与平台现状
 
-[`environment.yml`](environment.yml) 声明 Python 3.11、Pydantic 2、Playwright 1.61、模型 SDK、数据分析和文档处理依赖，但尚未声明 FastAPI、Uvicorn 或 SSE 库。按仓库约束检查的本机 `Browser-Use` conda 环境为 Python 3.12.13；其中 FastAPI 未安装，Uvicorn 和 `sse-starlette` 虽存在，但属于未声明环境状态，不能作为可复现构建依据。
+[`environment.yml`](environment.yml) 声明 Python 3.11、Pydantic 2、Playwright 1.61、模型 SDK、数据分析和文档处理依赖，但尚未声明 FastAPI、Uvicorn 或 SSE 库。按仓库约束检查的本机 `webAgent` conda 环境为 Python 3.12.13；其中 FastAPI 未安装，Uvicorn 和 `sse-starlette` 虽存在，但属于未声明环境状态，不能作为可复现构建依据。
 
 此外，`TaskLock` 当前依赖 Unix `fcntl`，在 Windows 会直接不可用。因此：
 
@@ -795,7 +795,7 @@ Observer 失败不能使比赛任务失败：队列背压或可恢复的事件�
 - 首先发布 Linux 包；将 Python sidecar、动态导入资源和 Playwright browser 做可复现打包。
 - 处理 macOS 签名/公证、Windows 跨平台锁和 Job Object，再扩平台。
 - 增加升级兼容：API protocol major、SQLite migration、sidecar/app build matrix。
-- 验收：全新机器无需 conda 即可运行发布包；开发模式仍可使用 `Browser-Use` 环境。
+- 验收：全新机器无需 conda 即可运行发布包；开发模式仍可使用 `webAgent` 环境。
 
 ### 10.2 技术选型
 

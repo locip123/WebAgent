@@ -1,7 +1,7 @@
 [package]
 name = "wr-desktop-shell"
 version = "0.1.0"
-description = "WebRetriever Linux desktop shell"
+description = "WebRetriever desktop shell"
 edition = "2021"
 rust-version = "1.88"
 
@@ -22,13 +22,18 @@ desktop = ["dep:tauri", "dep:tauri-plugin-dialog"]
 async-trait = "0.1.88"
 rand = "0.9.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls"] }
-nix = { version = "0.30.1", features = ["process", "signal"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tauri = { version = "2.11.5", features = [], optional = true }
 tauri-plugin-dialog = { version = "2.7.3", optional = true }
 thiserror = "2.0.12"
 tokio = { version = "1.44.2", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", features = ["process", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

@@ -15,11 +15,12 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import queue
 import shutil
-import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
@@ -31,8 +32,17 @@ from browser_use.webretriever.desktop.versioning import API_PROTOCOL_VERSION, SI
 
 RELEASE_FORMAT = "webretriever.desktop-release/v1"
 _MANIFEST_NAME = "release-manifest.json"
-_SIDECAR_RELATIVE_PATH = PurePosixPath("sidecar/webretriever-sidecar")
 _BROWSER_ROOT = PurePosixPath("sidecar/playwright-browsers")
+_LINUX_TARGETS = {
+	"x86_64": "x86_64-unknown-linux-gnu",
+	"amd64": "x86_64-unknown-linux-gnu",
+	"aarch64": "aarch64-unknown-linux-gnu",
+	"arm64": "aarch64-unknown-linux-gnu",
+}
+_WINDOWS_TARGETS = {
+	"x86_64": "x86_64-pc-windows-msvc",
+	"amd64": "x86_64-pc-windows-msvc",
+}
 
 
 class ReleaseValidationError(ValueError):
@@ -50,14 +60,15 @@ def stage_bundle(
 ) -> dict[str, Any]:
 	"""Stage a PyInstaller ``onedir`` output and its exact Playwright browser set."""
 
-	_validate_native_linux_target(target)
+	_validate_native_target(target)
 	if not sidecar_build or not runner_build:
 		raise ReleaseValidationError("sidecar and runner build identifiers must be non-empty")
 	source_sidecar = Path(sidecar_dist).expanduser().resolve()
 	if not source_sidecar.is_dir():
 		raise ReleaseValidationError(f"PyInstaller sidecar directory does not exist: {source_sidecar}")
-	program = source_sidecar / _SIDECAR_RELATIVE_PATH.name
-	if not program.is_file() or not os.access(program, os.X_OK):
+	sidecar_path = _sidecar_relative_path(target)
+	program = source_sidecar / sidecar_path.name
+	if not _is_executable(program, target):
 		raise ReleaseValidationError("PyInstaller sidecar directory must contain an executable webretriever-sidecar")
 	source_browsers = Path(playwright_browsers_dir).expanduser().resolve()
 	expected_entries, playwright_version = _expected_playwright_browser_entries()
@@ -84,7 +95,7 @@ def stage_bundle(
 			"protocol": {"api_major": API_PROTOCOL_VERSION, "sidecar_major": SIDECAR_PROTOCOL_VERSION},
 			"sqlite_schema_version": SQLITE_SCHEMA_VERSION,
 			"playwright": {"version": playwright_version, "browser_entries": list(expected_entries)},
-			"artifacts": _artifact_records(temporary),
+			"artifacts": _artifact_records(temporary, target=target),
 		}
 		(staged_sidecar / _MANIFEST_NAME).write_text(
 			json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -108,7 +119,7 @@ def build_bundle(
 ) -> dict[str, Any]:
 	"""Build a fresh PyInstaller ``onedir`` sidecar and stage it for Tauri."""
 
-	_validate_native_linux_target(target)
+	_validate_native_target(target)
 	destination = Path(output_dir).expanduser().resolve()
 	if destination.exists():
 		raise ReleaseValidationError(f"release output already exists: {destination}")
@@ -118,13 +129,15 @@ def build_bundle(
 		work_root = Path(workspace)
 		dist_path = work_root / "dist"
 		command = _pyinstaller_command(pyinstaller_executable)
+		if _target_platform(target) == "windows":
+			command.extend(["--contents-directory", "."])
 		command.extend(
 			[
 				"--noconfirm",
 				"--clean",
 				"--onedir",
 				"--name",
-				_SIDECAR_RELATIVE_PATH.name,
+				"webretriever-sidecar",
 				"--distpath",
 				str(dist_path),
 				"--workpath",
@@ -148,12 +161,19 @@ def build_bundle(
 				str(project_root / "src" / "browser_use" / "webretriever" / "desktop" / "sidecar.py"),
 			]
 		)
-		completed = subprocess.run(command, cwd=project_root, capture_output=True, text=True, check=False)
+		completed = subprocess.run(
+			command,
+			cwd=project_root,
+			env=_pyinstaller_environment(),
+			capture_output=True,
+			text=True,
+			check=False,
+		)
 		if completed.returncode != 0:
 			diagnostic = (completed.stderr or completed.stdout).strip()
 			raise ReleaseValidationError(f"PyInstaller sidecar build failed: {diagnostic[-4_000:]}")
 		result = stage_bundle(
-			sidecar_dist=dist_path / _SIDECAR_RELATIVE_PATH.name,
+			sidecar_dist=dist_path / "webretriever-sidecar",
 			playwright_browsers_dir=playwright_browsers_dir,
 			output_dir=destination,
 			target=target,
@@ -199,7 +219,7 @@ def smoke_bundle(bundle_dir: Path | str) -> dict[str, Any]:
 
 	verified = verify_bundle(bundle_dir)
 	root = Path(bundle_dir).expanduser().resolve()
-	program = root.joinpath(*_SIDECAR_RELATIVE_PATH.parts)
+	program = root.joinpath(*_sidecar_relative_path(verified["target"]).parts)
 	with tempfile.TemporaryDirectory(prefix="wr-release-smoke-") as state_dir:
 		bearer_token = secrets.token_urlsafe(48)
 		launch_nonce = secrets.token_urlsafe(24)
@@ -243,8 +263,10 @@ def verify_bundle(bundle_dir: Path | str, *, state_dir: Path | str | None = None
 	manifest = _read_manifest(root / "sidecar" / _MANIFEST_NAME)
 	if manifest.get("format") != RELEASE_FORMAT:
 		raise ReleaseValidationError(f"unsupported release manifest format: {manifest.get('format')!r}")
-	if not isinstance(manifest.get("target"), str) or not manifest["target"].endswith("-unknown-linux-gnu"):
-		raise ReleaseValidationError("release target must be a Linux GNU target triple")
+	target = manifest.get("target")
+	if not isinstance(target, str):
+		raise ReleaseValidationError("release target must be a supported native target triple")
+	_target_platform(target)
 
 	build = _mapping(manifest, "build")
 	for name in ("app", "sidecar", "runner"):
@@ -273,13 +295,13 @@ def verify_bundle(bundle_dir: Path | str, *, state_dir: Path | str | None = None
 
 	browser_entries = _browser_entries(manifest)
 	artifacts = _artifacts(manifest)
-	_verify_artifacts(root, artifacts)
-	_verify_sidecar(root, artifacts)
+	_verify_artifacts(root, artifacts, target=target)
+	_verify_sidecar(root, artifacts, target=target)
 	_verify_browser_entries(root, browser_entries, artifacts)
 	_migrate_control_store(state_dir)
 	return {
 		"status": "verified",
-		"target": manifest["target"],
+		"target": target,
 		"app_build": build["app"],
 		"sidecar_build": build["sidecar"],
 		"api_protocol": protocol["api_major"],
@@ -301,28 +323,40 @@ def _migrate_control_store(state_dir: Path | str | None) -> None:
 def _sidecar_smoke_environment(*, bearer_token: str, launch_nonce: str) -> dict[str, str]:
 	"""Expose only the launch contract; a real release cannot inherit conda paths."""
 
-	return {
+	environment = {
 		"PATH": os.defpath,
-		"LANG": os.environ.get("LANG", "C.UTF-8"),
 		"WR_SIDECAR_BEARER_TOKEN": bearer_token,
 		"WR_SIDECAR_LAUNCH_NONCE": launch_nonce,
 		"WR_SIDECAR_ALLOWED_ORIGINS": "tauri://localhost",
 	}
+	for name in ("LANG", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"):
+		if value := os.environ.get(name):
+			environment[name] = value
+	return environment
 
 
 def _await_sidecar_handshake(process: subprocess.Popen[str], launch_nonce: str) -> str:
 	if process.stdout is None:
 		raise ReleaseValidationError("smoke sidecar did not expose stdout")
+	lines: queue.Queue[str | None] = queue.Queue()
+
+	def read_stdout() -> None:
+		assert process.stdout is not None
+		for line in iter(process.stdout.readline, ""):
+			lines.put(line)
+		lines.put(None)
+
+	threading.Thread(target=read_stdout, name="wr-sidecar-smoke-stdout", daemon=True).start()
 	deadline = time.monotonic() + 15
 	while time.monotonic() < deadline:
 		if process.poll() is not None:
 			raise ReleaseValidationError("smoke sidecar exited before its bootstrap handshake")
 		remaining = deadline - time.monotonic()
-		readable, _, _ = select.select([process.stdout], [], [], max(remaining, 0))
-		if not readable:
-			break
-		line = process.stdout.readline()
-		if not line:
+		try:
+			line = lines.get(timeout=min(remaining, 0.1))
+		except queue.Empty:
+			continue
+		if line is None:
 			continue
 		if not line.startswith("WR_SIDECAR_LISTENING "):
 			continue
@@ -432,7 +466,7 @@ def _artifacts(manifest: dict[str, Any]) -> dict[PurePosixPath, dict[str, Any]]:
 	return artifacts
 
 
-def _verify_artifacts(root: Path, artifacts: dict[PurePosixPath, dict[str, Any]]) -> None:
+def _verify_artifacts(root: Path, artifacts: dict[PurePosixPath, dict[str, Any]], *, target: str) -> None:
 	actual = {
 		PurePosixPath(path.relative_to(root).as_posix())
 		for path in root.rglob("*")
@@ -447,15 +481,16 @@ def _verify_artifacts(root: Path, artifacts: dict[PurePosixPath, dict[str, Any]]
 		path = root.joinpath(*relative_path.parts)
 		if _sha256(path) != record["sha256"]:
 			raise ReleaseValidationError(f"release artifact digest mismatch: {relative_path}")
-		if bool(path.stat().st_mode & 0o111) != record["executable"]:
+		if _is_executable(path, target) != record["executable"]:
 			raise ReleaseValidationError(f"release artifact executable mode mismatch: {relative_path}")
 
 
-def _verify_sidecar(root: Path, artifacts: dict[PurePosixPath, dict[str, Any]]) -> None:
-	record = artifacts.get(_SIDECAR_RELATIVE_PATH)
+def _verify_sidecar(root: Path, artifacts: dict[PurePosixPath, dict[str, Any]], *, target: str) -> None:
+	sidecar_path = _sidecar_relative_path(target)
+	record = artifacts.get(sidecar_path)
 	if record is None or not record["executable"]:
 		raise ReleaseValidationError("release must contain an executable sidecar/webretriever-sidecar")
-	if not os.access(root.joinpath(*_SIDECAR_RELATIVE_PATH.parts), os.X_OK):
+	if not _is_executable(root.joinpath(*sidecar_path.parts), target):
 		raise ReleaseValidationError("release sidecar is not executable")
 
 
@@ -479,12 +514,12 @@ def _sha256(path: Path) -> str:
 	return digest.hexdigest()
 
 
-def _artifact_records(root: Path) -> list[dict[str, Any]]:
+def _artifact_records(root: Path, *, target: str) -> list[dict[str, Any]]:
 	return [
 		{
 			"path": path.relative_to(root).as_posix(),
 			"sha256": _sha256(path),
-			"executable": bool(path.stat().st_mode & 0o111),
+			"executable": _is_executable(path, target),
 		}
 		for path in sorted(root.rglob("*"))
 		if path.is_file() and path.relative_to(root).as_posix() != f"sidecar/{_MANIFEST_NAME}"
@@ -534,20 +569,43 @@ def _project_root() -> Path:
 	return Path(__file__).resolve().parents[4]
 
 
-def _validate_native_linux_target(target: str) -> None:
-	architectures = {
-		"x86_64": "x86_64-unknown-linux-gnu",
-		"amd64": "x86_64-unknown-linux-gnu",
-		"aarch64": "aarch64-unknown-linux-gnu",
-		"arm64": "aarch64-unknown-linux-gnu",
-	}
-	if sys.platform != "linux" or platform.machine().lower() not in architectures:
-		raise ReleaseValidationError("release staging requires a supported native Linux target host")
+def _target_platform(target: str) -> str:
+	if target in set(_LINUX_TARGETS.values()):
+		return "linux"
+	if target in set(_WINDOWS_TARGETS.values()):
+		return "windows"
+	raise ReleaseValidationError(f"release target is unsupported: {target!r}")
+
+
+def _validate_native_target(target: str) -> None:
+	if sys.platform == "linux":
+		architectures = _LINUX_TARGETS
+		platform_name = "Linux"
+	elif sys.platform == "win32":
+		architectures = _WINDOWS_TARGETS
+		platform_name = "Windows"
+	else:
+		raise ReleaseValidationError("release staging requires a supported native Linux or Windows host")
+	if platform.machine().lower() not in architectures:
+		raise ReleaseValidationError(f"release staging requires a supported native {platform_name} target host")
 	expected = architectures[platform.machine().lower()]
 	if target != expected:
 		raise ReleaseValidationError(
-			f"release staging requires native Linux target {expected!r}, not {target!r}"
+			f"release staging requires native {platform_name} target {expected!r}, not {target!r}"
 		)
+
+
+def _sidecar_relative_path(target: str) -> PurePosixPath:
+	name = "webretriever-sidecar.exe" if _target_platform(target) == "windows" else "webretriever-sidecar"
+	return PurePosixPath("sidecar") / name
+
+
+def _is_executable(path: Path, target: str) -> bool:
+	if not path.is_file():
+		return False
+	if _target_platform(target) == "windows":
+		return path.suffix.casefold() == ".exe"
+	return os.access(path, os.X_OK)
 
 
 def _pyinstaller_command(pyinstaller_executable: Path | str | None) -> list[str]:
@@ -559,10 +617,21 @@ def _pyinstaller_command(pyinstaller_executable: Path | str | None) -> list[str]
 	return [str(path)]
 
 
+def _pyinstaller_environment() -> dict[str, str]:
+	"""Prefer the active Python environment's DLLs when building on Windows."""
+
+	environment = os.environ.copy()
+	if sys.platform == "win32":
+		library_bin = Path(sys.prefix).resolve() / "Library" / "bin"
+		if library_bin.is_dir():
+			environment["PATH"] = str(library_bin) + os.pathsep + environment.get("PATH", "")
+	return environment
+
+
 def _parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Build and verify self-contained WebRetriever desktop releases.")
 	subcommands = parser.add_subparsers(dest="command", required=True)
-	verify = subcommands.add_parser("verify", help="verify a Linux release directory")
+	verify = subcommands.add_parser("verify", help="verify a Linux or Windows release directory")
 	verify.add_argument("--bundle-dir", required=True, type=Path)
 	verify.add_argument("--state-dir", type=Path, help="migrate and verify this sidecar control-state directory")
 	stage = subcommands.add_parser("stage", help="stage a PyInstaller sidecar and its Playwright browser payload")

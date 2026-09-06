@@ -1,4 +1,4 @@
-name: WR-047
+name: webAgent
 
 channels:
   - conda-forge
@@ -13,6 +13,7 @@ dependencies:
       - aiohttp==3.13.4
       - anyio==4.12.1
       - bubus==1.5.6
+      - portalocker==4.3.0
       - click==8.3.1
       - InquirerPy==0.3.4
       - rich==14.3.1
@@ -52,7 +53,7 @@ dependencies:
       - browser-use-sdk==3.4.2
       - browser-harness==0.1.6
       - playwright==1.61.0
-      # Linux 桌面发布 sidecar 的 onedir 打包器；由阶段 4 的 release CLI 调用。
+      # Linux/Windows 桌面发布 sidecar 的 onedir 打包器；由阶段 4 的 release CLI 调用。
       - pyinstaller==6.22.2
       - xlrd==2.0.2
       - pandas>=2.3.3,<3.1

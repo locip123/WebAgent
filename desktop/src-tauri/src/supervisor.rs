@@ -71,6 +71,13 @@ impl SupervisorConfig {
     }
 }
 
+pub fn bundled_sidecar_program(resource_dir: &std::path::Path) -> PathBuf {
+    let mut program = resource_dir.join("sidecar").join("webretriever-sidecar");
+    #[cfg(windows)]
+    program.set_extension("exe");
+    program
+}
+
 fn random_secret(length: usize) -> String {
     rand::rng()
         .sample_iter(&Alphanumeric)
@@ -345,6 +352,8 @@ impl SidecarLauncher for TokioSidecarLauncher {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        let job = WindowsJob::assign(&child)?;
         let stdout = child
             .stdout
             .take()
@@ -353,6 +362,8 @@ impl SidecarLauncher for TokioSidecarLauncher {
             child: Mutex::new(child),
             stdout: Mutex::new(BufReader::new(stdout).lines()),
             client: reqwest::Client::new(),
+            #[cfg(windows)]
+            job,
         }))
     }
 }
@@ -361,6 +372,76 @@ struct TokioSidecarChild {
     child: Mutex<Child>,
     stdout: Mutex<Lines<BufReader<ChildStdout>>>,
     client: reqwest::Client,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+#[cfg(windows)]
+struct WindowsJob(usize);
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn assign(child: &Child) -> Result<Self, String> {
+        use std::{mem::size_of, ptr::null};
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+                JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| "sidecar exited before it could join its Windows Job Object".to_owned())?
+            as HANDLE;
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        if job.is_null() {
+            return Err(format!("could not create Windows Job Object: {}", std::io::Error::last_os_error()));
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const std::ffi::c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(format!("could not configure Windows Job Object: {error}"));
+        }
+        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(format!("could not assign sidecar to Windows Job Object: {error}"));
+        }
+        Ok(Self(job as usize))
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            System::JobObjects::TerminateJobObject,
+        };
+        unsafe {
+            let _ = TerminateJobObject(self.0 as HANDLE, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        unsafe {
+            let _ = CloseHandle(self.0 as HANDLE);
+        }
+    }
 }
 
 #[async_trait]
@@ -402,6 +483,8 @@ impl SidecarChild for TokioSidecarChild {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let _ = kill(process_group, Signal::SIGKILL);
         }
+        #[cfg(windows)]
+        self.job.terminate();
         let _ = child.start_kill();
         let _ = child.wait().await;
     }

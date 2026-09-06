@@ -7,6 +7,7 @@
     "dev": "vite",
     "tauri": "tauri",
     "build": "tsc --noEmit && vite build",
+    "build:windows": "tauri build --bundles msi,nsis",
     "test": "vitest run",
     "test:watch": "vitest"
   },

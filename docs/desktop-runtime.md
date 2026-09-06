@@ -1,16 +1,27 @@
 # 本地桌面运行时基线
 
-桌面 v1 仅支持 Linux。该限制来自现有 Runner 的 Unix `fcntl` 工件锁，以及尚未完成的 Windows 子进程树与 Playwright 验证；不能仅因 Tauri 可以交叉编译就宣称 Windows 受支持。
+桌面 v1 支持 Linux GNU 和 Windows x64 (`x86_64-pc-windows-msvc`) 发布包。Python Runner 的工件锁使用跨平台 `portalocker`；Windows desktop supervisor 会将 sidecar 放入带 `KILL_ON_JOB_CLOSE` 的 Job Object，确保强制退出或桌面进程意外退出时清理 sidecar 子进程树。
 
 开发和 sidecar 基线为 Python 3.12。创建或更新环境后，使用以下命令安装与仓库声明的 Playwright 版本匹配的 Chromium：
 
 ```bash
 conda env create -f environment.yml
-conda activate Browser-Use
+conda activate webAgent
 python -m playwright install chromium
 ```
 
-已存在的 `Browser-Use` 环境可跳过创建步骤，但必须确认 `python --version` 是 3.12。发布包不要求最终用户安装 conda：它将随 sidecar 一起交付由已固定 Playwright revision 驱动的 Chromium；该发布打包工作属于阶段 4。
+已存在的 `webAgent` 环境可跳过创建步骤，但必须确认 `python --version` 是 3.12。发布包不要求最终用户安装 conda：它将随 sidecar 一起交付由已固定 Playwright revision 驱动的 Chromium；该发布打包工作属于阶段 4。
+
+Windows PowerShell 下，在仓库根目录设置源码路径后可直接运行 Python 入口：
+
+```powershell
+conda activate webAgent
+$env:PYTHONPATH = "$PWD\src"
+$env:BROWSER_USE_SETUP_LOGGING = "false"
+python -m browser_use.webretriever --help
+```
+
+首次运行需要联网下载 tiktoken 词表。实际浏览任务还需要有效的模型 API 配置和任务文件；本地浏览器使用 `--local-browser`。
 
 本地桌面控制面不取代竞赛入口：`scripts/run.sh`、`result.json`、`capture.json` 与每任务工件目录仍是 Runner 的兼容契约。
 
@@ -45,9 +56,9 @@ npm run tauri dev
 
 首次构建 Linux Tauri 应用还需要 WebKitGTK、GTK、AppIndicator、librsvg 和 D-Bus 开发包。阶段 3 从源码启动 Python sidecar；将 sidecar、Python 运行时和 Chromium 打进发行包属于阶段 4。
 
-## 阶段 4：Linux 发布包
+## 阶段 4：发布包
 
-发布工具入口是 `python -m browser_use.webretriever.desktop.release`。它只接受 Linux GNU target；macOS 签名/公证和 Windows 的跨平台锁、Job Object 尚未实现，因此不会由该工具生成或宣称支持对应安装包。
+发布工具入口是 `python -m browser_use.webretriever.desktop.release`。它只接受构建机的原生目标：Linux 支持 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu`，Windows 当前支持 x64 `x86_64-pc-windows-msvc`。macOS 签名/公证尚未实现。
 
 在受支持 Linux 构建机上，先用受锁定的 `Browser-Use` 环境准备 PyInstaller 和 Playwright browser，再生成一个独立发行资源目录：
 
@@ -67,6 +78,25 @@ python -m browser_use.webretriever.desktop.release smoke \
   --bundle-dir dist/webretriever-linux-resources
 ```
 
+在 Windows x64 构建机上，使用 PowerShell 执行相同链路：
+
+```powershell
+conda activate webAgent
+$env:PYTHONPATH = "$PWD\src"
+python -m playwright install chromium
+$build = git rev-parse --verify HEAD
+python -m browser_use.webretriever.desktop.release build `
+  --playwright-browsers-dir "$env:LOCALAPPDATA\ms-playwright" `
+  --output-dir dist\webretriever-windows-resources `
+  --target x86_64-pc-windows-msvc `
+  --sidecar-build $build `
+  --runner-build $build
+python -m browser_use.webretriever.desktop.release verify `
+  --bundle-dir dist\webretriever-windows-resources
+python -m browser_use.webretriever.desktop.release smoke `
+  --bundle-dir dist\webretriever-windows-resources
+```
+
 `build` 使用 PyInstaller `onedir`，会复制完整 sidecar 运行时、动态导入资源，以及当前 pinned Playwright 所要求的 Chromium、headless shell 和 FFmpeg revision。生成的 `sidecar/release-manifest.json` 记录每个有效载荷的 SHA-256、目标三元组、sidecar/runner/app build、API major 和 SQLite schema version；`verify` 会拒绝缺失、篡改或版本不兼容的目录。`smoke` 在不继承 `CONDA_PREFIX` 或 `PYTHONPATH` 的环境中完成 bootstrap、认证就绪和 shutdown 检查。
 
 通过 smoke 后，把已经验证的资源树安装到 Tauri 的固定资源槽，再构建安装包：
@@ -81,6 +111,18 @@ npm ci
 npm run tauri build -- --bundles deb,appimage
 ```
 
-生产态 Tauri 从资源目录中的固定 `sidecar/webretriever-sidecar` 启动，并且只允许 `tauri://localhost`；开发态仍然使用活动 `Browser-Use` 环境中的 `python -m browser_use.webretriever.desktop.sidecar`。UI 不能传解释器路径或任意 shell 参数。
+Windows 上改用以下命令。它会生成 MSI 和 NSIS EXE；未经代码签名时 Windows 会显示发布者未知的 SmartScreen/安装提示。
+
+```powershell
+python -m browser_use.webretriever.desktop.release install-tauri-resources `
+  --bundle-dir dist\webretriever-windows-resources `
+  --resources-dir desktop\src-tauri\resources `
+  --replace
+Set-Location desktop
+npm ci
+npm run build:windows
+```
+
+生产态 Tauri 从资源目录中的固定 `sidecar/webretriever-sidecar` 启动（Windows 自动使用 `.exe` 后缀），并且只允许 `tauri://localhost`；开发态仍然使用活动 `Browser-Use` 环境中的 `python -m browser_use.webretriever.desktop.sidecar`。UI 不能传解释器路径或任意 shell 参数。
 
 升级时，release verifier 会核对 API/sidecar major、Tauri app build 和 SQLite schema matrix；若传入 `--state-dir`，会先迁移该目录的 `control.sqlite3`。SQLite 使用 `PRAGMA user_version`，旧的无版本 v1 journal 会原地补全 `last_event_id` 并标记为 schema 1；高于当前版本的数据库会被拒绝，不会降级写入。

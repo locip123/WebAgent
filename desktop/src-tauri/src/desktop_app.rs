@@ -1,5 +1,5 @@
 use crate::supervisor::{
-    BackendDescriptor, BackendState, BackendStatus, Supervisor, SupervisorConfig,
+    bundled_sidecar_program, BackendDescriptor, BackendState, BackendStatus, Supervisor, SupervisorConfig,
     TokioSidecarLauncher,
 };
 use std::{
@@ -67,11 +67,7 @@ pub fn run() {
             let config = if cfg!(debug_assertions) {
                 SupervisorConfig::development(state_dir)
             } else {
-                let program = app
-                    .path()
-                    .resource_dir()?
-                    .join("sidecar")
-                    .join("webretriever-sidecar");
+                let program = bundled_sidecar_program(&app.path().resource_dir()?);
                 SupervisorConfig::bundled(state_dir, program)
             };
             let supervisor = Arc::new(Supervisor::new(

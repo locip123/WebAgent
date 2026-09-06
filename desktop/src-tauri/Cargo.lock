@@ -4897,6 +4897,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "thiserror 2.0.20",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
