@@ -101,6 +101,7 @@ class RunnerConfig:
 	# endpoint.  A submission adapter may instead reuse the competition
 	# template's supplied authentication helper without changing runner logic.
 	cdp_headers_provider: Callable[[str], Mapping[str, str]] | None = None
+	project_url: str | None = None
 
 	def validate(self) -> None:
 		if not self.model.strip():
@@ -119,6 +120,10 @@ class RunnerConfig:
 					raise ValueError(f'model service {service.name} api_base must not be empty')
 				if not service.api_key.strip():
 					raise ValueError(f'model service {service.name} api_key must not be empty')
+				if not service.model.strip():
+					raise ValueError(f'model service {service.name} model must not be empty')
+				if service.response_mode not in {'responses', 'chat-completions'}:
+					raise ValueError(f'unsupported model service response mode: {service.name}')
 		elif not self.vlm_ports:
 			raise ValueError('at least one model service is required')
 		if any(not 1 <= port <= 65535 for port in self.vlm_ports):
@@ -170,6 +175,7 @@ class TaskRunResult:
 	retire_worker: bool = False
 	recover_worker: bool = False
 	requeue_task: bool = False
+	answer: str | None = None
 
 
 @dataclass(slots=True)
@@ -255,12 +261,13 @@ def _build_chat_model(
 	*,
 	api_base: str | None,
 	api_key: str,
+	model: str | None = None,
 	use_responses_api: bool | None = None,
 ) -> ChatOpenAI:
 	if use_responses_api is None:
 		use_responses_api = resolve_responses_api(config.api_mode)
 	return ChatOpenAI(
-		model=config.model,
+		model=model or config.model,
 		api_key=api_key,
 		base_url=api_base or None,
 		use_responses_api=use_responses_api,
@@ -278,7 +285,14 @@ def build_llm(config: RunnerConfig, worker_id: int = 0) -> BaseChatModel:
 	if config.model_services:
 		services = tuple(config.model_services)
 		clients = tuple(
-			_build_chat_model(config, api_base=service.api_base, api_key=service.api_key) for service in services
+			_build_chat_model(
+				config,
+				api_base=service.api_base,
+				api_key=service.api_key,
+				model=service.model,
+				use_responses_api=resolve_responses_api(service.response_mode),
+			)
+			for service in services
 		)
 		return ModelServiceRouter(
 			model=config.model,
@@ -810,7 +824,12 @@ async def _run_task(
 		)
 		_log_diagnostic_task_failure(logger, task, outcome)
 		logger.info('Finished task %s/%s with status %s', task.task_idx, task.task_id, outcome.status)
-		return TaskRunResult(outcome.status, retire_worker=retire_worker, recover_worker=recover_worker)
+		return TaskRunResult(
+			outcome.status,
+			retire_worker=retire_worker,
+			recover_worker=recover_worker,
+			answer=outcome.agent_answer,
+		)
 	finally:
 		try:
 			if isinstance(llm, ModelServiceRouter):
@@ -921,7 +940,10 @@ async def _consume_tasks(
 							worker_id=worker_id,
 							task_id=task.task_id,
 							task_idx=task.task_idx,
-							payload={'domain_status': task_result.status},
+							payload={
+								'domain_status': task_result.status,
+								**({'answer': task_result.answer} if task_result.answer else {}),
+							},
 						),
 						logger=logger,
 					)
@@ -1154,6 +1176,8 @@ async def run(
 ) -> dict[str, Any]:
 	config.validate()
 	tasks = _select_tasks(load_tasks(config.input_path), config)
+	if config.project_url is not None:
+		tasks = [task.model_copy(update={'website': config.project_url}) for task in tasks]
 	config.output_dir.mkdir(parents=True, exist_ok=True)
 	if not tasks:
 		raise ValueError('no tasks selected')

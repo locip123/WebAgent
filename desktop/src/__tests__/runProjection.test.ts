@@ -38,9 +38,13 @@ describe("run event projection", () => {
           taskIdx: 4,
           website: "example.com",
           phase: null,
-          status: "RUNNING"
+          status: "RUNNING",
+          completedSteps: 0,
+          maxSteps: null,
+          answer: null
         }
       },
+      steps: [],
       artifacts: [],
       errors: []
     });
@@ -74,6 +78,31 @@ describe("run event projection", () => {
         mimeType: "application/json",
         size: 128,
         taskId: "task-4"
+      }
+    ]);
+  });
+
+  it("keeps each completed step as a model progress update", () => {
+    const started = applyRunEvent(createRunProjection(snapshot), taskStarted);
+    const progressed = applyRunEvent(started, {
+      ...taskStarted,
+      event_id: 3,
+      type: "task.step.completed",
+      payload: { step: 2, max_steps: 5, action: "find_text", outcome: "ok" }
+    });
+
+    expect(progressed.tasks["task-4"]).toMatchObject({
+      completedSteps: 2,
+      maxSteps: 5
+    });
+    expect(progressed.steps).toEqual([
+      {
+        eventId: 3,
+        taskId: "task-4",
+        step: 2,
+        maxSteps: 5,
+        action: "find_text",
+        outcome: "ok"
       }
     ]);
   });

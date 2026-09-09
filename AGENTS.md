@@ -1,4 +1,4 @@
 - Python: `conda activate webAgent`
 - Communicate in Simplified Chinese
-- Competition smoke test repository:https://github.com/hhhhhhalf/WR-047 , This repository requires GitHub CLI authorized by the local machine for access
-- The competition has ended, and the competition information for the current project is provided for reference only
+- Our goal is to design a user-friendly webAgent with a clean and aesthetically pleasing interface.
+- UI design files in Penpot webagentUI

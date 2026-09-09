@@ -15,6 +15,8 @@ from typing import Sequence
 import uvicorn
 
 from browser_use.webretriever.desktop.api import create_app
+from browser_use.webretriever.desktop.account_profile_store import AccountProfileStore
+from browser_use.webretriever.desktop.model_service_store import ModelServiceStore
 from browser_use.webretriever.desktop.run_manager import RunManager
 from browser_use.webretriever.desktop.runner_adapter import JsonProfileResolver, RunnerAdapter
 from browser_use.webretriever.desktop.versioning import SIDECAR_PROTOCOL_VERSION
@@ -46,7 +48,10 @@ def _environment_mapping(name: str) -> dict[str, str]:
 
 async def _serve(*, state_dir: Path, launch_token: str, launch_nonce: str, log_level: str) -> None:
 	sidecar_build, runner_build = _runtime_build_info()
-	profiles = JsonProfileResolver(_environment_mapping("WR_SIDECAR_PROFILE_CONFIGS_JSON"))
+	model_config_path = _model_service_config_path(state_dir)
+	profile_paths = _environment_mapping("WR_SIDECAR_PROFILE_CONFIGS_JSON")
+	profile_paths.setdefault("local-default", str(model_config_path))
+	profiles = JsonProfileResolver(profile_paths)
 	adapter = RunnerAdapter(profiles=profiles)
 	manager = RunManager(runner=adapter, database_path=state_dir / "control.sqlite3")
 	shutdown_requested = asyncio.Event()
@@ -61,8 +66,11 @@ async def _serve(*, state_dir: Path, launch_token: str, launch_nonce: str, log_l
 		preflight=adapter.preflight,
 		allowed_origins=allowed_origins,
 		on_shutdown_requested=notify_shutdown,
+		account_profile_store=AccountProfileStore(state_dir / "account-profile.json"),
+		model_service_store=ModelServiceStore(model_config_path),
 		sidecar_build=sidecar_build,
 		runner_build=runner_build,
+		task_submission_dir=state_dir,
 	)
 	listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -94,6 +102,16 @@ async def _serve(*, state_dir: Path, launch_token: str, launch_nonce: str, log_l
 		with suppress(asyncio.CancelledError):
 			await shutdown_task
 		listener.close()
+
+
+def _model_service_config_path(state_dir: Path) -> Path:
+	"""Use the supplied config in releases and the repository config during development."""
+
+	configured_path = os.getenv("WR_SIDECAR_MODEL_CONFIG_PATH")
+	if configured_path:
+		return Path(configured_path).expanduser().resolve()
+	repository_config = Path(__file__).resolve().parents[4] / "config.json"
+	return repository_config if repository_config.is_file() else state_dir / "config.json"
 
 
 def _runtime_build_info() -> tuple[str, str]:

@@ -1,54 +1,74 @@
 {
-  "api_model": "gpt-5.4",
+  "api_model": "gpt-5.5",
   "api_mode": "responses",
   "reasoning_effort": "high",
   "model_services": [
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "sudobug",
       "api_base": "https://sudobug.top/v1",
       "api_key": "sk-MI3mqrru56y7hRDRKFBKBYpcfn28ojQ2fkFJBcD9BYuJmeEl"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "sudobug-2",
       "api_base": "https://sudobug.top/v1",
       "api_key": "sk-tkfHFReE8rW3rmJTwPLB6s2zXyx9ariMffBNC5vfyAVQAHHD"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "share-pro",
       "api_base": "https://share-api.com/v1",
       "api_key": "sk-49a16224b87eb856298fa7a1b7e38612fb1c3267bdfabb147d871746492a29f7"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "zxai",
       "api_base": "https://zxai.work/v1",
       "api_key": "sk-xbzb3EL48z7K0tyG63cZmM7TxEy4ThtGHg60lcrvzcFgcOgJ"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "share-plus",
       "api_base": "https://share-api.com/v1",
       "api_key": "sk-58ef910f7a880db1d46222f9f99b177eb8b7104db3152ded664800303c788472"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "share-pro-2",
       "api_base": "https://share-api.com/v1",
       "api_key": "sk-f5d0aef77f5123c4c0513aeb2f51501c75404f1cb25c4bd9a0a1611dbbade3a3"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "zxai-2",
       "api_base": "https://zxai.work/v1",
       "api_key": "sk-ozW26xoMiaEkipDQojvC7FRSIndYkJgW6iIWQ01c0RM5QpDs"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "fastapi-1",
       "api_base": "https://www.fastaitoken.com/v1",
       "api_key": "sk-c24bb4c36c242187484c48e71f112a54c892598b7cc852d4e9e8190602ab2bfe"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "fastapi-2",
       "api_base": "https://www.fastaitoken.com/v1",
       "api_key": "sk-2aa8bbef813d38fb2f418a08332bbca2d0046592c84c3efa44ac2a52d02292d1"
     },
     {
+      "model": "gpt-5.5",
+      "response_mode": "responses",
       "name": "fastapi-3",
       "api_base": "https://www.fastaitoken.com/v1",
       "api_key": "sk-72614223261bdb829de3c22e3afa7f1fd80f967fa158a4c6ef842d204843fec0"

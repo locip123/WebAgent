@@ -11,7 +11,11 @@ from typing import Any, Protocol
 
 from browser_use.webretriever.desktop.contracts import PreflightResult, RunEventDraft, RunSpec
 from browser_use.webretriever.desktop.telemetry import RunTelemetry
-from browser_use.webretriever.model_services import ModelServiceConfig
+from browser_use.webretriever.model_services import (
+	DEFAULT_MODEL_SERVICE_MODEL,
+	DEFAULT_MODEL_SERVICE_RESPONSE_MODE,
+	ModelServiceConfig,
+)
 from browser_use.webretriever.models import load_tasks
 from browser_use.webretriever.run_control import CancellationToken
 from browser_use.webretriever.runner import RunnerConfig, run as execute_runner
@@ -72,9 +76,13 @@ class JsonProfileResolver:
 			if not isinstance(raw, Mapping):
 				raise PreflightError("the selected model credential profile is invalid")
 			name, api_base, api_key = raw.get("name"), raw.get("api_base"), raw.get("api_key")
-			if not all(isinstance(value, str) and value.strip() for value in (name, api_base, api_key)):
+			service_model = raw.get("model", DEFAULT_MODEL_SERVICE_MODEL)
+			response_mode = raw.get("response_mode", DEFAULT_MODEL_SERVICE_RESPONSE_MODE)
+			if not all(isinstance(value, str) and value.strip() for value in (name, api_base, api_key, service_model)):
 				raise PreflightError("the selected model credential profile is invalid")
-			services.append(ModelServiceConfig(name.strip(), api_base.strip(), api_key.strip()))
+			if response_mode not in {"responses", "chat-completions"}:
+				raise PreflightError("the selected model credential profile is invalid")
+			services.append(ModelServiceConfig(name.strip(), api_base.strip(), api_key.strip(), service_model.strip(), response_mode))
 		api_mode = payload.get("api_mode", "auto")
 		reasoning_effort = payload.get("reasoning_effort", "medium")
 		if api_mode not in {"auto", "responses", "chat-completions"} or reasoning_effort not in {"low", "medium", "high"}:
@@ -145,6 +153,7 @@ class RunnerAdapter:
 			output_dir=actual_output,
 			model=profile.model,
 			cdp_urls=[],
+			project_url=spec.project_url,
 			model_services=list(profile.model_services),
 			api_mode=profile.api_mode,  # type: ignore[arg-type]
 			max_steps=spec.limits.max_steps,

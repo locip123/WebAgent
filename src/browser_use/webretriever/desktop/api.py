@@ -18,7 +18,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
+from browser_use.webretriever.desktop.account_profile_store import AccountProfileStore
+from browser_use.webretriever.desktop.model_service_store import ModelServiceStore
+from browser_use.webretriever.desktop.model_service_connection import (
+	ModelServiceConnectionError,
+	test_model_service_connection,
+)
 from browser_use.webretriever.desktop.contracts import (
+	AccountProfile,
 	CancelRequest,
 	CancelResult,
 	ArtifactPage,
@@ -29,9 +36,14 @@ from browser_use.webretriever.desktop.contracts import (
 	RunPage,
 	RunSnapshot,
 	RunSpec,
+	TaskSubmissionRequest,
 	RuntimeCapabilities,
 	ShutdownAccepted,
+	ModelServiceInput,
+	ModelServiceSummary,
+	ModelServiceTestResult,
 )
+from browser_use.webretriever.desktop.task_submission import TaskSubmissionService
 from browser_use.webretriever.desktop.run_manager import (
 	ActiveRunExistsError,
 	EventsExpiredError,
@@ -64,8 +76,12 @@ def create_app(
 	preflight: Callable[[RunSpec], Awaitable[PreflightResult | dict[str, Any]]] | None = None,
 	allowed_origins: tuple[str, ...] = (),
 	on_shutdown_requested: Callable[[], Awaitable[None]] | None = None,
+	account_profile_store: AccountProfileStore | None = None,
+	model_service_store: ModelServiceStore | None = None,
+	model_service_tester: Callable[[ModelServiceInput], Awaitable[None]] | None = None,
 	sidecar_build: str = "development",
 	runner_build: str = "development",
+	task_submission_dir: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
 	"""Build one sidecar application bound to its launch-scoped bearer token."""
 
@@ -83,11 +99,15 @@ def create_app(
 	)
 	app.state.run_manager = manager
 	app.state.preflight = preflight
+	app.state.account_profile_store = account_profile_store or AccountProfileStore()
+	app.state.model_service_store = model_service_store or ModelServiceStore()
+	app.state.model_service_tester = model_service_tester or test_model_service_connection
+	app.state.task_submission_service = TaskSubmissionService(task_submission_dir or ".webretriever-desktop")
 	app.add_middleware(
 		CORSMiddleware,
 		allow_origins=list(allowed_origins),
 		allow_credentials=False,
-		allow_methods=["GET", "POST"],
+		allow_methods=["GET", "POST", "PUT"],
 		allow_headers=["Authorization", "Idempotency-Key", "Last-Event-ID", "Content-Type"],
 	)
 
@@ -146,6 +166,62 @@ def create_app(
 	)
 	async def get_runtime_capabilities() -> RuntimeCapabilities:
 		return RuntimeCapabilities()
+
+	@app.get(
+		"/api/v1/account-profile",
+		response_model=AccountProfile,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def get_account_profile() -> AccountProfile:
+		return app.state.account_profile_store.get()
+
+	@app.put(
+		"/api/v1/account-profile",
+		response_model=AccountProfile,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def update_account_profile(profile: AccountProfile) -> AccountProfile:
+		return app.state.account_profile_store.save(profile)
+
+	@app.get(
+		"/api/v1/model-services",
+		response_model=list[ModelServiceSummary],
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def list_model_services() -> list[ModelServiceSummary]:
+		return app.state.model_service_store.list()
+
+	@app.post(
+		"/api/v1/model-services",
+		status_code=201,
+		response_model=ModelServiceSummary,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def add_model_service(service: ModelServiceInput, request: Request) -> ModelServiceSummary:
+		try:
+			return app.state.model_service_store.add(service)
+		except ValueError as exc:
+			raise _validation_problem(request, detail="the model service could not be saved") from exc
+
+	@app.post(
+		"/api/v1/model-services/test",
+		response_model=ModelServiceTestResult,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def test_unsaved_model_service(service: ModelServiceInput) -> ModelServiceTestResult:
+		return await _test_model_service_connection(app.state.model_service_tester, service)
+
+	@app.post(
+		"/api/v1/model-services/{service_name}/test",
+		response_model=ModelServiceTestResult,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def test_saved_model_service(service_name: str, request: Request) -> ModelServiceTestResult:
+		try:
+			service = app.state.model_service_store.get(service_name)
+		except KeyError as exc:
+			raise _validation_problem(request, detail="the model service was not found") from exc
+		return await _test_model_service_connection(app.state.model_service_tester, service)
 
 	@app.post(
 		"/api/v1/run-preflights",
@@ -233,6 +309,20 @@ def create_app(
 					trace_id=request.state.trace_id,
 				)
 			) from exc
+
+	@app.post(
+		"/api/v1/task-submissions",
+		status_code=202,
+		response_model=RunAccepted,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def submit_task(
+		submission: TaskSubmissionRequest,
+		request: Request,
+		idempotency_key: str = Header(alias="Idempotency-Key"),
+	) -> RunAccepted:
+		spec = app.state.task_submission_service.create_run_spec(submission)
+		return await create_run(spec, request, idempotency_key)
 
 	@app.get("/api/v1/runs", response_model=RunPage, dependencies=[Depends(require_launch_bearer)])
 	async def list_runs(cursor: str | None = None, limit: int = 50) -> RunPage:
@@ -377,6 +467,18 @@ def _validation_problem(request: Request, *, detail: str) -> _ProblemError:
 			errors={"request": [detail]},
 		)
 	)
+
+
+async def _test_model_service_connection(
+	tester: Callable[[ModelServiceInput], Awaitable[None]], service: ModelServiceInput
+) -> ModelServiceTestResult:
+	try:
+		await tester(service)
+	except ModelServiceConnectionError as exc:
+		return ModelServiceTestResult(name=service.name, success=False, error_code=exc.error_code)
+	except Exception:
+		return ModelServiceTestResult(name=service.name, success=False, error_code="connection_failed")
+	return ModelServiceTestResult(name=service.name, success=True)
 
 
 __all__ = ["create_app"]

@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel
@@ -26,6 +26,10 @@ T = TypeVar('T', bound=BaseModel)
 MODEL_SERVICE_COOLDOWN_BASE_SECONDS = 2.0
 MODEL_SERVICE_COOLDOWN_MAX_SECONDS = 60.0
 MODEL_SERVICE_AFFINITY_MAX_LOAD_DELTA = 1
+DEFAULT_MODEL_SERVICE_NAME = 'response'
+DEFAULT_MODEL_SERVICE_MODEL = 'gpt-5.5'
+DEFAULT_MODEL_SERVICE_RESPONSE_MODE = 'responses'
+ModelServiceResponseMode = Literal['responses', 'chat-completions']
 
 
 def model_service_group_key(api_base: str) -> str:
@@ -64,6 +68,8 @@ class ModelServiceConfig:
 	name: str
 	api_base: str
 	api_key: str
+	model: str = DEFAULT_MODEL_SERVICE_MODEL
+	response_mode: ModelServiceResponseMode = DEFAULT_MODEL_SERVICE_RESPONSE_MODE
 
 	@property
 	def group_key(self) -> str:

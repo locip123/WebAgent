@@ -24,7 +24,24 @@ const runSpec: RunSpec = {
 };
 
 describe("local control-plane client", () => {
-  it("preflights a run using the launch-scoped bearer token in a request header", async () => {
+  it("calls the default fetch with globalThis as its receiver", async () => {
+    const browserFetch = vi.fn(function (this: unknown) {
+      if (this !== globalThis) return Promise.reject(new TypeError("Illegal invocation"));
+      return Promise.resolve(
+        new Response(JSON.stringify({ schema_version: 1, task_count: 2, warnings: [] }), { status: 200 })
+      );
+    });
+    vi.stubGlobal("fetch", browserFetch);
+
+    try {
+      const client = new ControlPlaneClient(descriptor);
+      await expect(client.preflight(runSpec)).resolves.toEqual({ schema_version: 1, task_count: 2, warnings: [] });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+	it("preflights a run using the launch-scoped bearer token in a request header", async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ schema_version: 1, task_count: 2, warnings: [] }), { status: 200 })
     );
@@ -35,10 +52,57 @@ describe("local control-plane client", () => {
     const [url, options] = fetcher.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://127.0.0.1:43127/api/v1/run-preflights");
     expect(new Headers(options.headers).get("Authorization")).toBe("Bearer ephemeral-token");
-    expect(JSON.parse(String(options.body))).toEqual(runSpec);
-  });
+		expect(JSON.parse(String(options.body))).toEqual(runSpec);
+	});
 
-  it("replays SSE events from the supplied cursor with the bearer token kept in headers", async () => {
+	it("submits a workspace task with the launch-scoped bearer token", async () => {
+		const fetcher = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					schema_version: 1,
+					run_id: "run-7",
+					status: "STARTING",
+					created_at: "2026-09-04T12:00:00Z",
+					snapshot_url: "/api/v1/runs/run-7",
+					events_url: "/api/v1/runs/run-7/events"
+				}),
+				{ status: 202 }
+			)
+		);
+		const client = new ControlPlaneClient(descriptor, fetcher);
+
+		await client.submitTask({ task: "整理首页信息", website_url: "https://example.com" });
+
+		const [url, options] = fetcher.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe("http://127.0.0.1:43127/api/v1/task-submissions");
+		expect(new Headers(options.headers).get("Authorization")).toBe("Bearer ephemeral-token");
+		expect(new Headers(options.headers).get("Idempotency-Key")).toBeTruthy();
+		expect(JSON.parse(String(options.body))).toEqual({ task: "整理首页信息", website_url: "https://example.com" });
+	});
+
+	it("requests cancellation for an active run with the launch-scoped bearer token", async () => {
+		const fetcher = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify({ schema_version: 1, run_id: "run-7", status: "CANCELLING", cancel_applied: true }),
+				{ status: 202 }
+			)
+		);
+		const client = new ControlPlaneClient(descriptor, fetcher);
+
+		await expect(client.cancelRun("run-7")).resolves.toEqual({
+			schema_version: 1,
+			run_id: "run-7",
+			status: "CANCELLING",
+			cancel_applied: true
+		});
+
+		const [url, options] = fetcher.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe("http://127.0.0.1:43127/api/v1/runs/run-7/cancel");
+		expect(options.method).toBe("POST");
+		expect(new Headers(options.headers).get("Authorization")).toBe("Bearer ephemeral-token");
+	});
+
+	it("replays SSE events from the supplied cursor with the bearer token kept in headers", async () => {
     const encoder = new TextEncoder();
     const fetcher = vi.fn().mockResolvedValue(
       new Response(

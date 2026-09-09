@@ -14,7 +14,11 @@ from typing import Any, Sequence
 from dotenv import load_dotenv
 
 from browser_use.webretriever.configuration import ConfigurationError, FileConfiguration, load_file_configuration
-from browser_use.webretriever.model_services import ModelServiceConfig
+from browser_use.webretriever.model_services import (
+	DEFAULT_MODEL_SERVICE_MODEL,
+	DEFAULT_MODEL_SERVICE_RESPONSE_MODE,
+	ModelServiceConfig,
+)
 from browser_use.webretriever.models import load_tasks
 from browser_use.webretriever.prompts import DEFAULT_THOUGHT_LANGUAGE
 from browser_use.webretriever.runner import (
@@ -304,15 +308,23 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 			if not isinstance(service, dict):
 				parser.error(f'model_services[{index}] must be a table')
 			try:
+				service_model = service.get('model', DEFAULT_MODEL_SERVICE_MODEL)
+				response_mode = service.get('response_mode', DEFAULT_MODEL_SERVICE_RESPONSE_MODE)
+				if not isinstance(service_model, str) or not service_model.strip():
+					raise ValueError('model must be a non-empty string')
+				if response_mode not in {'responses', 'chat-completions'}:
+					raise ValueError('response_mode must be responses or chat-completions')
 				model_services.append(
 					ModelServiceConfig(
 						name=str(service['name']),
 						api_base=str(service['api_base']),
 						api_key=str(service['api_key']),
+						model=service_model.strip(),
+						response_mode=response_mode,
 					)
 				)
-			except (KeyError, TypeError) as exc:
-				parser.error(f'model_services[{index}] must contain name, api_base, and api_key: {exc}')
+			except (KeyError, TypeError, ValueError) as exc:
+				parser.error(f'model_services[{index}] has an invalid model service configuration: {exc}')
 	if model_services and args.vlm_ports:
 		parser.error('model_services and --vlm_ports are mutually exclusive')
 	if not model:

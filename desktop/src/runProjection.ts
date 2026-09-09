@@ -30,6 +30,18 @@ export interface TaskProjection {
   website: string;
   phase: string | null;
   status: "RUNNING" | "FINISHED" | "FAILED";
+  completedSteps: number;
+  maxSteps: number | null;
+  answer: string | null;
+}
+
+export interface TaskStepProjection {
+  eventId: number;
+  taskId: string;
+  step: number;
+  maxSteps: number;
+  action: string;
+  outcome: string;
 }
 
 export interface ArtifactProjection {
@@ -43,12 +55,13 @@ export interface ArtifactProjection {
 export interface RunProjection {
   snapshot: RunSnapshot;
   tasks: Record<string, TaskProjection>;
+  steps: TaskStepProjection[];
   artifacts: ArtifactProjection[];
   errors: Array<{ eventId: number; code: string; taskId: string | null }>;
 }
 
 export function createRunProjection(snapshot: RunSnapshot): RunProjection {
-  return { snapshot, tasks: {}, artifacts: [], errors: [] };
+  return { snapshot, tasks: {}, steps: [], artifacts: [], errors: [] };
 }
 
 export function applyRunEvent(projection: RunProjection, event: RunEvent): RunProjection {
@@ -60,6 +73,7 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
     ...projection,
     snapshot: { ...projection.snapshot, last_event_id: event.event_id },
     tasks: { ...projection.tasks },
+    steps: [...projection.steps],
     errors: [...projection.errors]
   };
   if (event.type === "task.started" && event.task) {
@@ -68,7 +82,10 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
       taskIdx: event.task.task_idx,
       website: typeof event.payload.website_display === "string" ? event.payload.website_display : "未知站点",
       phase: null,
-      status: "RUNNING"
+      status: "RUNNING",
+      completedSteps: 0,
+      maxSteps: null,
+      answer: null
     };
   }
   if (event.type === "task.phase_changed" && event.task) {
@@ -80,12 +97,43 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
       };
     }
   }
+  if (event.type === "task.step.completed" && event.task) {
+    const task = next.tasks[event.task.task_id];
+    const step = event.payload.step;
+    const maxSteps = event.payload.max_steps;
+    const action = event.payload.action;
+    const outcome = event.payload.outcome;
+    if (
+      task &&
+      typeof step === "number" && Number.isInteger(step) && step > 0 &&
+      typeof maxSteps === "number" && Number.isInteger(maxSteps) && maxSteps > 0 &&
+      typeof action === "string" &&
+      typeof outcome === "string"
+    ) {
+      next.tasks[event.task.task_id] = {
+        ...task,
+        completedSteps: step,
+        maxSteps
+      };
+      next.steps.push({
+        eventId: event.event_id,
+        taskId: event.task.task_id,
+        step,
+        maxSteps,
+        action,
+        outcome
+      });
+    }
+  }
   if ((event.type === "task.finished" || event.type === "task.failed") && event.task) {
     const task = next.tasks[event.task.task_id];
     if (task) {
       next.tasks[event.task.task_id] = {
         ...task,
-        status: event.type === "task.failed" ? "FAILED" : "FINISHED"
+        status: event.type === "task.failed" ? "FAILED" : "FINISHED",
+        answer: event.type === "task.finished" && typeof event.payload.answer === "string"
+          ? event.payload.answer
+          : task.answer
       };
     }
   }

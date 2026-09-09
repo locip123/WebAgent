@@ -45,6 +45,112 @@ paths:
                 $ref: '#/components/schemas/RuntimeCapabilities'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /api/v1/account-profile:
+    get:
+      operationId: getAccountProfile
+      responses:
+        '200':
+          description: The local desktop user's account profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      operationId: updateAccountProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountProfile'
+      responses:
+        '200':
+          description: The saved local desktop user profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/model-services:
+    get:
+      operationId: listModelServices
+      responses:
+        '200':
+          description: Configured model services without API keys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ModelServiceSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: addModelService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelServiceInput'
+      responses:
+        '201':
+          description: A model service was persisted; its API key is never returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelServiceSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/model-services/test:
+    post:
+      operationId: testUnsavedModelService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelServiceInput'
+      responses:
+        '200':
+          description: A credential-safe result from one live provider request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelServiceTestResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/model-services/{service_name}/test:
+    post:
+      operationId: testSavedModelService
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+      responses:
+        '200':
+          description: A credential-safe result from testing a persisted service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelServiceTestResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
   /api/v1/run-preflights:
     post:
       operationId: preflightRun
@@ -63,6 +169,39 @@ paths:
                 $ref: '#/components/schemas/PreflightResult'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+  /api/v1/task-submissions:
+    post:
+      operationId: submitTask
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskSubmissionRequest'
+      responses:
+        '202':
+          description: A headed, single-task run was accepted asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAccepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A run is active or this idempotency key names a different request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '422':
           $ref: '#/components/responses/ValidationFailed'
   /api/v1/runs:
@@ -306,6 +445,80 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
   schemas:
+    AccountProfile:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          default: 林晓宇
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          default: ''
+        age:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 150
+          default: null
+        work:
+          type: string
+          maxLength: 100
+          default: ''
+        organization:
+          type: string
+          maxLength: 100
+          default: ''
+    ModelServiceSummary:
+      type: object
+      additionalProperties: false
+      required: [name, api_base, model, response_mode]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          default: response
+        api_base:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 4096
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+          default: gpt-5.4
+        response_mode:
+          type: string
+          enum: [responses, chat-completions]
+          default: responses
+    ModelServiceInput:
+      allOf:
+        - $ref: '#/components/schemas/ModelServiceSummary'
+        - type: object
+          required: [api_key]
+          properties:
+            api_key:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              writeOnly: true
+    ModelServiceTestResult:
+      type: object
+      additionalProperties: false
+      required: [name, success, error_code]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        success:
+          type: boolean
+        error_code:
+          type: [string, 'null']
     CredentialProfileReference:
       type: object
       additionalProperties: false
@@ -326,6 +539,20 @@ components:
         headed:
           type: boolean
           default: false
+    TaskSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [task, website_url]
+      properties:
+        task:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        website_url:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          format: uri
     RunnerLimits:
       type: object
       additionalProperties: false
@@ -379,6 +606,11 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
+        project_url:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 4096
+          format: uri
         model:
           $ref: '#/components/schemas/CredentialProfileReference'
         browser:

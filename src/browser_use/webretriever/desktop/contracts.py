@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -13,6 +15,11 @@ from browser_use.webretriever.runner import (
 	MAX_CONCURRENCY,
 )
 from browser_use.webretriever.desktop.versioning import API_PROTOCOL_VERSION
+from browser_use.webretriever.model_services import (
+	DEFAULT_MODEL_SERVICE_MODEL,
+	DEFAULT_MODEL_SERVICE_NAME,
+	DEFAULT_MODEL_SERVICE_RESPONSE_MODE,
+)
 
 SCHEMA_VERSION = API_PROTOCOL_VERSION
 MAX_STEPS = 100
@@ -109,6 +116,55 @@ class ProblemDetails(_ContractModel):
 			run_id=run_id,
 			errors=errors,
 		)
+
+
+class AccountProfile(_ContractModel):
+	"""The locally stored profile for the desktop application's single user."""
+
+	name: str = Field(default="林晓宇", max_length=100)
+	email: str = Field(default="", max_length=254)
+	age: int | None = Field(default=None, ge=0, le=150)
+	work: str = Field(default="", max_length=100)
+	organization: str = Field(default="", max_length=100)
+
+	@field_validator("email")
+	@classmethod
+	def _email_is_valid(cls, value: str) -> str:
+		if value and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+			raise ValueError("email must be a valid email address")
+		return value
+
+
+ModelServiceResponseMode = Literal["responses", "chat-completions"]
+
+
+class ModelServiceSummary(_ContractModel):
+	"""A configured service excluding its credential."""
+
+	name: str = Field(default=DEFAULT_MODEL_SERVICE_NAME, min_length=1, max_length=100)
+	api_base: str = Field(min_length=1, max_length=4_096)
+	model: str = Field(default=DEFAULT_MODEL_SERVICE_MODEL, min_length=1, max_length=256)
+	response_mode: ModelServiceResponseMode = DEFAULT_MODEL_SERVICE_RESPONSE_MODE
+
+	@field_validator("api_base")
+	@classmethod
+	def _api_base_is_valid(cls, value: str) -> str:
+		parts = urlsplit(value)
+		if parts.scheme not in {"http", "https"} or not parts.netloc or parts.username or parts.password:
+			raise ValueError("api_base must be an absolute HTTP(S) URL without credentials")
+		return value.rstrip("/")
+
+
+class ModelServiceInput(ModelServiceSummary):
+	"""A service supplied to the local sidecar, including its write-only credential."""
+
+	api_key: str = Field(min_length=1, max_length=4_096)
+
+
+class ModelServiceTestResult(_ContractModel):
+	name: str = Field(min_length=1, max_length=100)
+	success: bool
+	error_code: str | None = None
 
 
 EventType = Literal[
@@ -277,6 +333,29 @@ class LocalBrowserSpec(_ContractModel):
 	headed: bool = False
 
 
+class TaskSubmissionRequest(_ContractModel):
+	"""A single workspace task submitted from the desktop home screen."""
+
+	task: str = Field(min_length=1, max_length=20_000)
+	website_url: str = Field(min_length=1, max_length=4_096)
+
+	@field_validator("website_url")
+	@classmethod
+	def _website_url_is_valid(cls, value: str) -> str:
+		if any(character.isspace() or ord(character) < 32 for character in value):
+			raise ValueError("website_url must not contain whitespace or control characters")
+		parts = urlsplit(value)
+		if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+			raise ValueError("website_url must be an absolute HTTP(S) URL")
+		if parts.username is not None or parts.password is not None:
+			raise ValueError("website_url must not contain credentials")
+		try:
+			_ = parts.port
+		except ValueError as exc:
+			raise ValueError("website_url contains an invalid port") from exc
+		return value
+
+
 class RunnerLimits(_ContractModel):
 	"""The bounded Runner controls deliberately exposed to desktop users."""
 
@@ -314,13 +393,36 @@ class RunSpec(_ContractModel):
 	schema_version: Literal[SCHEMA_VERSION]
 	input_path: str = Field(min_length=1, max_length=4_096)
 	output_root: str = Field(min_length=1, max_length=4_096)
+	project_url: str | None = Field(default=None, min_length=1, max_length=4_096)
 	model: CredentialProfileReference
 	browser: LocalBrowserSpec
 	limits: RunnerLimits = Field(default_factory=RunnerLimits)
 	selection: TaskSelection = Field(default_factory=TaskSelection)
 
+	@field_validator("project_url")
+	@classmethod
+	def _project_url_is_valid(cls, value: str | None) -> str | None:
+		if value is None:
+			return None
+		if any(character.isspace() or ord(character) < 32 for character in value):
+			raise ValueError("project_url must not contain whitespace or control characters")
+		parts = urlsplit(value)
+		if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+			raise ValueError("project_url must be an absolute HTTP(S) URL")
+		if parts.username is not None or parts.password is not None:
+			raise ValueError("project_url must not contain credentials")
+		try:
+			_ = parts.port
+		except ValueError as exc:
+			raise ValueError("project_url contains an invalid port") from exc
+		return value
+
 
 __all__ = [
+	"AccountProfile",
+	"ModelServiceInput",
+	"ModelServiceSummary",
+	"ModelServiceTestResult",
 	"CredentialProfileReference",
 	"Artifact",
 	"ArtifactPage",
@@ -347,4 +449,5 @@ __all__ = [
 	"ShutdownAccepted",
 	"TaskSelection",
 	"RuntimeCapabilities",
+	"TaskSubmissionRequest",
 ]

@@ -6,6 +6,7 @@ export interface RunSpec {
   schema_version: 1;
   input_path: string;
   output_root: string;
+  project_url?: string;
   model: { profile_id: string };
   browser: { mode: "local"; headed: boolean };
   limits: {
@@ -26,6 +27,31 @@ export interface PreflightResult {
   warnings: string[];
 }
 
+export interface AccountProfile {
+  name: string;
+  email: string;
+  age: number | null;
+  work: string;
+  organization: string;
+}
+
+export interface ModelServiceSummary {
+  name: string;
+  api_base: string;
+  model: string;
+  response_mode: "responses" | "chat-completions";
+}
+
+export interface ModelServiceInput extends ModelServiceSummary {
+  api_key: string;
+}
+
+export interface ModelServiceTestResult {
+  name: string;
+  success: boolean;
+  error_code: string | null;
+}
+
 export interface RunAccepted {
   schema_version: 1;
   run_id: string;
@@ -35,10 +61,30 @@ export interface RunAccepted {
   events_url: string;
 }
 
+export interface CancelResult {
+  schema_version: 1;
+  run_id: string;
+  status: "STARTING" | "RUNNING" | "CANCELLING" | "COMPLETED" | "CANCELLED" | "FAILED" | "INTERRUPTED";
+  cancel_applied: boolean;
+}
+
+export interface TaskSubmission {
+  task: string;
+  website_url: string;
+}
+
 export interface ControlPlaneApi {
+	getAccountProfile?(): Promise<AccountProfile>;
+	updateAccountProfile?(profile: AccountProfile): Promise<AccountProfile>;
+  listModelServices?(): Promise<ModelServiceSummary[]>;
+  addModelService?(service: ModelServiceInput): Promise<ModelServiceSummary>;
+  testModelService?(service: ModelServiceInput): Promise<ModelServiceTestResult>;
+  testSavedModelService?(name: string): Promise<ModelServiceTestResult>;
   preflight(spec: RunSpec): Promise<PreflightResult>;
   createRun(spec: RunSpec): Promise<RunAccepted>;
+	 submitTask?(submission: TaskSubmission): Promise<RunAccepted>;
   getRun(runId: string): Promise<RunSnapshot>;
+	 cancelRun?(runId: string): Promise<CancelResult>;
   subscribeToRun(runId: string, after: number, onEvent: (event: RunEvent) => void): Promise<() => void>;
 }
 
@@ -65,19 +111,54 @@ const chineseProblemMessages: Record<string, string> = {
 };
 
 export function localizeProblem(problem: LocalControlPlaneProblem): string {
-  return chineseProblemMessages[problem.errorCode] ?? "本地后端请求失败，请稍后重试。";
+  return chineseProblemMessages[problem.errorCode] ?? `本地后端请求失败（HTTP ${problem.status}），请稍后重试。`;
 }
 
 export class ControlPlaneClient implements ControlPlaneApi {
   public constructor(
     private readonly descriptor: BackendDescriptor,
-    private readonly fetcher: Fetcher = fetch
+    private readonly fetcher: Fetcher = (input, init) => globalThis.fetch(input, init)
   ) {}
 
   public async preflight(spec: RunSpec): Promise<PreflightResult> {
     return this.request<PreflightResult>("/api/v1/run-preflights", {
       method: "POST",
       body: JSON.stringify(spec)
+    });
+  }
+
+	public async getAccountProfile(): Promise<AccountProfile> {
+		return this.request<AccountProfile>("/api/v1/account-profile", { method: "GET" });
+	}
+
+	public async updateAccountProfile(profile: AccountProfile): Promise<AccountProfile> {
+		return this.request<AccountProfile>("/api/v1/account-profile", {
+			method: "PUT",
+			body: JSON.stringify(profile)
+		});
+	}
+
+  public async listModelServices(): Promise<ModelServiceSummary[]> {
+    return this.request<ModelServiceSummary[]>("/api/v1/model-services", { method: "GET" });
+  }
+
+  public async addModelService(service: ModelServiceInput): Promise<ModelServiceSummary> {
+    return this.request<ModelServiceSummary>("/api/v1/model-services", {
+      method: "POST",
+      body: JSON.stringify(service)
+    });
+  }
+
+  public async testModelService(service: ModelServiceInput): Promise<ModelServiceTestResult> {
+    return this.request<ModelServiceTestResult>("/api/v1/model-services/test", {
+      method: "POST",
+      body: JSON.stringify(service)
+    });
+  }
+
+  public async testSavedModelService(name: string): Promise<ModelServiceTestResult> {
+    return this.request<ModelServiceTestResult>(`/api/v1/model-services/${encodeURIComponent(name)}/test`, {
+      method: "POST"
     });
   }
 
@@ -89,8 +170,20 @@ export class ControlPlaneClient implements ControlPlaneApi {
     });
   }
 
+	public async submitTask(submission: TaskSubmission): Promise<RunAccepted> {
+		return this.request<RunAccepted>("/api/v1/task-submissions", {
+			method: "POST",
+			headers: { "Idempotency-Key": crypto.randomUUID() },
+			body: JSON.stringify(submission)
+		});
+	}
+
   public async getRun(runId: string): Promise<RunSnapshot> {
     return this.request<RunSnapshot>(`/api/v1/runs/${encodeURIComponent(runId)}`, { method: "GET" });
+  }
+
+  public async cancelRun(runId: string): Promise<CancelResult> {
+    return this.request<CancelResult>(`/api/v1/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
   }
 
   public async subscribeToRun(

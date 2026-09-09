@@ -18,7 +18,11 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from browser_use.webretriever.connection import BrowserDriver
-from browser_use.webretriever.model_services import ModelServiceConfig
+from browser_use.webretriever.model_services import (
+	DEFAULT_MODEL_SERVICE_MODEL,
+	DEFAULT_MODEL_SERVICE_RESPONSE_MODE,
+	ModelServiceConfig,
+)
 from browser_use.webretriever.runner import MAX_CONCURRENCY, RunnerConfig, run
 
 _CDP_ACCESS_TOKEN_KEY = 'access_token'
@@ -58,11 +62,19 @@ def _load_model_services(payload: Mapping[str, object]) -> list[ModelServiceConf
 		prefix = f'config.json model_services[{index}]'
 		if not isinstance(raw_service, Mapping):
 			raise ValueError(f'{prefix} must be an object')
+		model = raw_service.get('model', DEFAULT_MODEL_SERVICE_MODEL)
+		response_mode = raw_service.get('response_mode', DEFAULT_MODEL_SERVICE_RESPONSE_MODE)
+		if not isinstance(model, str) or not model.strip():
+			raise ValueError(f"{prefix} field 'model' must be a non-empty string")
+		if response_mode not in {'responses', 'chat-completions'}:
+			raise ValueError(f"{prefix} field 'response_mode' must be one of: chat-completions, responses")
 		services.append(
 			ModelServiceConfig(
 				_required_configuration_string(raw_service, 'name', prefix=prefix),
 				_required_configuration_string(raw_service, 'api_base', prefix=prefix),
 				_required_configuration_string(raw_service, 'api_key', prefix=prefix),
+				model.strip(),
+				response_mode,
 			)
 		)
 	return services
