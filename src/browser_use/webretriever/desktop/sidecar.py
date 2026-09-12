@@ -53,7 +53,7 @@ async def _serve(*, state_dir: Path, launch_token: str, launch_nonce: str, log_l
 	profile_paths.setdefault("local-default", str(model_config_path))
 	profiles = JsonProfileResolver(profile_paths)
 	adapter = RunnerAdapter(profiles=profiles)
-	manager = RunManager(runner=adapter, database_path=state_dir / "control.sqlite3")
+	manager = RunManager(runner=adapter, database_path=state_dir / "control.sqlite3", state_dir=state_dir)
 	shutdown_requested = asyncio.Event()
 
 	async def notify_shutdown() -> None:
@@ -71,6 +71,7 @@ async def _serve(*, state_dir: Path, launch_token: str, launch_nonce: str, log_l
 		sidecar_build=sidecar_build,
 		runner_build=runner_build,
 		task_submission_dir=state_dir,
+		state_dir=state_dir,
 	)
 	listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

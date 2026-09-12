@@ -59,7 +59,7 @@ ApiMode = Literal['auto', 'responses', 'chat-completions']
 ReasoningEffort = Literal['low', 'medium', 'high']
 DEFAULT_MAX_CONCURRENCY = 3
 MAX_CONCURRENCY = 8
-DEFAULT_TASK_TIMEOUT_SECONDS = 600.0
+DEFAULT_TASK_TIMEOUT_SECONDS = 1200.0
 TASK_FINALIZATION_GRACE_SECONDS = 60.0
 DEFAULT_PATCHRIGHT_EXPERIMENT_TASK_INDICES = PATCHRIGHT_EXPERIMENT_TASK_INDICES
 DEFAULT_REBROWSER_EXPERIMENT_TASK_INDICES = REBROWSER_EXPERIMENT_TASK_INDICES
@@ -176,6 +176,7 @@ class TaskRunResult:
 	recover_worker: bool = False
 	requeue_task: bool = False
 	answer: str | None = None
+	error: str | None = None
 
 
 @dataclass(slots=True)
@@ -829,6 +830,7 @@ async def _run_task(
 			retire_worker=retire_worker,
 			recover_worker=recover_worker,
 			answer=outcome.agent_answer,
+			error=redact_cdp_url(outcome.error) if outcome.error else None,
 		)
 	finally:
 		try:
@@ -943,6 +945,7 @@ async def _consume_tasks(
 							payload={
 								'domain_status': task_result.status,
 								**({'answer': task_result.answer} if task_result.answer else {}),
+								**({'error': task_result.error} if task_result.error else {}),
 							},
 						),
 						logger=logger,

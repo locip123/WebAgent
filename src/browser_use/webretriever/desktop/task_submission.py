@@ -41,6 +41,7 @@ class TaskSubmissionService:
 			schema_version=1,
 			input_path=str(task_path),
 			output_root=str(output_root),
+			project_id=submission.project_id,
 			project_url=submission.website_url,
 			model={"profile_id": self._profile_id},
 			browser={"mode": "local", "headed": True},

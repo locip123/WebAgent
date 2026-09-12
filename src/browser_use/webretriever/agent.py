@@ -350,7 +350,6 @@ _KNOWN_ACTION_NAMES = frozenset(
 		'close_tab',
 		'read_element',
 		'find_text',
-		'inspect_network',
 		'find_chart_data_requests',
 		'call_data_analysis_assistant',
 		'calculate',
@@ -907,15 +906,14 @@ def _observation_hash(rendered_observation: str) -> str:
 _NAVIGATION_ACTIONS = frozenset({'scroll', 'back', 'navigate', 'click_xy', 'switch_tab', 'drag'})
 # Read-only probes: many of these in a row without any state change means the
 # current modality is exhausted, no matter how the query string varies.
-_PROBE_ACTIONS = frozenset({'inspect_network', 'find_text', 'read_element', 'find_chart_data_requests'})
+_PROBE_ACTIONS = frozenset({'find_text', 'read_element', 'find_chart_data_requests'})
 
 
 def _action_intent(decision: AgentDecision) -> str:
 	"""Coarse action identity that ignores incidental parameter churn.
 
 	Case 62 re-submitted the same form through five different ``element_id``
-	values, case 77 issued 48 ``inspect_network`` calls with 48 different query
-	strings, and case 95 dragged the same date-picker column ten times with
+	values, and case 95 dragged the same date-picker column ten times with
 	endpoints jittering by a handful of pixels.  Each is one intent repeated, so
 	loop detection keys on the action plus only the parameters that change *what*
 	is being attempted -- never the coordinates or element handle used to reach it.
@@ -1242,7 +1240,7 @@ class ProtocolIIIAgent:
 			logger=logging.getLogger('webretriever.agent'),
 		)
 
-	async def _emit_completed_step(self, *, step: int, action: str, outcome: str) -> None:
+	async def _emit_completed_step(self, *, step: int, action: str, outcome: str, thought: str) -> None:
 		await self._emit(
 			'task.step.completed',
 			payload={
@@ -1250,6 +1248,18 @@ class ProtocolIIIAgent:
 				'max_steps': self.max_steps,
 				'action': action,
 				'outcome': outcome,
+				'thought': thought,
+			},
+		)
+
+	async def _emit_decided_step(self, *, step: int, action: str, thought: str) -> None:
+		await self._emit(
+			'task.step.decided',
+			payload={
+				'step': step,
+				'max_steps': self.max_steps,
+				'action': action,
+				'thought': thought,
 			},
 		)
 
@@ -2824,6 +2834,7 @@ class ProtocolIIIAgent:
 				blocked_no_change_signatures.clear()
 				blocked_loop_intents.clear()
 			action_text = _action_string(decision)
+			await self._emit_decided_step(step=step, action=decision.action, thought=decision.thought)
 			_save_visual_screenshot(
 				screenshot,
 				self.task_dir / 'trajectory_visual' / f'{step}.png',
@@ -2849,7 +2860,9 @@ class ProtocolIIIAgent:
 				if decision.success is True and answer and evidence:
 					step_record['outcome'] = 'Task completed with an answer and origin explanation.'
 					outcome.steps.append(step_record)
-					await self._emit_completed_step(step=step, action=decision.action, outcome='ok')
+					await self._emit_completed_step(
+						step=step, action=decision.action, outcome='ok', thought=decision.thought
+					)
 					outcome.status = 'SUCCESS'
 					outcome.agent_answer = answer
 					outcome.evidence = evidence
@@ -3228,7 +3241,9 @@ class ProtocolIIIAgent:
 				if isinstance(action_result_payload, Mapping) and isinstance(action_result_payload.get('status'), str)
 				else ('error' if action_failed else 'ok')
 			)
-			await self._emit_completed_step(step=step, action=decision.action, outcome=telemetry_outcome)
+			await self._emit_completed_step(
+				step=step, action=decision.action, outcome=telemetry_outcome, thought=decision.thought
+			)
 			_record_exploration_decision(
 				exploration_tracker,
 				decision=decision,

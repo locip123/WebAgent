@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -31,6 +32,10 @@ from browser_use.webretriever.desktop.contracts import (
 	ArtifactPage,
 	PreflightResult,
 	ProblemDetails,
+	ProjectHistoryPage,
+	ProjectPage,
+	ProjectRegistration,
+	ProjectSummary,
 	ReadyInfo,
 	RunAccepted,
 	RunPage,
@@ -45,13 +50,18 @@ from browser_use.webretriever.desktop.contracts import (
 )
 from browser_use.webretriever.desktop.task_submission import TaskSubmissionService
 from browser_use.webretriever.desktop.run_manager import (
+	ActiveProjectRunError,
 	ActiveRunExistsError,
 	EventsExpiredError,
 	IdempotencyKeyReusedError,
 	RunManager,
 	RunNotFoundError,
+	ProjectNotFoundError,
+	ProjectDeletionPermissionError,
+	ProjectPathUnsafeError,
 	SidecarDrainingError,
 )
+from browser_use.webretriever.desktop.store import ProjectUrlMismatchError
 from browser_use.webretriever.desktop.runner_adapter import PreflightError
 
 
@@ -82,6 +92,7 @@ def create_app(
 	sidecar_build: str = "development",
 	runner_build: str = "development",
 	task_submission_dir: str | os.PathLike[str] | None = None,
+	state_dir: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
 	"""Build one sidecar application bound to its launch-scoped bearer token."""
 
@@ -102,19 +113,21 @@ def create_app(
 	app.state.account_profile_store = account_profile_store or AccountProfileStore()
 	app.state.model_service_store = model_service_store or ModelServiceStore()
 	app.state.model_service_tester = model_service_tester or test_model_service_connection
-	app.state.task_submission_service = TaskSubmissionService(task_submission_dir or ".webretriever-desktop")
-	app.add_middleware(
-		CORSMiddleware,
-		allow_origins=list(allowed_origins),
-		allow_credentials=False,
-		allow_methods=["GET", "POST", "PUT"],
-		allow_headers=["Authorization", "Idempotency-Key", "Last-Event-ID", "Content-Type"],
-	)
-
+	effective_state_dir = state_dir or task_submission_dir or ".webretriever-desktop"
+	app.state.state_dir = os.fspath(effective_state_dir)
+	app.state.task_submission_service = TaskSubmissionService(effective_state_dir)
 	@app.middleware("http")
 	async def assign_trace_id(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
 		request.state.trace_id = str(uuid4())
 		return await call_next(request)
+
+	app.add_middleware(
+		CORSMiddleware,
+		allow_origins=list(allowed_origins),
+		allow_credentials=False,
+		allow_methods=["GET", "POST", "PUT", "DELETE"],
+		allow_headers=["Authorization", "Idempotency-Key", "Last-Event-ID", "Content-Type"],
+	)
 
 	@app.exception_handler(_ProblemError)
 	async def handle_problem(_request: Request, error: _ProblemError) -> JSONResponse:
@@ -223,6 +236,98 @@ def create_app(
 			raise _validation_problem(request, detail="the model service was not found") from exc
 		return await _test_model_service_connection(app.state.model_service_tester, service)
 
+	@app.get("/api/v1/projects", response_model=ProjectPage, dependencies=[Depends(require_launch_bearer)])
+	async def list_projects() -> ProjectPage:
+		return ProjectPage(items=await manager.list_projects())
+
+	@app.put(
+		"/api/v1/projects/{project_id}",
+		response_model=ProjectSummary,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def register_project(project_id: str, registration: ProjectRegistration, request: Request) -> ProjectSummary:
+		_validate_project_id(project_id, request)
+		try:
+			return await manager.register_project(project_id, registration.website_url)
+		except ProjectUrlMismatchError as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_url_mismatch",
+					status=409,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+				)
+			) from exc
+
+	@app.get(
+		"/api/v1/projects/{project_id}/history",
+		response_model=ProjectHistoryPage,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def list_project_history(
+		project_id: str,
+		request: Request,
+		cursor: str | None = None,
+		limit: int = 20,
+	) -> ProjectHistoryPage:
+		_validate_project_id(project_id, request)
+		try:
+			items, next_cursor = await manager.list_project_history(project_id, cursor=cursor, limit=limit)
+		except ProjectNotFoundError as exc:
+			raise _project_not_found_problem(request, project_id) from exc
+		return ProjectHistoryPage(items=items, next_cursor=next_cursor)
+
+	@app.delete(
+		"/api/v1/projects/{project_id}",
+		status_code=204,
+		dependencies=[Depends(require_launch_bearer)],
+	)
+	async def delete_project(project_id: str, request: Request) -> Response:
+		_validate_project_id(project_id, request)
+		try:
+			await manager.delete_project(project_id, state_dir=app.state.state_dir)
+		except ProjectNotFoundError as exc:
+			raise _project_not_found_problem(request, project_id) from exc
+		except ActiveProjectRunError as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_has_active_run",
+					status=409,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+					run_id=exc.run_id,
+				)
+			) from exc
+		except ProjectPathUnsafeError as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_path_unsafe",
+					status=409,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+				)
+			) from exc
+		except ProjectDeletionPermissionError as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_files_in_use",
+					status=409,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+					errors={"diagnostic": [exc.stage]},
+				)
+			) from exc
+		except Exception as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_delete_failed",
+					status=500,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+				)
+			) from exc
+		return Response(status_code=204)
+
 	@app.post(
 		"/api/v1/run-preflights",
 		response_model=PreflightResult,
@@ -295,6 +400,15 @@ def create_app(
 			raise _ProblemError(
 				ProblemDetails.for_error(
 					code="idempotency_key_reused",
+					status=409,
+					instance=request.url.path,
+					trace_id=request.state.trace_id,
+				)
+			) from exc
+		except ProjectUrlMismatchError as exc:
+			raise _ProblemError(
+				ProblemDetails.for_error(
+					code="project_url_mismatch",
 					status=409,
 					instance=request.url.path,
 					trace_id=request.state.trace_id,
@@ -467,6 +581,30 @@ def _validation_problem(request: Request, *, detail: str) -> _ProblemError:
 			errors={"request": [detail]},
 		)
 	)
+
+
+def _project_not_found_problem(request: Request, project_id: str) -> _ProblemError:
+	return _ProblemError(
+		ProblemDetails.for_error(
+			code="project_not_found",
+			status=404,
+			instance=request.url.path,
+			trace_id=request.state.trace_id,
+		)
+	)
+
+
+def _validate_project_id(project_id: str, request: Request) -> None:
+	if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", project_id):
+		raise _ProblemError(
+			ProblemDetails.for_error(
+				code="validation_failed",
+				status=422,
+				instance=request.url.path,
+				trace_id=request.state.trace_id,
+				errors={"path.project_id": ["must be a safe project identifier"]},
+			)
+		)
 
 
 async def _test_model_service_connection(

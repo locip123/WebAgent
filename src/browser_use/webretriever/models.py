@@ -38,7 +38,6 @@ ActionName: TypeAlias = Literal[
 	'close_tab',
 	'read_element',
 	'find_text',
-	'inspect_network',
 	'find_chart_data_requests',
 	'call_data_analysis_assistant',
 	'calculate',
@@ -119,10 +118,6 @@ ACTION_PARAMETER_CONTRACTS: dict[ActionName, ActionParameterContract] = {
 	'close_tab': ActionParameterContract(frozenset({'tab_index'}), description='close a current tab'),
 	'read_element': ActionParameterContract(frozenset({'element_id'}), description='read a current element fully'),
 	'find_text': ActionParameterContract(frozenset({'text'}), description='find text on the current page/document'),
-	'inspect_network': ActionParameterContract(
-		optional=frozenset({'text', 'request_id', 'network_cursor'}),
-		description='search captured bodies, optionally scoped to request_id, or continue one captured response',
-	),
 	'find_chart_data_requests': ActionParameterContract(
 		optional=frozenset({'chart_cursor'}), description='normalize current chart traffic or continue its saved packet'
 	),
@@ -408,7 +403,6 @@ class AgentDecision(BaseModel):
 		if 'cursor' in data:
 			action = data.get('action')
 			typed_field = {
-				'inspect_network': 'network_cursor',
 				'find_chart_data_requests': 'chart_cursor',
 			}.get(action if isinstance(action, str) else '')
 			if typed_field is None:
@@ -475,11 +469,6 @@ class AgentDecision(BaseModel):
 
 		if self.action == 'navigate' and self.url is not None:
 			_validate_web_url(self.url, field_name='url')
-		if self.action == 'inspect_network':
-			if self.network_cursor is not None and self.request_id is None:
-				raise ValueError('inspect_network network_cursor requires request_id')
-			if self.text is not None and self.network_cursor is not None:
-				raise ValueError('inspect_network network_cursor cannot be combined with text')
 		if self.action == 'finish' and self.success:
 			if not self._allows_legacy_finish_success:
 				raise ValueError('finish(success=true) is not part of the model contract; submit an answer candidate instead')

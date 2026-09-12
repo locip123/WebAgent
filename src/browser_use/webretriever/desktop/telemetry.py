@@ -15,6 +15,7 @@ _PUBLIC_RUNNER_EVENTS = frozenset(
 		"worker.state_changed",
 		"task.started",
 		"task.phase_changed",
+		"task.step.decided",
 		"task.step.completed",
 		"task.recovery",
 		"artifact.available",
@@ -23,7 +24,8 @@ _PUBLIC_RUNNER_EVENTS = frozenset(
 		"run.completed",
 	}
 )
-_FORBIDDEN_PAYLOAD_KEYS = frozenset({"api_key", "authorization", "token", "prompt", "completion", "thought", "screenshot"})
+_FORBIDDEN_PAYLOAD_KEYS = frozenset({"api_key", "authorization", "token", "prompt", "completion", "screenshot"})
+_MAX_PUBLIC_THOUGHT_CHARS = 4_000
 
 
 class RunTelemetry(RunObserver):
@@ -51,11 +53,18 @@ class RunTelemetry(RunObserver):
 def sanitize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 	"""Drop values whose names could expose credentials or model-private data."""
 
-	return {
-		str(key): value
-		for key, value in payload.items()
-		if str(key).casefold() not in _FORBIDDEN_PAYLOAD_KEYS and not str(key).casefold().endswith("_secret")
-	}
+	sanitized: dict[str, Any] = {}
+	for key, value in payload.items():
+		name = str(key)
+		normalized_name = name.casefold()
+		if normalized_name in _FORBIDDEN_PAYLOAD_KEYS or normalized_name.endswith("_secret"):
+			continue
+		if normalized_name == "thought":
+			if isinstance(value, str):
+				sanitized[name] = value[:_MAX_PUBLIC_THOUGHT_CHARS]
+			continue
+		sanitized[name] = value
+	return sanitized
 
 
 __all__ = ["RunTelemetry", "sanitize_payload"]

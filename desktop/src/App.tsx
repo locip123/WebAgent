@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { BackendDescriptor, BackendStatus, DesktopBridge } from "./bridge";
 import {
   ControlPlaneClient,
@@ -13,7 +13,7 @@ import {
   type RunAccepted,
   type RunSpec
 } from "./api/controlPlaneClient";
-import { applyRunEvent, createRunProjection, type RunProjection, type RunSnapshot } from "./runProjection";
+import { applyRunEvent, createRunProjection, type RunEvent, type RunProjection, type RunSnapshot } from "./runProjection";
 import {
   createProject,
   loadProjects,
@@ -23,6 +23,8 @@ import {
   type ProjectInput,
   type ProjectValidationErrors
 } from "./projectStore";
+import { ProjectHistoryDialog } from "./ProjectHistoryDialog";
+import { ProjectNewTaskButton } from "./ProjectNewTaskButton";
 
 type AppView = "home" | "settings" | "help" | "batch";
 
@@ -64,6 +66,108 @@ const backendLabels: Record<BackendStatus["state"], string> = {
   FAILED: "后端启动失败"
 };
 
+const backendReadyNoticeDuration = 4000;
+
+const workspaceTaskStartedNotice = "任务已开始，正在打开浏览器…";
+
+const WORKSPACE_RUNS_STORAGE_KEY = "webAgent.projectWorkspaceRuns";
+
+type WorkspaceRunReference = {
+  runId: string;
+  instruction: string;
+};
+
+type WorkspaceRunReferences = Record<string, WorkspaceRunReference>;
+
+type WorkspaceRunHistoryItem = RunSnapshot & {
+  project_id?: string | null;
+  project_url?: string | null;
+  projectId?: string | null;
+  projectUrl?: string | null;
+  instruction?: string | null;
+  task?: string;
+  events?: RunEvent[];
+};
+
+type WorkspaceRunHistoryResult =
+  | { items: WorkspaceRunHistoryItem[]; next_cursor?: string | null }
+  | WorkspaceRunHistoryItem[];
+
+type WorkspaceHistoryClient = ControlPlaneApi & {
+  listRuns?: () => Promise<WorkspaceRunHistoryResult>;
+  listProjectHistory?: (
+    projectId: string,
+    query?: { cursor?: string; limit?: number }
+  ) => Promise<{ items: WorkspaceRunHistoryItem[]; next_cursor?: string | null }>;
+  getProjectHistory?: (
+    projectId: string,
+    query?: { cursor?: string; limit?: number }
+  ) => Promise<{ items: WorkspaceRunHistoryItem[]; next_cursor?: string | null }>;
+};
+
+type WorkspaceRunRecord = {
+  runId: string;
+  instruction: string;
+  accepted: RunAccepted | null;
+  projection: RunProjection;
+  isCancelling: boolean;
+};
+
+function loadWorkspaceRunReferences(): WorkspaceRunReferences {
+  if (typeof window === "undefined") return {};
+  try {
+    const value: unknown = JSON.parse(window.localStorage.getItem(WORKSPACE_RUNS_STORAGE_KEY) ?? "{}");
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+    return Object.fromEntries(
+      Object.entries(value).filter(([, reference]) => isWorkspaceRunReference(reference))
+    ) as WorkspaceRunReferences;
+  } catch {
+    return {};
+  }
+}
+
+function saveWorkspaceRunReferences(references: WorkspaceRunReferences): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(WORKSPACE_RUNS_STORAGE_KEY, JSON.stringify(references));
+  } catch {
+    // A desktop session can still work when browser storage is unavailable.
+  }
+}
+
+function isWorkspaceRunReference(value: unknown): value is WorkspaceRunReference {
+  if (typeof value !== "object" || value === null) return false;
+  const reference = value as Partial<WorkspaceRunReference>;
+  return typeof reference.runId === "string" && typeof reference.instruction === "string";
+}
+
+function workspaceHistoryItems(result: WorkspaceRunHistoryResult): WorkspaceRunHistoryItem[] {
+  return Array.isArray(result) ? result : result.items;
+}
+
+function historyItemForProject(
+  items: WorkspaceRunHistoryItem[],
+  project: Project
+): WorkspaceRunHistoryItem | undefined {
+  return items.find((item) =>
+    item.project_id === project.id ||
+    item.projectId === project.id ||
+    item.project_url === project.websiteUrl ||
+    item.projectUrl === project.websiteUrl
+  );
+}
+
+function historyItemInstruction(item: WorkspaceRunHistoryItem): string {
+  const value = item as WorkspaceRunHistoryItem & { instruction?: unknown; task?: unknown };
+  if (typeof value.instruction === "string" && value.instruction.trim()) return value.instruction;
+  if (typeof value.task === "string" && value.task.trim()) return value.task;
+  return "最近一次任务";
+}
+
+function isTerminalRunStatus(status: RunSnapshot["status"] | undefined): boolean {
+  return status === "COMPLETED" || status === "CANCELLED" || status === "FAILED" || status === "INTERRUPTED";
+}
+
 export function App({ bridge, createClient = (readyDescriptor) => new ControlPlaneClient(readyDescriptor) }: AppProps) {
   const [descriptor, setDescriptor] = useState<BackendDescriptor | null>(null);
   const [backend, setBackend] = useState<BackendStatus>({ state: "STARTING" });
@@ -79,11 +183,15 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
   const [view, setView] = useState<AppView>("home");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [promptNotice, setPromptNotice] = useState<string | null>(null);
-  const [workspaceTask, setWorkspaceTask] = useState<{ runId: string; instruction: string } | null>(null);
-  const [isCancellingWorkspaceTask, setIsCancellingWorkspaceTask] = useState(false);
+  const [isBackendReadyNoticeVisible, setIsBackendReadyNoticeVisible] = useState(false);
+  const [workspaceRuns, setWorkspaceRuns] = useState<Record<string, WorkspaceRunRecord>>({});
   const [projects, setProjects] = useState<Project[]>(() => loadProjects());
   const [currentProject, setCurrentProject] = useState<Project | null>(() => loadProjects()[0] ?? null);
+  const [historyProject, setHistoryProject] = useState<Project | null>(null);
   const [isProjectDialogOpen, setIsProjectDialogOpen] = useState(false);
+  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
+  const [projectDeleteError, setProjectDeleteError] = useState<string | null>(null);
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
   const [projectForm, setProjectForm] = useState<ProjectInput>({ name: "", websiteUrl: "" });
   const [projectErrors, setProjectErrors] = useState<ProjectValidationErrors>({});
 	const [accountProfile, setAccountProfile] = useState<AccountProfile>(defaultAccountProfile);
@@ -100,6 +208,24 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
 	const [isSavingModelService, setIsSavingModelService] = useState(false);
 	const [isTestingModelService, setIsTestingModelService] = useState(false);
   const unsubscribeRunEvents = useRef<(() => void) | null>(null);
+  const workspaceRunReferences = useRef<WorkspaceRunReferences>(loadWorkspaceRunReferences());
+  const workspaceRunIds = useRef<Record<string, string>>({});
+  const workspaceSubscriptions = useRef(new Map<string, () => void>());
+  const restoredWorkspaceProjects = useRef(new Set<string>());
+  const projectRegistrations = useRef(new Map<string, Promise<void>>());
+  const backendReadyNoticeShown = useRef(false);
+
+  function showBackendReadyNoticeOnce() {
+    if (backendReadyNoticeShown.current) return;
+    backendReadyNoticeShown.current = true;
+    setIsBackendReadyNoticeVisible(true);
+  }
+
+  useEffect(() => {
+    if (!isBackendReadyNoticeVisible) return;
+    const timeout = window.setTimeout(() => setIsBackendReadyNoticeVisible(false), backendReadyNoticeDuration);
+    return () => window.clearTimeout(timeout);
+  }, [isBackendReadyNoticeVisible]);
 
   useEffect(() => {
     let disposed = false;
@@ -113,6 +239,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
           if (disposed || request !== descriptorRequest) return;
           setDescriptor(readyDescriptor);
           setBackend({ state: "READY" });
+          showBackendReadyNoticeOnce();
         },
         () => {
           if (disposed || request !== descriptorRequest) return;
@@ -145,6 +272,11 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
 
   useEffect(() => () => unsubscribeRunEvents.current?.(), []);
 
+  useEffect(() => () => {
+    workspaceSubscriptions.current.forEach((unsubscribe) => unsubscribe());
+    workspaceSubscriptions.current.clear();
+  }, []);
+
 	useEffect(() => {
 		if (!descriptor) return;
 		const client = createClient(descriptor);
@@ -156,15 +288,161 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
 			},
 			() => undefined
 		);
-	}, [descriptor]);
+  }, [descriptor]);
 
   const ready = descriptor !== null && backend.state === "READY";
+  const currentWorkspaceRun = currentProject ? workspaceRuns[currentProject.id] ?? null : null;
+  const currentWorkspaceRunStatus = currentWorkspaceRun?.projection.snapshot.status;
+  const currentWorkspaceRunError = currentWorkspaceRunStatus === "COMPLETED"
+    ? readableRunError(currentWorkspaceRun?.projection.snapshot.error)
+      ?? [...(currentWorkspaceRun?.projection.errors ?? [])].reverse().find((error) => error.message)?.message
+      ?? null
+    : null;
+
+  useEffect(() => {
+    if (isTerminalRunStatus(currentWorkspaceRunStatus)) {
+      setPromptNotice((current) => current === workspaceTaskStartedNotice ? null : current);
+    }
+  }, [promptNotice, currentWorkspaceRunStatus]);
+
+  useEffect(() => {
+    if (!descriptor || !currentProject || restoredWorkspaceProjects.current.has(currentProject.id)) return;
+    const project = currentProject;
+    restoredWorkspaceProjects.current.add(project.id);
+    const client = createClient(descriptor) as WorkspaceHistoryClient;
+
+    void (async () => {
+      let reference = workspaceRunReferences.current[project.id];
+      const readProjectHistory = client.listProjectHistory ?? client.getProjectHistory;
+      if (!reference && readProjectHistory) {
+        try {
+          const result = await readProjectHistory(project.id, { limit: 1 });
+          const item = result.items[0];
+          if (item) {
+            const instruction = historyItemInstruction(item);
+            reference = { runId: item.run_id, instruction };
+            rememberWorkspaceRun(project.id, reference);
+            await restoreWorkspaceHistoryItem(project.id, reference, item, client);
+            return;
+          }
+        } catch {
+          // A missing project history is treated as an empty workspace.
+        }
+      }
+      if (!reference && client.listRuns) {
+        try {
+          const result = await client.listRuns();
+          const item = historyItemForProject(workspaceHistoryItems(result), project);
+          const instruction = item?.instruction ?? item?.task;
+          if (item && typeof instruction === "string" && instruction.trim()) {
+            reference = { runId: item.run_id, instruction };
+            rememberWorkspaceRun(project.id, reference);
+          }
+        } catch {
+          // Historical workspace state is optional; a list failure should not block the composer.
+        }
+      }
+      if (!reference || workspaceRunIds.current[project.id]) return;
+
+      try {
+        const snapshot = await client.getRun(reference.runId);
+        if (workspaceRunIds.current[project.id]) return;
+        const projection = createRunProjection({ ...snapshot, last_event_id: 0 });
+        workspaceRunIds.current[project.id] = reference.runId;
+        setWorkspaceRuns((current) => current[project.id] ? current : {
+          ...current,
+          [project.id]: {
+            runId: reference.runId,
+            instruction: reference.instruction,
+            accepted: null,
+            projection,
+            isCancelling: false
+          }
+        });
+        await attachWorkspaceSubscription(project.id, reference.runId, client, 0);
+      } catch {
+        // A stale local reference is treated as no history until a new task is submitted.
+      }
+    })();
+  }, [createClient, currentProject, descriptor]);
+
+  async function restoreWorkspaceHistoryItem(
+    projectId: string,
+    reference: WorkspaceRunReference,
+    item: WorkspaceRunHistoryItem,
+    client: ControlPlaneApi
+  ): Promise<void> {
+    if (workspaceRunIds.current[projectId]) return;
+    const projection = (item.events ?? []).reduce(
+      (current, event) => applyRunEvent(current, event),
+      createRunProjection({ ...item, last_event_id: 0 })
+    );
+    workspaceRunIds.current[projectId] = reference.runId;
+    setWorkspaceRuns((current) => current[projectId] ? current : {
+      ...current,
+      [projectId]: {
+        runId: reference.runId,
+        instruction: reference.instruction,
+        accepted: null,
+        projection,
+        isCancelling: projection.snapshot.status === "CANCELLING"
+      }
+    });
+    if (!isTerminalRunStatus(projection.snapshot.status)) {
+      await attachWorkspaceSubscription(projectId, reference.runId, client, projection.snapshot.last_event_id);
+    }
+  }
+
+  function rememberWorkspaceRun(projectId: string, reference: WorkspaceRunReference): void {
+    const next = { ...workspaceRunReferences.current, [projectId]: reference };
+    workspaceRunReferences.current = next;
+    saveWorkspaceRunReferences(next);
+  }
+
+  async function attachWorkspaceSubscription(
+    projectId: string,
+    runId: string,
+    client: ControlPlaneApi,
+    after: number
+  ): Promise<void> {
+    const unsubscribe = await client.subscribeToRun(runId, after, (event) => {
+      setWorkspaceRuns((current) => {
+        const record = current[projectId];
+        if (!record || record.runId !== runId) return current;
+        const projection = applyRunEvent(record.projection, event);
+        if (projection === record.projection) return current;
+        return {
+          ...current,
+          [projectId]: {
+            ...record,
+            projection,
+            isCancelling: isTerminalRunStatus(projection.snapshot.status) ? false : record.isCancelling
+          }
+        };
+      });
+    });
+    if (workspaceRunIds.current[projectId] !== runId) {
+      unsubscribe();
+      return;
+    }
+    workspaceSubscriptions.current.get(projectId)?.();
+    workspaceSubscriptions.current.set(projectId, unsubscribe);
+  }
+
+  const loadProjectHistory = useCallback((projectId: string) => {
+    if (!descriptor) return Promise.reject(new Error("本地后端尚未就绪"));
+    const client = createClient(descriptor) as WorkspaceHistoryClient;
+    if (client.listProjectHistory) return client.listProjectHistory(projectId, { limit: 100 });
+    if (client.getProjectHistory) return client.getProjectHistory(projectId, { limit: 100 });
+    return Promise.reject(new Error("历史任务服务暂不可用"));
+  }, [createClient, descriptor]);
 
   function currentSpec(): RunSpec {
     return {
       schema_version: 1,
       input_path: inputPath,
       output_root: outputRoot,
+      project_id: currentProject?.id,
       project_url: currentProject?.websiteUrl,
       model: { profile_id: profileId },
       browser: { mode: "local", headed: false },
@@ -238,46 +516,74 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
     }
     setPromptNotice("正在提交任务…");
     try {
-      unsubscribeRunEvents.current?.();
-      const accepted = await client.submitTask({
-			task,
-			website_url: project.websiteUrl
-      });
-      setActiveRun(accepted);
-		setWorkspaceTask({ runId: accepted.run_id, instruction: task });
-		setIsCancellingWorkspaceTask(false);
+      workspaceSubscriptions.current.get(project.id)?.();
+      workspaceSubscriptions.current.delete(project.id);
+      const submission = {
+        task,
+        website_url: project.websiteUrl,
+        ...(client.registerProject || client.listProjectHistory || client.getProjectHistory || (client as WorkspaceHistoryClient).listRuns
+          ? { project_id: project.id }
+          : {})
+      };
+      const accepted = await client.submitTask(submission);
       const snapshot = await client.getRun(accepted.run_id);
-      setRunSnapshot(snapshot);
-      setProjection(createRunProjection(snapshot));
-      unsubscribeRunEvents.current = await client.subscribeToRun(accepted.run_id, snapshot.last_event_id, (event) => {
-        setProjection((current) => (current ? applyRunEvent(current, event) : current));
-      });
+      const record: WorkspaceRunRecord = {
+        runId: accepted.run_id,
+        instruction: task,
+        accepted,
+			projection: createRunProjection({ ...snapshot, last_event_id: 0 }),
+        isCancelling: false
+      };
+      workspaceRunIds.current[project.id] = accepted.run_id;
+      setWorkspaceRuns((current) => ({ ...current, [project.id]: record }));
+      rememberWorkspaceRun(project.id, { runId: accepted.run_id, instruction: task });
+		await attachWorkspaceSubscription(project.id, accepted.run_id, client, 0);
       setTaskPrompt("");
-      setPromptNotice("任务已开始，正在打开浏览器…");
+      setPromptNotice(workspaceTaskStartedNotice);
     } catch (error) {
       setPromptNotice(localMessage(error, "无法提交任务，请稍后重试。"));
     }
   }
 
   async function cancelWorkspaceTask() {
-    if (!descriptor || !workspaceTask || isCancellingWorkspaceTask) return;
+    const project = currentProject;
+    const record = currentWorkspaceRun;
+    if (!descriptor || !project || !record || record.isCancelling) return;
     const client = createClient(descriptor);
     if (!client.cancelRun) {
       setPromptNotice("当前任务暂不支持停止。");
       return;
     }
-    setIsCancellingWorkspaceTask(true);
+    setWorkspaceRuns((current) => {
+      const currentRecord = current[project.id];
+      if (!currentRecord || currentRecord.runId !== record.runId) return current;
+      return { ...current, [project.id]: { ...currentRecord, isCancelling: true } };
+    });
     setPromptNotice("正在停止任务…");
     try {
-      const result = await client.cancelRun(workspaceTask.runId);
-      setProjection((current) => current ? {
-        ...current,
-        snapshot: { ...current.snapshot, status: result.status }
-      } : current);
-      setRunSnapshot((current) => current ? { ...current, status: result.status } : current);
+      const result = await client.cancelRun(record.runId);
+      setWorkspaceRuns((current) => {
+        const currentRecord = current[project.id];
+        if (!currentRecord || currentRecord.runId !== record.runId) return current;
+        return {
+          ...current,
+          [project.id]: {
+            ...currentRecord,
+            isCancelling: result.cancel_applied,
+            projection: {
+              ...currentRecord.projection,
+              snapshot: { ...currentRecord.projection.snapshot, status: result.status }
+            }
+          }
+        };
+      });
       if (!result.cancel_applied) setPromptNotice("任务已经结束。");
     } catch (error) {
-      setIsCancellingWorkspaceTask(false);
+      setWorkspaceRuns((current) => {
+        const currentRecord = current[project.id];
+        if (!currentRecord || currentRecord.runId !== record.runId) return current;
+        return { ...current, [project.id]: { ...currentRecord, isCancelling: false } };
+      });
       setPromptNotice(localMessage(error, "停止任务失败，请稍后重试。"));
     }
   }
@@ -300,6 +606,30 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
     setPromptNotice(null);
   }
 
+  function startNewProjectTask(projectId: string) {
+    const project = projects.find((item) => item.id === projectId);
+    if (!project) return;
+
+    workspaceSubscriptions.current.get(project.id)?.();
+    workspaceSubscriptions.current.delete(project.id);
+    delete workspaceRunIds.current[project.id];
+    delete workspaceRunReferences.current[project.id];
+    saveWorkspaceRunReferences(workspaceRunReferences.current);
+    restoredWorkspaceProjects.current.add(project.id);
+    setWorkspaceRuns((current) => {
+      const next = { ...current };
+      delete next[project.id];
+      return next;
+    });
+    selectProject(project);
+    setTaskPrompt("");
+    setPromptNotice(null);
+  }
+
+  function openProjectHistory(project: Project) {
+    setHistoryProject(project);
+  }
+
   function openCreateProject() {
     setProjectForm({ name: "", websiteUrl: "" });
     setProjectErrors({});
@@ -309,6 +639,69 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
   function closeCreateProject() {
     setIsProjectDialogOpen(false);
     setProjectErrors({});
+  }
+
+  function openDeleteProject(project: Project) {
+    setProjectToDelete(project);
+    setProjectDeleteError(null);
+  }
+
+  function closeDeleteProject() {
+    if (isDeletingProject) return;
+    setProjectToDelete(null);
+    setProjectDeleteError(null);
+  }
+
+  function removeProjectLocally(project: Project) {
+    const nextProjects = projects.filter((item) => item.id !== project.id);
+    setProjects(nextProjects);
+    saveProjects(nextProjects);
+    workspaceSubscriptions.current.get(project.id)?.();
+    workspaceSubscriptions.current.delete(project.id);
+    delete workspaceRunIds.current[project.id];
+    delete workspaceRunReferences.current[project.id];
+    saveWorkspaceRunReferences(workspaceRunReferences.current);
+    setWorkspaceRuns((current) => {
+      const next = { ...current };
+      delete next[project.id];
+      return next;
+    });
+    restoredWorkspaceProjects.current.delete(project.id);
+    setCurrentProject((current) => {
+      if (current?.id !== project.id) return current;
+      return nextProjects[0] ?? null;
+    });
+  }
+
+  async function confirmDeleteProject() {
+    const project = projectToDelete;
+    if (!project || isDeletingProject) return;
+    setIsDeletingProject(true);
+    setProjectDeleteError(null);
+    try {
+      await projectRegistrations.current.get(project.id);
+      const activeDescriptor = await bridge.getDescriptor();
+      setDescriptor(activeDescriptor);
+      setBackend({ state: "READY" });
+      showBackendReadyNoticeOnce();
+      const client = createClient(activeDescriptor);
+      if (!client.deleteProject) {
+        throw new Error("delete_project_unavailable");
+      }
+      try {
+        await client.deleteProject(project.id);
+      } catch (error) {
+        // A project created while the sidecar was unavailable has no server row
+        // yet; local removal is still safe and makes delete idempotent in the UI.
+        if (!(error instanceof LocalControlPlaneProblem && error.errorCode === "project_not_found")) throw error;
+      }
+      removeProjectLocally(project);
+      setProjectToDelete(null);
+    } catch (error) {
+      setProjectDeleteError(localMessage(error, "删除项目失败，请稍后重试。"));
+    } finally {
+      setIsDeletingProject(false);
+    }
   }
 
 	function openAccountProfile() {
@@ -332,6 +725,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
 			activeDescriptor = await bridge.getDescriptor();
 			setDescriptor(activeDescriptor);
 			setBackend({ state: "READY" });
+      showBackendReadyNoticeOnce();
 		} catch {
 			setAccountProfileError("本地后端尚未就绪，请稍后重试。");
 			return;
@@ -406,6 +800,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
 			const activeDescriptor = await bridge.getDescriptor();
 			setDescriptor(activeDescriptor);
 			setBackend({ state: "READY" });
+      showBackendReadyNoticeOnce();
 			return createClient(activeDescriptor);
 		} catch {
 			setModelServiceError("本地后端尚未就绪，请稍后重试。");
@@ -495,6 +890,20 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
     saveProjects(nextProjects);
     setCurrentProject(project);
     closeCreateProject();
+		if (descriptor) {
+			const client = createClient(descriptor);
+			if (client.registerProject) {
+				const registration = client.registerProject(project.id, { website_url: project.websiteUrl })
+					.then(() => undefined)
+					.catch(() => undefined);
+				projectRegistrations.current.set(project.id, registration);
+				void registration.finally(() => {
+					if (projectRegistrations.current.get(project.id) === registration) {
+						projectRegistrations.current.delete(project.id);
+					}
+				});
+			}
+		}
 		const task = taskPrompt.trim();
 		if (task) void submitWorkspaceTask(task, project);
   }
@@ -511,6 +920,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
   }
 
   function renderBatchOperations() {
+    const snapshotError = readableRunError(projection?.snapshot.error);
     return (
       <div className="batch-page">
         <div className="page-heading page-heading--compact">
@@ -548,10 +958,12 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
               <p className="eyebrow">任务执行</p>
               <h2>运行配置</h2>
             </div>
-            <span className={`connection-state connection-state--${backend.state.toLowerCase()}`}>
-              <span aria-hidden="true" />
-              {backendLabels[backend.state]}
-            </span>
+            {backend.state !== "READY" && (
+              <span className={`connection-state connection-state--${backend.state.toLowerCase()}`}>
+                <span aria-hidden="true" />
+                {backendLabels[backend.state]}
+              </span>
+            )}
           </div>
           <div className="run-fields">
             <label>
@@ -610,10 +1022,13 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
               </ul>
             )}
             <h3>错误</h3>
-            {projection.errors.length === 0 ? <p>暂无错误</p> : (
+            {projection.errors.length === 0 && !snapshotError ? <p>暂无错误</p> : (
               <ul>
+                {snapshotError && !projection.errors.some((error) => error.message === snapshotError || error.code === snapshotError) && (
+                  <li key="run-error">{snapshotError}</li>
+                )}
                 {projection.errors.map((error) => (
-                  <li key={error.eventId}>{error.code}</li>
+                  <li key={error.eventId}>{error.message ?? error.code}</li>
                 ))}
               </ul>
             )}
@@ -641,19 +1056,39 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
             我的工作区
           </button>
           {projects.map((project) => (
-            <button
-              className={`project-link ${currentProject?.id === project.id ? "project-link--active" : ""}`}
-              key={project.id}
-              type="button"
-              onClick={() => selectProject(project)}
-              aria-label={`项目 ${project.name}`}
-            >
-              <span className="project-link-mark" aria-hidden="true">{project.name.slice(0, 1)}</span>
-              <span className="project-link-copy">
-                <strong>{project.name}</strong>
-                <small>{project.websiteUrl}</small>
-              </span>
-            </button>
+            <div className="project-entry" key={project.id}>
+              <button
+                className={`project-link ${currentProject?.id === project.id ? "project-link--active" : ""}`}
+                type="button"
+                onClick={() => selectProject(project)}
+                aria-label={`项目 ${project.name}`}
+              >
+                <span className="project-link-mark" aria-hidden="true">{project.name.slice(0, 1)}</span>
+                <span className="project-link-copy">
+                  <strong>{project.name}</strong>
+                  <small>{project.websiteUrl}</small>
+                </span>
+              </button>
+              <div className="project-entry-actions">
+                <ProjectNewTaskButton projectId={project.id} onCreate={startNewProjectTask} />
+                <button
+                  className="project-history-button"
+                  type="button"
+                  onClick={() => openProjectHistory(project)}
+                  aria-label={`查看项目 ${project.name} 的历史任务`}
+                >
+                  历史
+                </button>
+                <button
+                  className="project-delete-button"
+                  type="button"
+                  onClick={() => openDeleteProject(project)}
+                  aria-label={`删除项目 ${project.name}`}
+                >
+                  删除
+                </button>
+              </div>
+            </div>
           ))}
         </div>
         <button className="sidebar-profile" type="button" onClick={openAccountProfile} aria-label="打开账户设置">
@@ -675,10 +1110,10 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
         </header>
 
         <div className="content-area">
-          <span className={`backend-status backend-status--${backend.state.toLowerCase()}`} aria-live="polite" role="status">
+          {isBackendReadyNoticeVisible && <span className="backend-status backend-status--ready" aria-live="polite" role="status">
             <span aria-hidden="true" />
-            {backendLabels[backend.state]}
-          </span>
+            后端已就绪
+          </span>}
           {view === "home" && (
             <section className="home-page" aria-label="我的工作区">
               <div className="home-intro">
@@ -692,19 +1127,24 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                   </div>
                 )}
               </div>
-              {workspaceTask && (
+              {currentWorkspaceRun ? (
                 <section className="task-conversation" aria-label="任务执行过程" aria-live="polite">
                   <article className="conversation-message conversation-message--user">
                     <p>用户指令</p>
-                    <strong>{workspaceTask.instruction}</strong>
+                    <strong>{currentWorkspaceRun.instruction}</strong>
                   </article>
-                  {projection?.steps
-                    .filter((step) => step.taskId in projection.tasks)
+                  {currentWorkspaceRun.projection.steps
+                    .filter((step) => step.taskId in currentWorkspaceRun.projection.tasks)
                     .map((step) => (
                       <article className="conversation-message conversation-message--thinking" key={step.eventId}>
                         <p>模型思考过程</p>
                         <strong>第 {step.step} / {step.maxSteps} 步</strong>
-                        <span>正在执行 {step.action}，结果：{step.outcome}</span>
+                        {step.thought && <span>{step.thought}</span>}
+                        <span>
+                          {step.status === "PENDING"
+                            ? `正在执行 ${step.action}…`
+                            : `已执行 ${step.action}，结果：${step.outcome}`}
+                        </span>
                         <div
                           aria-label={`任务进度：第 ${step.step} / ${step.maxSteps} 步`}
                           aria-valuemax={step.maxSteps}
@@ -717,7 +1157,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                         </div>
                       </article>
                     ))}
-                  {Object.values(projection?.tasks ?? {})
+                  {Object.values(currentWorkspaceRun.projection.tasks)
                     .filter((task) => task.answer !== null)
                     .map((task) => (
                       <article className="conversation-message conversation-message--answer" key={`${task.taskId}-answer`}>
@@ -725,22 +1165,33 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                         <strong>{task.answer}</strong>
                       </article>
                     ))}
+                  {currentWorkspaceRunError && (
+                    <article className="conversation-message conversation-message--error" role="alert">
+                      <p>运行错误</p>
+                      <strong>{currentWorkspaceRunError}</strong>
+                    </article>
+                  )}
                   <div className="conversation-actions">
-                    <span>{workspaceRunStatus(projection, runSnapshot, activeRun)}</span>
-                    {canCancelWorkspaceRun(projection, runSnapshot, activeRun) && (
+                    <span>{workspaceRunStatus(currentWorkspaceRun.projection, null, currentWorkspaceRun.accepted)}</span>
+                    {canCancelWorkspaceRun(currentWorkspaceRun.projection, null, currentWorkspaceRun.accepted) && (
                       <button
                         className="button button--danger"
-                        disabled={isCancellingWorkspaceTask}
+                        disabled={currentWorkspaceRun.isCancelling}
                         onClick={() => void cancelWorkspaceTask()}
                         type="button"
                       >
-                        {isCancellingWorkspaceTask ? "正在停止…" : "停止任务"}
+                        {currentWorkspaceRun.isCancelling ? "正在停止…" : "停止任务"}
                       </button>
                     )}
                   </div>
                 </section>
-              )}
-              <form className="task-composer" onSubmit={handlePromptSubmit}>
+               ) : currentProject ? (
+                 <section className="task-conversation task-conversation--empty" aria-label="任务执行过程">
+                   <p>暂无任务记录</p>
+                   <span>提交任务后，最近一次交互记录会显示在这里。</span>
+                 </section>
+               ) : null}
+               <form className="task-composer" onSubmit={handlePromptSubmit}>
                 <input
                   aria-label="任务描述"
                   type="text"
@@ -838,6 +1289,23 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                 <button className="button button--primary" type="submit">确定</button>
               </div>
             </form>
+          </section>
+        </div>
+      )}
+      {projectToDelete && (
+        <div className="project-dialog-backdrop">
+          <section className="project-dialog project-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-project-title">
+            <h2 id="delete-project-title">删除项目</h2>
+            <p className="project-delete-dialog__description">
+              确定删除“{projectToDelete.name}”吗？该项目的任务记录、交互事件和输出文件都会被删除。
+            </p>
+            {projectDeleteError && <p className="field-error" role="alert">{projectDeleteError}</p>}
+            <div className="project-dialog-actions">
+              <button className="button button--secondary" type="button" onClick={closeDeleteProject} disabled={isDeletingProject}>取消</button>
+              <button className="button button--danger" type="button" onClick={() => void confirmDeleteProject()} disabled={isDeletingProject}>
+                {isDeletingProject ? "删除中…" : "确认删除"}
+              </button>
+            </div>
           </section>
         </div>
       )}
@@ -941,6 +1409,15 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
           </section>
         </div>
       )}
+      {historyProject && (
+        <ProjectHistoryDialog
+          projectId={historyProject.id}
+          projectName={historyProject.name}
+          open
+          loadHistory={loadProjectHistory}
+          onClose={() => setHistoryProject(null)}
+        />
+      )}
     </div>
   );
 }
@@ -979,6 +1456,17 @@ function Icon({ name }: { name: "plus" | "grid" | "layers" | "arrow-right" | "ar
 function localMessage(error: unknown, fallback: string): string {
   if (error instanceof LocalControlPlaneProblem) return localizeProblem(error);
   return error instanceof TypeError ? `无法连接本地后端：${error.message}` : fallback;
+}
+
+function readableRunError(error: unknown): string | null {
+  if (typeof error === "string" && error.trim()) return error;
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+  const record = error as Record<string, unknown>;
+  if (typeof record.message === "string" && record.message.trim()) return record.message;
+  if (typeof record.detail === "string" && record.detail.trim()) return record.detail;
+  if (typeof record.error === "string" && record.error.trim()) return record.error;
+  if (typeof record.code === "string" && record.code.trim()) return record.code;
+  return null;
 }
 
 function modelServiceConnectionMessage(errorCode: string | null): string {

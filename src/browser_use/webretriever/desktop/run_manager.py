@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import shutil
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -14,8 +15,20 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from browser_use.webretriever.desktop.artifact_index import ArtifactIndex
-from browser_use.webretriever.desktop.contracts import Artifact, RunAccepted, RunEvent, RunEventDraft, RunSnapshot, RunSpec
-from browser_use.webretriever.desktop.store import SqliteControlStore, StoredRun
+from browser_use.webretriever.desktop.contracts import (
+	Artifact,
+	ProjectHistoryItem,
+	ProjectSummary,
+	RunAccepted,
+	RunEvent,
+	RunEventDraft,
+	RunSnapshot,
+	RunSpec,
+)
+from browser_use.webretriever.desktop.store import (
+	SqliteControlStore,
+	StoredRun,
+)
 from browser_use.webretriever.run_control import CancellationToken
 
 
@@ -52,6 +65,30 @@ class RunNotFoundError(KeyError):
 	"""Raised when the requested durable run record does not exist."""
 
 
+class ProjectNotFoundError(KeyError):
+	"""Raised when the requested durable project record does not exist."""
+
+
+class ActiveProjectRunError(RuntimeError):
+	"""Raised when deleting a project would race with its active task."""
+
+	def __init__(self, run_id: str) -> None:
+		super().__init__(f"project run {run_id} is still active")
+		self.run_id = run_id
+
+
+class ProjectPathUnsafeError(ValueError):
+	"""Raised when a project record points outside sidecar-managed storage."""
+
+
+class ProjectDeletionPermissionError(PermissionError):
+	"""Raised when a deletion cannot access a local project resource."""
+
+	def __init__(self, stage: str) -> None:
+		super().__init__(stage)
+		self.stage = stage
+
+
 class EventsExpiredError(ValueError):
 	"""Raised when an SSE replay cursor predates the retained journal window."""
 
@@ -75,10 +112,13 @@ class RunManager:
 		*,
 		runner: DesktopRunner,
 		database_path: Path | str | None = None,
+		state_dir: Path | str | None = None,
 		event_retention: int = 10_000,
 	) -> None:
 		self._runner = runner
-		self._store = SqliteControlStore(database_path or ":memory:", event_retention=event_retention)
+		database = database_path or ":memory:"
+		self._store = SqliteControlStore(database, event_retention=event_retention)
+		self._state_dir = Path(state_dir).expanduser().resolve() if state_dir is not None else _database_state_dir(database)
 		self._lock = asyncio.Lock()
 		self._live: dict[str, _LiveRun] = {}
 		self._subscribers: defaultdict[str, set[asyncio.Queue[RunEvent]]] = defaultdict(set)
@@ -94,18 +134,26 @@ class RunManager:
 	async def create_run(self, *, spec: RunSpec, idempotency_key: str) -> RunAccepted:
 		"""Durably accept one asynchronous run, or return its idempotent original."""
 
-		spec_digest = json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+		spec_payload = spec.model_dump(mode="json")
+		spec_digest = json.dumps(spec_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+		legacy_spec_payload = {key: value for key, value in spec_payload.items() if key != "project_id"}
+		legacy_spec_digest = json.dumps(legacy_spec_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 		async with self._lock:
 			if self._draining:
 				raise SidecarDrainingError
 			previous = self._store.get_idempotency(idempotency_key)
 			if previous is not None:
-				if previous.spec_digest != spec_digest:
+				legacy_match = spec.project_id is None and previous.project_id is None and previous.spec_digest == legacy_spec_digest
+				if previous.spec_digest != spec_digest and not legacy_match:
 					raise IdempotencyKeyReusedError("idempotency key was reused with a different RunSpec")
 				return _accepted(previous)
 			active = self._store.active_run()
 			if active is not None:
 				raise ActiveRunExistsError(active.run_id)
+			if spec.project_id is not None:
+				if spec.project_url is None:
+					raise ValueError("project_id requires project_url")
+				self._store.ensure_project(spec.project_id, spec.project_url)
 
 			run_id = str(uuid4())
 			created_at = datetime.now(timezone.utc)
@@ -113,6 +161,7 @@ class RunManager:
 			record = StoredRun(
 				run_id=run_id,
 				idempotency_key=idempotency_key,
+				project_id=spec.project_id,
 				spec=spec,
 				spec_digest=spec_digest,
 				status="STARTING",
@@ -141,6 +190,106 @@ class RunManager:
 	async def list_runs(self, *, cursor: str | None, limit: int) -> tuple[list[RunSnapshot], str | None]:
 		records, next_cursor = self._store.list_runs(cursor=cursor, limit=limit)
 		return ([record.snapshot(last_event_id=self._store.last_event_id(record.run_id)) for record in records], next_cursor)
+
+	async def register_project(self, project_id: str, website_url: str) -> ProjectSummary:
+		return self._store.ensure_project(project_id, website_url).summary()
+
+	async def list_projects(self, *, limit: int = 100) -> list[ProjectSummary]:
+		return [project.summary() for project in self._store.list_projects(limit=limit)]
+
+	async def list_project_history(
+		self,
+		project_id: str,
+		*,
+		cursor: str | None,
+		limit: int,
+	) -> tuple[list[ProjectHistoryItem], str | None]:
+		project = self._store.get_project(project_id)
+		if project is None:
+			raise ProjectNotFoundError(project_id)
+		records, next_cursor = self._store.list_project_runs(
+			project_id=project_id,
+			website_url=project.website_url,
+			cursor=cursor,
+			limit=limit,
+		)
+		items = [
+			ProjectHistoryItem(
+				**record.snapshot(last_event_id=self._store.last_event_id(record.run_id)).model_dump(),
+				instruction=_instruction_from_task_file(record.spec.input_path),
+				events=self._store.events_after(record.run_id, after=0),
+			)
+			for record in records
+		]
+		return items, next_cursor
+
+	async def delete_project(self, project_id: str, *, state_dir: Path | str | None = None) -> None:
+		"""Remove one project only after validating and staging all owned files."""
+
+		async with self._lock:
+			project = self._store.get_project(project_id)
+			if project is None:
+				raise ProjectNotFoundError(project_id)
+			active = self._store.active_project_run(project_id=project_id, website_url=project.website_url)
+			if active is not None:
+				raise ActiveProjectRunError(active.run_id)
+			records, _ = self._store.list_project_runs(
+				project_id=project_id,
+				website_url=project.website_url,
+				cursor=None,
+				limit=10_000,
+			)
+			try:
+				storage_root = Path(state_dir).expanduser().resolve() if state_dir is not None else self._state_dir
+				paths = _project_storage_paths(records, storage_root)
+				trash_root = storage_root / ".project-delete" / uuid4().hex
+			except PermissionError as exc:
+				raise ProjectDeletionPermissionError("prepare_storage") from exc
+			moved: list[tuple[Path, Path]] = []
+
+			def restore_moved_files() -> None:
+				for original, staged in reversed(moved):
+					if _path_exists(staged):
+						original.parent.mkdir(parents=True, exist_ok=True)
+						shutil.move(str(staged), str(original))
+
+			try:
+				for index, original in enumerate(paths):
+					if not _path_exists(original):
+						continue
+					staged = trash_root / str(index)
+					staged.parent.mkdir(parents=True, exist_ok=True)
+					shutil.move(str(original), str(staged))
+					moved.append((original, staged))
+			except PermissionError as exc:
+				try:
+					restore_moved_files()
+				except PermissionError as rollback_error:
+					raise ProjectDeletionPermissionError("rollback") from rollback_error
+				raise ProjectDeletionPermissionError("stage_files") from exc
+			except BaseException:
+				restore_moved_files()
+				raise
+			try:
+				self._store.delete_project_records(project_id, (record.run_id for record in records))
+			except PermissionError as exc:
+				try:
+					restore_moved_files()
+				except PermissionError as rollback_error:
+					raise ProjectDeletionPermissionError("rollback") from rollback_error
+				raise ProjectDeletionPermissionError("delete_records") from exc
+			except BaseException:
+				restore_moved_files()
+				raise
+			finally:
+				if trash_root.exists():
+					shutil.rmtree(trash_root, ignore_errors=True)
+					try:
+						trash_root.parent.rmdir()
+					except OSError:
+						pass
+			for record in records:
+				self._live.pop(record.run_id, None)
 
 	async def list_artifacts(self, run_id: str, *, cursor: str | None, limit: int) -> tuple[list[Artifact], str | None]:
 		record = self._store.get_run(run_id)
@@ -333,6 +482,54 @@ class SidecarDrainingError(RuntimeError):
 	"""Raised when the supervisor has started graceful shutdown."""
 
 
+def _database_state_dir(database: Path | str) -> Path:
+	if str(database) == ":memory:":
+		return Path(".webretriever-desktop").resolve()
+	return Path(database).expanduser().resolve().parent
+
+
+def _project_storage_paths(records: list[StoredRun], state_dir: Path) -> list[Path]:
+	"""Return only concrete descendants of the two sidecar-managed storage roots."""
+
+	roots = {
+		"task-submissions": (state_dir / "task-submissions").resolve(),
+		"outputs": (state_dir / "outputs").resolve(),
+	}
+	paths: list[Path] = []
+	seen: set[Path] = set()
+	for record in records:
+		for raw_path, root in ((record.spec.input_path, roots["task-submissions"]), (record.output_dir, roots["outputs"])):
+			path = Path(raw_path).expanduser()
+			resolved = path.resolve(strict=False)
+			try:
+				resolved.relative_to(root)
+			except ValueError as exc:
+				raise ProjectPathUnsafeError(raw_path) from exc
+			if resolved == root or path.is_symlink():
+				raise ProjectPathUnsafeError(raw_path)
+			if resolved not in seen:
+				seen.add(resolved)
+				paths.append(resolved)
+	return paths
+
+
+def _path_exists(path: Path) -> bool:
+	return path.exists() or path.is_symlink()
+
+
+def _instruction_from_task_file(input_path: str) -> str | None:
+	"""Recover the workspace prompt without exposing the task-file path on the wire."""
+
+	try:
+		payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+	except (OSError, UnicodeError, json.JSONDecodeError):
+		return None
+	if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+		return None
+	instruction = payload[0].get("task")
+	return instruction if isinstance(instruction, str) and instruction else None
+
+
 def _accepted(record: StoredRun) -> RunAccepted:
 	return RunAccepted(
 		run_id=record.run_id,
@@ -344,10 +541,14 @@ def _accepted(record: StoredRun) -> RunAccepted:
 
 __all__ = [
 	"ActiveRunExistsError",
+	"ActiveProjectRunError",
 	"DesktopRunner",
 	"EventsExpiredError",
 	"IdempotencyKeyReusedError",
 	"RunManager",
 	"RunNotFoundError",
+	"ProjectDeletionPermissionError",
+	"ProjectNotFoundError",
+	"ProjectPathUnsafeError",
 	"SidecarDrainingError",
 ]

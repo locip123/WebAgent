@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { waitFor } from "@testing-library/react";
-import { ControlPlaneClient, LocalControlPlaneProblem, localizeProblem, type RunSpec } from "../api/controlPlaneClient";
+import {
+  ControlPlaneClient,
+  LocalControlPlaneProblem,
+  localizeProblem,
+  type RunSpec
+} from "../api/controlPlaneClient";
 
 const descriptor = {
   baseUrl: "http://127.0.0.1:43127",
@@ -140,4 +145,10 @@ describe("local control-plane client", () => {
     await expect(client.preflight(runSpec)).rejects.toMatchObject({ errorCode: "active_run_exists" });
     expect(localizeProblem(new LocalControlPlaneProblem(409, "active_run_exists"))).toBe("已有运行正在执行，请先等待或取消它。");
   });
+
+	it("turns a file-lock deletion problem into a recoverable Chinese message", () => {
+		expect(localizeProblem(new LocalControlPlaneProblem(409, "project_files_in_use", "stage_files"))).toBe(
+			"删除项目失败：项目文件正被占用或存储位置不可写。请关闭资源管理器预览、浏览器和其他可能打开项目文件的程序后重试。"
+		);
+	});
 });

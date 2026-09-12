@@ -45,6 +45,7 @@ impl SupervisorConfig {
             allowed_origins: vec![
                 "tauri://localhost".to_owned(),
                 "http://localhost:1420".to_owned(),
+                "http://tauri.localhost".to_owned(),
             ],
             launch: SidecarLaunch::DevelopmentPython,
         }
@@ -55,7 +56,10 @@ impl SupervisorConfig {
             state_dir,
             bearer_token: random_secret(64),
             launch_nonce: random_secret(32),
-            allowed_origins: vec!["tauri://localhost".to_owned()],
+            allowed_origins: vec![
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+            ],
             launch: SidecarLaunch::BundledBinary { program },
         }
     }

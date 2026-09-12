@@ -41,7 +41,9 @@ export interface TaskStepProjection {
   step: number;
   maxSteps: number;
   action: string;
-  outcome: string;
+  outcome: string | null;
+  thought: string;
+  status: "PENDING" | "COMPLETED";
 }
 
 export interface ArtifactProjection {
@@ -57,7 +59,7 @@ export interface RunProjection {
   tasks: Record<string, TaskProjection>;
   steps: TaskStepProjection[];
   artifacts: ArtifactProjection[];
-  errors: Array<{ eventId: number; code: string; taskId: string | null }>;
+  errors: Array<{ eventId: number; code: string; message?: string; taskId: string | null }>;
 }
 
 export function createRunProjection(snapshot: RunSnapshot): RunProjection {
@@ -103,6 +105,7 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
     const maxSteps = event.payload.max_steps;
     const action = event.payload.action;
     const outcome = event.payload.outcome;
+    const thought = typeof event.payload.thought === "string" ? event.payload.thought : "";
     if (
       task &&
       typeof step === "number" && Number.isInteger(step) && step > 0 &&
@@ -115,13 +118,50 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
         completedSteps: step,
         maxSteps
       };
+      const existingStepIndex = next.steps.findIndex(
+        (candidate) => candidate.taskId === event.task?.task_id && candidate.step === step
+      );
+      const existingStep = existingStepIndex >= 0 ? next.steps[existingStepIndex] : undefined;
+      const completedStep: TaskStepProjection = {
+        eventId: existingStep?.eventId ?? event.event_id,
+        taskId: event.task.task_id,
+        step,
+        maxSteps,
+        action,
+        outcome,
+        thought: thought || existingStep?.thought || "",
+        status: "COMPLETED"
+      };
+      if (existingStepIndex >= 0) {
+        next.steps[existingStepIndex] = completedStep;
+      } else {
+        next.steps.push(completedStep);
+      }
+    }
+  }
+  if (event.type === "task.step.decided" && event.task) {
+    const task = next.tasks[event.task.task_id];
+    const step = event.payload.step;
+    const maxSteps = event.payload.max_steps;
+    const action = event.payload.action;
+    const thought = event.payload.thought;
+    if (
+      task &&
+      typeof step === "number" && Number.isInteger(step) && step > 0 &&
+      typeof maxSteps === "number" && Number.isInteger(maxSteps) && maxSteps > 0 &&
+      typeof action === "string" &&
+      typeof thought === "string"
+    ) {
+      next.tasks[event.task.task_id] = { ...task, maxSteps };
       next.steps.push({
         eventId: event.event_id,
         taskId: event.task.task_id,
         step,
         maxSteps,
         action,
-        outcome
+        outcome: null,
+        thought,
+        status: "PENDING"
       });
     }
   }
@@ -162,20 +202,29 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
     }
   }
   const terminalStatus = terminalRunStatus(event.type);
+  const eventError = errorFromEvent(event);
   if (terminalStatus) {
     next.snapshot = {
       ...next.snapshot,
       status: terminalStatus,
       finished_at: event.occurred_at,
-      error: event.type === "run.failed" ? { code: problemCode(event) } : next.snapshot.error
+      error: event.type === "run.completed" && eventError
+        ? eventError
+        : event.type === "run.failed" ? { code: problemCode(event) } : next.snapshot.error
     };
   }
-  if (event.level === "error" || event.type === "task.failed") {
-    next.errors.push({
+  const completedRunError = terminalStatus === "COMPLETED" && eventError;
+  const completedTaskError = event.type === "task.finished" && eventError;
+  if (event.level === "error" || event.type === "task.failed" || completedRunError || completedTaskError) {
+    const projectedError: { eventId: number; code: string; message?: string; taskId: string | null } = {
       eventId: event.event_id,
       code: problemCode(event),
       taskId: event.task?.task_id ?? null
-    });
+    };
+    if ((completedRunError || completedTaskError) && typeof eventError.message === "string") {
+      projectedError.message = eventError.message;
+    }
+    next.errors.push(projectedError);
   }
   return next;
 }
@@ -194,4 +243,16 @@ function problemCode(event: RunEvent): string {
     return error.code;
   }
   return event.type;
+}
+
+function isErrorRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorFromEvent(event: RunEvent): Record<string, unknown> | null {
+  if (isErrorRecord(event.payload.error)) return event.payload.error;
+  if (typeof event.payload.error === "string" && event.payload.error.trim()) {
+    return { code: problemCode(event), message: event.payload.error };
+  }
+  return null;
 }

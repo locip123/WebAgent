@@ -73,6 +73,36 @@ _PROBLEM_TEMPLATES: dict[str, tuple[str, int, str]] = {
 		410,
 		"Reload the run snapshot and resume from its event cursor.",
 	),
+	"project_not_found": (
+		"Project not found",
+		404,
+		"No local project matches this project_id.",
+	),
+	"project_has_active_run": (
+		"Project has an active run",
+		409,
+		"Wait for or cancel the active project run before deleting the project.",
+	),
+	"project_url_mismatch": (
+		"Project URL mismatch",
+		409,
+		"The project_id is already owned by a different website URL.",
+	),
+	"project_path_unsafe": (
+		"Project storage path is unsafe",
+		409,
+		"The project references a path outside the sidecar-managed state directory.",
+	),
+	"project_files_in_use": (
+		"Project files are in use",
+		409,
+		"The project could not be deleted because a local resource is unavailable.",
+	),
+	"project_delete_failed": (
+		"Project deletion failed",
+		500,
+		"The sidecar could not remove the project's local files and records.",
+	),
 }
 
 
@@ -173,6 +203,7 @@ EventType = Literal[
 	"worker.state_changed",
 	"task.started",
 	"task.phase_changed",
+	"task.step.decided",
 	"task.step.completed",
 	"task.recovery",
 	"artifact.available",
@@ -245,6 +276,8 @@ class RunSnapshot(_ContractModel):
 
 	schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
 	run_id: str = Field(min_length=1, max_length=128)
+	project_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+	project_url: str | None = Field(default=None, min_length=1, max_length=4_096)
 	status: RunStatus
 	created_at: datetime
 	started_at: datetime | None = None
@@ -285,6 +318,56 @@ class PreflightResult(_ContractModel):
 class RunPage(_ContractModel):
 	schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
 	items: list[RunSnapshot] = Field(default_factory=list, max_length=100)
+	next_cursor: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class ProjectRegistration(_ContractModel):
+	"""The URL ownership assertion for a client-generated project identifier."""
+
+	website_url: str = Field(min_length=1, max_length=4_096)
+
+	@field_validator("website_url")
+	@classmethod
+	def _website_url_is_valid(cls, value: str) -> str:
+		if any(character.isspace() or ord(character) < 32 for character in value):
+			raise ValueError("website_url must not contain whitespace or control characters")
+		parts = urlsplit(value)
+		if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+			raise ValueError("website_url must be an absolute HTTP(S) URL")
+		if parts.username is not None or parts.password is not None:
+			raise ValueError("website_url must not contain credentials")
+		try:
+			_ = parts.port
+		except ValueError as exc:
+			raise ValueError("website_url contains an invalid port") from exc
+		return value
+
+
+class ProjectSummary(_ContractModel):
+	"""A sidecar-owned project identity and its website URL."""
+
+	schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
+	project_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+	website_url: str = Field(min_length=1, max_length=4_096)
+	created_at: datetime
+
+
+class ProjectPage(_ContractModel):
+	schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
+	items: list[ProjectSummary] = Field(default_factory=list, max_length=100)
+	next_cursor: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class ProjectHistoryItem(RunSnapshot):
+	"""One project run together with its retained interaction journal."""
+
+	instruction: str | None = Field(default=None, max_length=20_000)
+	events: list[RunEvent] = Field(default_factory=list, max_length=10_000)
+
+
+class ProjectHistoryPage(_ContractModel):
+	schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
+	items: list[ProjectHistoryItem] = Field(default_factory=list, max_length=100)
 	next_cursor: str | None = Field(default=None, min_length=1, max_length=256)
 
 
@@ -338,6 +421,7 @@ class TaskSubmissionRequest(_ContractModel):
 
 	task: str = Field(min_length=1, max_length=20_000)
 	website_url: str = Field(min_length=1, max_length=4_096)
+	project_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 	@field_validator("website_url")
 	@classmethod
@@ -393,6 +477,7 @@ class RunSpec(_ContractModel):
 	schema_version: Literal[SCHEMA_VERSION]
 	input_path: str = Field(min_length=1, max_length=4_096)
 	output_root: str = Field(min_length=1, max_length=4_096)
+	project_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 	project_url: str | None = Field(default=None, min_length=1, max_length=4_096)
 	model: CredentialProfileReference
 	browser: LocalBrowserSpec
@@ -416,6 +501,12 @@ class RunSpec(_ContractModel):
 		except ValueError as exc:
 			raise ValueError("project_url contains an invalid port") from exc
 		return value
+
+	@model_validator(mode="after")
+	def _project_id_requires_url(self) -> RunSpec:
+		if self.project_id is not None and self.project_url is None:
+			raise ValueError("project_id requires project_url")
+		return self
 
 
 __all__ = [
@@ -444,6 +535,11 @@ __all__ = [
 	"RunSpec",
 	"RunSnapshot",
 	"RunPage",
+	"ProjectHistoryItem",
+	"ProjectHistoryPage",
+	"ProjectPage",
+	"ProjectRegistration",
+	"ProjectSummary",
 	"RunStatus",
 	"SCHEMA_VERSION",
 	"ShutdownAccepted",

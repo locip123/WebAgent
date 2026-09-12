@@ -82,13 +82,74 @@ describe("run event projection", () => {
     ]);
   });
 
+  it("shows a model thought before its browser action completes and updates that same step", () => {
+    const started = applyRunEvent(createRunProjection(snapshot), taskStarted);
+    const decided = applyRunEvent(started, {
+      ...taskStarted,
+      event_id: 3,
+      type: "task.step.decided",
+      payload: {
+        step: 2,
+        max_steps: 5,
+        action: "find_text",
+        thought: "Inspect the page for the requested text."
+      }
+    });
+
+    expect(decided.steps).toEqual([
+      {
+        eventId: 3,
+        taskId: "task-4",
+        step: 2,
+        maxSteps: 5,
+        action: "find_text",
+        outcome: null,
+        thought: "Inspect the page for the requested text.",
+        status: "PENDING"
+      }
+    ]);
+
+    const completed = applyRunEvent(decided, {
+      ...taskStarted,
+      event_id: 4,
+      type: "task.step.completed",
+      payload: {
+        step: 2,
+        max_steps: 5,
+        action: "find_text",
+        outcome: "ok",
+        thought: "Inspect the page for the requested text."
+      }
+    });
+
+    expect(completed.tasks["task-4"]).toMatchObject({ completedSteps: 2, maxSteps: 5 });
+    expect(completed.steps).toEqual([
+      {
+        eventId: 3,
+        taskId: "task-4",
+        step: 2,
+        maxSteps: 5,
+        action: "find_text",
+        outcome: "ok",
+        thought: "Inspect the page for the requested text.",
+        status: "COMPLETED"
+      }
+    ]);
+  });
+
   it("keeps each completed step as a model progress update", () => {
     const started = applyRunEvent(createRunProjection(snapshot), taskStarted);
     const progressed = applyRunEvent(started, {
       ...taskStarted,
       event_id: 3,
       type: "task.step.completed",
-      payload: { step: 2, max_steps: 5, action: "find_text", outcome: "ok" }
+      payload: {
+        step: 2,
+        max_steps: 5,
+        action: "find_text",
+        outcome: "ok",
+        thought: "Inspect the page for the requested text."
+      }
     });
 
     expect(progressed.tasks["task-4"]).toMatchObject({
@@ -102,7 +163,9 @@ describe("run event projection", () => {
         step: 2,
         maxSteps: 5,
         action: "find_text",
-        outcome: "ok"
+        outcome: "ok",
+        thought: "Inspect the page for the requested text.",
+        status: "COMPLETED"
       }
     ]);
   });
@@ -130,6 +193,38 @@ describe("run event projection", () => {
     expect(runFailed.errors).toEqual([
       { eventId: 3, code: "target_error", taskId: "task-4" },
       { eventId: 4, code: "runner_failed", taskId: null }
+    ]);
+  });
+
+  it("retains a readable error when a completed run carries one", () => {
+    const completed = applyRunEvent(createRunProjection(snapshot), {
+      ...taskStarted,
+      event_id: 3,
+      type: "run.completed",
+      task: null,
+      payload: {
+        summary: {},
+        error: {
+          code: "run_timeout",
+          message: "Task exceeded the 600-second time limit"
+        }
+      }
+    });
+
+    expect(completed.snapshot).toMatchObject({
+      status: "COMPLETED",
+      error: {
+        code: "run_timeout",
+        message: "Task exceeded the 600-second time limit"
+      }
+    });
+    expect(completed.errors).toEqual([
+      {
+        eventId: 3,
+        code: "run_timeout",
+        message: "Task exceeded the 600-second time limit",
+        taskId: null
+      }
     ]);
   });
 });

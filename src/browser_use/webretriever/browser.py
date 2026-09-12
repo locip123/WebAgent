@@ -118,7 +118,7 @@ _STATE_CHANGING_ACTIONS = frozenset(
 		'xy',
 	}
 )
-_CONTENT_ACTIONS = frozenset({'find', 'read', 'inspect_network', 'calculate'})
+_CONTENT_ACTIONS = frozenset({'find', 'read', 'calculate'})
 _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 _ANNOTATION_LABEL_GAP = 2
 _DOCUMENT_MIME_EXTENSIONS = {
@@ -1239,10 +1239,12 @@ class BrowserRuntime:
 	async def execute(self, decision: AgentDecision | Mapping[str, Any]) -> WebRetrieverActionResult:
 		"""Execute one model decision and return its bounded structured result."""
 
+		data = self._decision_dict(decision)
+		action, params = self._normalise_action(data)
+		if action == 'inspect_network':
+			raise ValueError("Browser action 'inspect_network' is disabled")
 		self._ensure_started()
 		async with self._execute_lock:
-			data = self._decision_dict(decision)
-			action, params = self._normalise_action(data)
 			page = self._active_page()
 			previous_page = page
 			previous_url = page.url
@@ -2486,8 +2488,6 @@ class BrowserRuntime:
 			return await self._read(params)
 		if action == 'find':
 			return await self._find(params)
-		if action == 'inspect_network':
-			return await self._inspect_network(params)
 		if action == 'calculate':
 			return self._calculate(params)
 		if action in {'done', 'finish', 'answer', 'noop'}:

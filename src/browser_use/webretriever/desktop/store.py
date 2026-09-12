@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from browser_use.webretriever.desktop.contracts import RunEvent, RunEventDraft, RunSnapshot, RunSpec
+from browser_use.webretriever.desktop.contracts import ProjectSummary, RunEvent, RunEventDraft, RunSnapshot, RunSpec
 from browser_use.webretriever.desktop.versioning import SQLITE_SCHEMA_VERSION
 
 
@@ -30,10 +30,13 @@ class StoredRun:
 	output_dir: str
 	summary: dict[str, Any] | None
 	error: dict[str, Any] | None
+	project_id: str | None = None
 
 	def snapshot(self, *, last_event_id: int) -> RunSnapshot:
 		return RunSnapshot(
 			run_id=self.run_id,
+			project_id=self.project_id,
+			project_url=self.spec.project_url,
 			status=self.status,
 			created_at=self.created_at,
 			started_at=self.started_at,
@@ -43,6 +46,24 @@ class StoredRun:
 			summary=self.summary,
 			error=self.error,
 		)
+
+
+@dataclass(frozen=True, slots=True)
+class StoredProject:
+	project_id: str
+	website_url: str
+	created_at: datetime
+
+	def summary(self) -> ProjectSummary:
+		return ProjectSummary(
+			project_id=self.project_id,
+			website_url=self.website_url,
+			created_at=self.created_at,
+		)
+
+
+class ProjectUrlMismatchError(ValueError):
+	"""Raised when an existing project id is asserted for another URL."""
 
 
 class SqliteControlStore:
@@ -74,13 +95,19 @@ class SqliteControlStore:
 			raise RuntimeError(
 				f"control database schema {current_version} is newer than this sidecar ({SQLITE_SCHEMA_VERSION})"
 			)
-		if current_version == SQLITE_SCHEMA_VERSION:
-			return
+		if current_version not in {0, 1} and current_version != SQLITE_SCHEMA_VERSION:
+			raise RuntimeError(f"unsupported control database schema {current_version}")
 		self._connection.executescript(
 			"""
+			CREATE TABLE IF NOT EXISTS projects (
+				project_id TEXT PRIMARY KEY,
+				website_url TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS runs (
 				run_id TEXT PRIMARY KEY,
 				idempotency_key TEXT NOT NULL UNIQUE,
+				project_id TEXT,
 				spec_json TEXT NOT NULL,
 				spec_digest TEXT NOT NULL,
 				status TEXT NOT NULL,
@@ -109,19 +136,46 @@ class SqliteControlStore:
 		columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(runs)")}
 		if "last_event_id" not in columns:
 			self._connection.execute("ALTER TABLE runs ADD COLUMN last_event_id INTEGER NOT NULL DEFAULT 0")
+		if "project_id" not in columns:
+			self._connection.execute("ALTER TABLE runs ADD COLUMN project_id TEXT")
+		self._connection.execute("CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id, created_at DESC, run_id DESC)")
 		self._connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
+
+	def get_project(self, project_id: str) -> StoredProject | None:
+		row = self._connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+		return _stored_project(row) if row is not None else None
+
+	def ensure_project(self, project_id: str, website_url: str) -> StoredProject:
+		current = self.get_project(project_id)
+		if current is not None:
+			if current.website_url != website_url:
+				raise ProjectUrlMismatchError(project_id)
+			return current
+		created_at = datetime.now(timezone.utc)
+		self._connection.execute(
+			"INSERT INTO projects (project_id, website_url, created_at) VALUES (?, ?, ?)",
+			(project_id, website_url, _datetime(created_at)),
+		)
+		return StoredProject(project_id=project_id, website_url=website_url, created_at=created_at)
+
+	def list_projects(self, *, limit: int = 100) -> list[StoredProject]:
+		rows = self._connection.execute(
+			"SELECT * FROM projects ORDER BY created_at DESC, project_id DESC LIMIT ?", (limit,)
+		).fetchall()
+		return [_stored_project(row) for row in rows]
 
 	def create_run(self, record: StoredRun) -> None:
 		self._connection.execute(
 			"""
 			INSERT INTO runs (
-				run_id, idempotency_key, spec_json, spec_digest, status, created_at,
+				run_id, idempotency_key, project_id, spec_json, spec_digest, status, created_at,
 				started_at, finished_at, output_dir, last_event_id, summary_json, error_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 			""",
 			(
 				record.run_id,
 				record.idempotency_key,
+				record.project_id,
 				_json(record.spec.model_dump(mode="json")),
 				record.spec_digest,
 				record.status,
@@ -142,13 +196,14 @@ class SqliteControlStore:
 			self._connection.execute(
 				"""
 				INSERT INTO runs (
-					run_id, idempotency_key, spec_json, spec_digest, status, created_at,
+					run_id, idempotency_key, project_id, spec_json, spec_digest, status, created_at,
 					started_at, finished_at, output_dir, last_event_id, summary_json, error_json
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 				""",
 				(
 					record.run_id,
 					record.idempotency_key,
+					record.project_id,
 					_json(record.spec.model_dump(mode="json")),
 					record.spec_digest,
 					record.status,
@@ -202,6 +257,59 @@ class SqliteControlStore:
 		stored = [_stored_run(row) for row in rows[:limit]]
 		next_cursor = stored[-1].run_id if len(rows) > limit and stored else None
 		return stored, next_cursor
+
+	def list_project_runs(
+		self,
+		*,
+		project_id: str,
+		website_url: str,
+		cursor: str | None,
+		limit: int,
+	) -> tuple[list[StoredRun], str | None]:
+		"""List explicit project runs and legacy URL-owned runs in one stable page."""
+
+		records = [
+			_stored_run(row)
+			for row in self._connection.execute("SELECT * FROM runs ORDER BY created_at DESC, run_id DESC").fetchall()
+		]
+		owned = [
+			record
+			for record in records
+			if record.project_id == project_id or (record.project_id is None and record.spec.project_url == website_url)
+		]
+		if cursor is not None:
+			cursor_index = next((index for index, record in enumerate(owned) if record.run_id == cursor), None)
+			if cursor_index is None:
+				return [], None
+			owned = owned[cursor_index + 1 :]
+		page = owned[:limit]
+		next_cursor = page[-1].run_id if len(owned) > limit and page else None
+		return page, next_cursor
+
+	def active_project_run(self, *, project_id: str, website_url: str) -> StoredRun | None:
+		records, _ = self.list_project_runs(
+			project_id=project_id,
+			website_url=website_url,
+			cursor=None,
+			limit=10_000,
+		)
+		return next((record for record in records if record.status in _ACTIVE_STATUSES), None)
+
+	def delete_project_records(self, project_id: str, run_ids: Iterable[str]) -> None:
+		"""Delete events, runs, and the project atomically in SQLite."""
+
+		ids = tuple(run_ids)
+		self._connection.execute("BEGIN IMMEDIATE")
+		try:
+			if ids:
+				placeholders = ", ".join("?" for _ in ids)
+				self._connection.execute(f"DELETE FROM events WHERE run_id IN ({placeholders})", ids)
+				self._connection.execute(f"DELETE FROM runs WHERE run_id IN ({placeholders})", ids)
+			self._connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+			self._connection.execute("COMMIT")
+		except BaseException:
+			self._connection.execute("ROLLBACK")
+			raise
 
 	def update_run(
 		self,
@@ -358,6 +466,7 @@ def _stored_run(row: sqlite3.Row) -> StoredRun:
 	return StoredRun(
 		run_id=str(row["run_id"]),
 		idempotency_key=str(row["idempotency_key"]),
+		project_id=str(row["project_id"]) if row["project_id"] is not None else None,
 		spec=RunSpec.model_validate_json(str(row["spec_json"])),
 		spec_digest=str(row["spec_digest"]),
 		status=str(row["status"]),
@@ -367,6 +476,14 @@ def _stored_run(row: sqlite3.Row) -> StoredRun:
 		output_dir=str(row["output_dir"]),
 		summary=_parse_json(row["summary_json"]),
 		error=_parse_json(row["error_json"]),
+	)
+
+
+def _stored_project(row: sqlite3.Row) -> StoredProject:
+	return StoredProject(
+		project_id=str(row["project_id"]),
+		website_url=str(row["website_url"]),
+		created_at=_parse_datetime(str(row["created_at"])),
 	)
 
 
@@ -405,4 +522,10 @@ def _parse_json(value: str | None) -> dict[str, Any] | None:
 	return loaded if isinstance(loaded, dict) else None
 
 
-__all__ = ["SQLITE_SCHEMA_VERSION", "SqliteControlStore", "StoredRun"]
+__all__ = [
+	"ProjectUrlMismatchError",
+	"SQLITE_SCHEMA_VERSION",
+	"SqliteControlStore",
+	"StoredProject",
+	"StoredRun",
+]

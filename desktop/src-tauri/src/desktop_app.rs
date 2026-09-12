@@ -9,10 +9,7 @@ use std::{
         Arc,
     },
 };
-use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    AppHandle, Emitter, Manager, State, Window, WindowEvent,
-};
+use tauri::{AppHandle, Emitter, Manager, State, Window, WindowEvent};
 use tokio::time::{sleep, Duration};
 
 pub struct AppSupervisor(pub Arc<Supervisor>);
@@ -76,7 +73,6 @@ pub fn run() {
             ));
             app.manage(AppSupervisor(supervisor.clone()));
             app.manage(QuitState(AtomicBool::new(false)));
-            install_menu(app)?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if start_sidecar_with_retries(&handle, supervisor.clone()).await {
@@ -97,27 +93,6 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run WebRetriever desktop shell");
-}
-
-fn install_menu(app: &tauri::App) -> tauri::Result<()> {
-    let new_run = MenuItem::with_id(app, "new-run", "新建运行", true, Some("CmdOrCtrl+N"))?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, Some("CmdOrCtrl+Q"))?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let file = Submenu::with_items(app, "文件", true, &[&new_run, &separator, &quit])?;
-    let menu = Menu::with_items(app, &[&file])?;
-    app.set_menu(menu)?;
-    app.on_menu_event(|app, event| match event.id().as_ref() {
-        "new-run" => {
-            let _ = app.emit("desktop-menu", "new-run");
-        }
-        "quit" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.close();
-            }
-        }
-        _ => {}
-    });
-    Ok(())
 }
 
 fn handle_close_requested(window: &Window, api: &tauri::CloseRequestApi) {

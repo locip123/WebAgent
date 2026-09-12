@@ -219,11 +219,6 @@ def _action_specific_guidance(action_contracts: Mapping[str, ActionParameterCont
 
 	active_actions = ACTION_PARAMETER_CONTRACTS if action_contracts is None else action_contracts
 	guidance: list[str] = []
-	if 'inspect_network' in active_actions:
-		guidance.append(
-			'inspect_network text is relevance search, not exact proof; request_id scopes text to one captured response, '
-			'or without text reads a result; network_cursor only continues a request read without text.'
-		)
 	if 'find_chart_data_requests' in active_actions:
 		guidance.append('chart_cursor belongs only to find_chart_data_requests.')
 	if 'call_data_analysis_assistant' in active_actions:

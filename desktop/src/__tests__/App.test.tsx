@@ -1,8 +1,9 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { UserEvent } from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
+import type { RunEvent } from "../runProjection";
 
 describe("desktop run workspace", () => {
 	beforeEach(() => {
@@ -102,7 +103,7 @@ describe("desktop run workspace", () => {
 		await user.click(screen.getByRole("button", { name: "确定" }));
 
 		expect(screen.queryByRole("dialog", { name: "创建项目" })).not.toBeInTheDocument();
-		expect(screen.getByRole("button", { name: /我的产品官网/ })).toBeVisible();
+		expect(screen.getByRole("button", { name: "项目 我的产品官网" })).toBeVisible();
 		expect(screen.getAllByText("https://example.com").length).toBe(2);
 
 		await user.type(screen.getByLabelText("任务描述"), "整理首页信息");
@@ -115,8 +116,61 @@ describe("desktop run workspace", () => {
 		expect(await screen.findByText("任务已开始，正在打开浏览器…")).toBeVisible();
 	});
 
+	it("clears the startup notice when the submitted task enters a terminal state", async () => {
+		const user = userEvent.setup();
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn().mockResolvedValue({
+				schema_version: 1,
+				run_id: "run-completed",
+				status: "STARTING",
+				created_at: "2026-09-04T12:00:00Z",
+				snapshot_url: "/api/v1/runs/run-completed",
+				events_url: "/api/v1/runs/run-completed/events"
+			}),
+			getRun: vi.fn().mockResolvedValue({
+				schema_version: 1,
+				run_id: "run-completed",
+				status: "RUNNING",
+				created_at: "2026-09-04T12:00:00Z",
+				started_at: "2026-09-04T12:00:01Z",
+				finished_at: null,
+				output_dir: "/work/outputs/run-completed",
+				last_event_id: 1,
+				summary: null,
+				error: null
+			}),
+			subscribeToRun: vi.fn().mockImplementation(async (_runId, _after, onEvent) => {
+				onEvent({
+					schema: "webretriever.run-event/v1",
+					run_id: "run-completed",
+					event_id: 2,
+					type: "run.completed",
+					occurred_at: "2026-09-04T12:00:02Z",
+					level: "info",
+					task: null,
+					payload: {}
+				});
+				return () => {};
+			})
+		};
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+
+		await user.click(screen.getByRole("button", { name: "创建项目" }));
+		await user.type(screen.getByLabelText("网站名称"), "产品官网");
+		await user.type(screen.getByLabelText("网站 URL"), "https://example.com");
+		await user.click(screen.getByRole("button", { name: "确定" }));
+		await user.type(screen.getByLabelText("任务描述"), "整理首页信息");
+		await user.click(screen.getByRole("button", { name: "提交任务" }));
+
+		expect(await screen.findByText("运行状态：COMPLETED")).toBeVisible();
+		expect(screen.queryByText("任务已开始，正在打开浏览器…")).not.toBeInTheDocument();
+	});
+
 	it("shows an active task as a conversation and lets the user stop it", async () => {
 		const user = userEvent.setup();
+		let publishEvent: ((event: RunEvent) => void) | null = null;
 		const client = {
 			preflight: vi.fn(),
 			createRun: vi.fn(),
@@ -147,6 +201,7 @@ describe("desktop run workspace", () => {
 				cancel_applied: true
 			}),
 			subscribeToRun: vi.fn().mockImplementation(async (_runId, _after, onEvent) => {
+				publishEvent = onEvent;
 				onEvent({
 					schema: "webretriever.run-event/v1",
 					run_id: "run-9",
@@ -157,25 +212,20 @@ describe("desktop run workspace", () => {
 					task: { task_id: "task-9", task_idx: 1 },
 					payload: { website_display: "example.com" }
 				});
-				onEvent({
+					onEvent({
 					schema: "webretriever.run-event/v1",
 					run_id: "run-9",
 					event_id: 3,
-					type: "task.step.completed",
+					type: "task.step.decided",
 					occurred_at: "2026-09-04T12:00:03Z",
 					level: "info",
 					task: { task_id: "task-9", task_idx: 1 },
-					payload: { step: 2, max_steps: 5, action: "find_text", outcome: "ok" }
-				});
-				onEvent({
-					schema: "webretriever.run-event/v1",
-					run_id: "run-9",
-					event_id: 4,
-					type: "task.finished",
-					occurred_at: "2026-09-04T12:00:04Z",
-					level: "info",
-					task: { task_id: "task-9", task_idx: 1 },
-					payload: { domain_status: "SUCCESS", answer: "首页信息已经整理完成。" }
+					payload: {
+						step: 2,
+						max_steps: 5,
+						action: "find_text",
+						thought: "Inspect the page for the requested text."
+					}
 				});
 				return () => {};
 			})
@@ -192,7 +242,43 @@ describe("desktop run workspace", () => {
 		expect(await screen.findByText("用户指令")).toBeVisible();
 		expect(screen.getByText("整理首页信息")).toBeVisible();
 		expect(screen.getByText("模型思考过程")).toBeVisible();
+		expect(screen.getByText("Inspect the page for the requested text.")).toBeVisible();
 		expect(screen.getByText("第 2 / 5 步")).toBeVisible();
+		expect(screen.getByText("正在执行 find_text…")).toBeVisible();
+
+		act(() => {
+			if (publishEvent === null) {
+				throw new Error("SSE callback was not registered");
+			}
+			publishEvent({
+				schema: "webretriever.run-event/v1",
+				run_id: "run-9",
+				event_id: 4,
+				type: "task.step.completed",
+				occurred_at: "2026-09-04T12:00:04Z",
+				level: "info",
+				task: { task_id: "task-9", task_idx: 1 },
+				payload: {
+					step: 2,
+					max_steps: 5,
+					action: "find_text",
+					outcome: "ok",
+					thought: "Inspect the page for the requested text."
+				}
+			});
+			publishEvent({
+				schema: "webretriever.run-event/v1",
+				run_id: "run-9",
+				event_id: 5,
+				type: "task.finished",
+				occurred_at: "2026-09-04T12:00:05Z",
+				level: "info",
+				task: { task_id: "task-9", task_idx: 1 },
+				payload: { domain_status: "SUCCESS", answer: "首页信息已经整理完成。" }
+			});
+		});
+
+		expect(await screen.findByText("已执行 find_text，结果：ok")).toBeVisible();
 		expect(screen.getByText("模型回答")).toBeVisible();
 		expect(screen.getByText("首页信息已经整理完成。")).toBeVisible();
 
@@ -235,6 +321,83 @@ describe("desktop run workspace", () => {
 
 		expect(await screen.findByRole("button", { name: "项目 产品后台" })).toBeVisible();
 		expect(screen.getAllByText("https://admin.example.com").length).toBe(2);
+	});
+
+	it("restores the latest project interaction and clears it when switching to an empty project", async () => {
+		const user = userEvent.setup();
+		localStorage.setItem("webAgent.projects", JSON.stringify([
+			{ id: "project-a", name: "项目 A", websiteUrl: "https://a.example.com", createdAt: "2026-09-01T00:00:00Z" },
+			{ id: "project-b", name: "项目 B", websiteUrl: "https://b.example.com", createdAt: "2026-09-02T00:00:00Z" }
+		]));
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn(),
+			getRun: vi.fn(),
+			listProjectHistory: vi.fn().mockImplementation(async (projectId: string) => projectId === "project-a" ? ({
+				items: [{
+					schema_version: 1,
+					run_id: "run-a",
+					project_id: "project-a",
+					project_url: "https://a.example.com",
+					status: "COMPLETED",
+					created_at: "2026-09-03T00:00:00Z",
+					started_at: "2026-09-03T00:00:01Z",
+					finished_at: "2026-09-03T00:00:05Z",
+					output_dir: "/work/outputs/run-a",
+					last_event_id: 5,
+					summary: null,
+					error: null,
+					instruction: "历史任务指令",
+					events: [
+						{ schema: "webretriever.run-event/v1", run_id: "run-a", event_id: 1, type: "task.started", occurred_at: "2026-09-03T00:00:01Z", level: "info", task: { task_id: "task-a", task_idx: 0 }, payload: { website_display: "a.example.com" } },
+						{ schema: "webretriever.run-event/v1", run_id: "run-a", event_id: 2, type: "task.finished", occurred_at: "2026-09-03T00:00:04Z", level: "info", task: { task_id: "task-a", task_idx: 0 }, payload: { answer: "历史任务回答" } },
+						{ schema: "webretriever.run-event/v1", run_id: "run-a", event_id: 3, type: "run.completed", occurred_at: "2026-09-03T00:00:05Z", level: "info", task: null, payload: {} }
+					]
+				}],
+				next_cursor: null
+			}) : ({ items: [], next_cursor: null })),
+			subscribeToRun: vi.fn().mockResolvedValue(() => {})
+		};
+
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+
+		expect(await screen.findByText("历史任务指令")).toBeVisible();
+		expect(screen.getByText("历史任务回答")).toBeVisible();
+		await user.click(screen.getByRole("button", { name: "项目 项目 B" }));
+
+		expect(await screen.findByText("暂无任务记录")).toBeVisible();
+		expect(screen.queryByText("历史任务指令")).not.toBeInTheDocument();
+	});
+
+	it("confirms project deletion, removes its local state, and selects the next project", async () => {
+		const user = userEvent.setup();
+		localStorage.setItem("webAgent.projects", JSON.stringify([
+			{ id: "project-a", name: "项目 A", websiteUrl: "https://a.example.com", createdAt: "2026-09-01T00:00:00Z" },
+			{ id: "project-b", name: "项目 B", websiteUrl: "https://b.example.com", createdAt: "2026-09-02T00:00:00Z" }
+		]));
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn(),
+			getRun: vi.fn(),
+			deleteProject: vi.fn().mockResolvedValue(undefined),
+			listProjectHistory: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+			subscribeToRun: vi.fn().mockResolvedValue(() => {})
+		};
+
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+		await user.click(screen.getByRole("button", { name: "删除项目 项目 A" }));
+		expect(screen.getByRole("dialog", { name: "删除项目" })).toBeVisible();
+		await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+		expect(client.deleteProject).toHaveBeenCalledWith("project-a");
+		expect(screen.queryByRole("button", { name: "项目 项目 A" })).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "项目 项目 B" })).toBeVisible();
+		expect(screen.getByLabelText("当前项目：项目 B")).toBeVisible();
+		expect(JSON.parse(localStorage.getItem("webAgent.projects") ?? "[]")).toEqual([
+			{ id: "project-b", name: "项目 B", websiteUrl: "https://b.example.com", createdAt: "2026-09-02T00:00:00Z" }
+		]);
 	});
 
 	it("includes the current project URL in batch run preflight context", async () => {
@@ -330,6 +493,51 @@ describe("desktop run workspace", () => {
 		await openBatchOperations(userEvent.setup());
 
 		expect(await screen.findByRole("button", { name: "选择文件" })).toBeEnabled();
+	});
+
+	it("shows the backend ready notice once and removes it from the page", async () => {
+		vi.useFakeTimers();
+		try {
+			let stateListener: ((status: { state: "READY" }) => void) | undefined;
+			const bridge = {
+				...readyBridge(),
+				onBackendStateChanged: vi.fn().mockImplementation(async (listener) => {
+					stateListener = listener;
+					return () => {};
+				})
+			};
+
+			render(<App bridge={bridge} />);
+			await act(async () => {});
+
+			expect(screen.getByText("后端已就绪")).toBeVisible();
+			await act(async () => stateListener?.({ state: "READY" }));
+			expect(screen.getAllByText("后端已就绪")).toHaveLength(1);
+
+			await act(async () => {
+				vi.runOnlyPendingTimers();
+			});
+			expect(screen.queryByText("后端已就绪")).not.toBeInTheDocument();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not show a ready notice while the descriptor is still loading", async () => {
+		let stateListener: ((status: { state: "READY" }) => void) | undefined;
+		const bridge = {
+			...readyBridge(),
+			getDescriptor: vi.fn().mockImplementation(() => new Promise(() => {})),
+			onBackendStateChanged: vi.fn().mockImplementation(async (listener) => {
+				stateListener = listener;
+				return () => {};
+			})
+		};
+
+		render(<App bridge={bridge} />);
+		await act(async () => stateListener?.({ state: "READY" }));
+
+		expect(screen.queryByText("后端已就绪")).not.toBeInTheDocument();
 	});
 
 	it("enables preflight only after the native shell publishes a ready descriptor", async () => {
@@ -440,5 +648,149 @@ describe("desktop run workspace", () => {
 		expect(await screen.findByText("运行状态：FAILED")).toBeVisible();
 		expect(await screen.findByText("任务 4：task-4（example.com）")).toBeVisible();
 		expect(await screen.findByText("runner_failed")).toBeVisible();
+	});
+
+	it("replays a completed task error that is absent from the terminal snapshot", async () => {
+		const user = userEvent.setup();
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn().mockResolvedValue({
+				schema_version: 1,
+				run_id: "run-timeout",
+				status: "STARTING",
+				created_at: "2026-09-04T12:00:00Z",
+				snapshot_url: "/api/v1/runs/run-timeout",
+				events_url: "/api/v1/runs/run-timeout/events"
+			}),
+			getRun: vi.fn().mockResolvedValue({
+				schema_version: 1,
+				run_id: "run-timeout",
+				status: "COMPLETED",
+				created_at: "2026-09-04T12:00:00Z",
+				started_at: "2026-09-04T12:00:01Z",
+				finished_at: "2026-09-04T12:10:01Z",
+				output_dir: "/work/outputs/run-timeout",
+				last_event_id: 3,
+				summary: null,
+				error: null
+			}),
+			subscribeToRun: vi.fn().mockImplementation(async (_runId, after, onEvent) => {
+				if (after === 0) {
+					onEvent({
+						schema: "webretriever.run-event/v1",
+						run_id: "run-timeout",
+						event_id: 1,
+						type: "task.started",
+						occurred_at: "2026-09-04T12:00:01Z",
+						level: "info",
+						task: { task_id: "task-timeout", task_idx: 0 },
+						payload: { website_display: "timeout.example.com" }
+					});
+					onEvent({
+						schema: "webretriever.run-event/v1",
+						run_id: "run-timeout",
+						event_id: 2,
+						type: "task.finished",
+						occurred_at: "2026-09-04T12:10:00Z",
+						level: "info",
+						task: { task_id: "task-timeout", task_idx: 0 },
+						payload: { domain_status: "FAIL_MODEL_TIMEOUT", error: "Model request exceeded 0 seconds after up to 5 connection attempts" }
+					});
+					onEvent({
+						schema: "webretriever.run-event/v1",
+						run_id: "run-timeout",
+						event_id: 3,
+						type: "run.completed",
+						occurred_at: "2026-09-04T12:10:01Z",
+						level: "info",
+						task: null,
+						payload: { summary: {} }
+					});
+				}
+				return () => {};
+			})
+		};
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+
+		await user.click(screen.getByRole("button", { name: "创建项目" }));
+		await user.type(screen.getByLabelText("网站名称"), "超时项目");
+		await user.type(screen.getByLabelText("网站 URL"), "https://timeout.example.com");
+		await user.click(screen.getByRole("button", { name: "确定" }));
+		await user.type(screen.getByLabelText("任务描述"), "执行一个可能超时的任务");
+		await user.click(screen.getByRole("button", { name: "提交任务" }));
+
+		expect(await screen.findByText("运行状态：COMPLETED")).toBeVisible();
+		expect(await screen.findByRole("alert")).toHaveTextContent("Model request exceeded 0 seconds after up to 5 connection attempts");
+		expect(client.subscribeToRun).toHaveBeenCalledWith("run-timeout", 0, expect.any(Function));
+	});
+
+	it("starts a blank conversation for the project selected by the new-task button", async () => {
+		const user = userEvent.setup();
+		localStorage.setItem("webAgent.projects", JSON.stringify([
+			{ id: "project-a", name: "项目 A", websiteUrl: "https://a.example.com", createdAt: "2026-09-01T00:00:00Z" },
+			{ id: "project-b", name: "项目 B", websiteUrl: "https://b.example.com", createdAt: "2026-09-02T00:00:00Z" }
+		]));
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn(),
+			getRun: vi.fn(),
+			listProjectHistory: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+			subscribeToRun: vi.fn().mockResolvedValue(() => {})
+		};
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+
+		await screen.findByRole("button", { name: "项目 项目 A" });
+		await user.type(screen.getByLabelText("任务描述"), "尚未提交的草稿");
+		await user.click(screen.getByRole("button", { name: "为项目 project-a 新建任务" }));
+
+		expect(screen.getByLabelText("任务描述")).toHaveValue("");
+		expect(screen.getByText("暂无任务记录")).toBeVisible();
+		await user.click(screen.getByRole("button", { name: "为项目 project-b 新建任务" }));
+		expect(screen.getByLabelText("当前项目：项目 B")).toBeVisible();
+	});
+
+	it("opens project history from the project row action", async () => {
+		const user = userEvent.setup();
+		localStorage.setItem("webAgent.projects", JSON.stringify([
+			{ id: "project-history", name: "研究网", websiteUrl: "https://research.example.com", createdAt: "2026-09-01T00:00:00Z" }
+		]));
+		const client = {
+			preflight: vi.fn(),
+			createRun: vi.fn(),
+			submitTask: vi.fn(),
+			getRun: vi.fn(),
+			listProjectHistory: vi.fn().mockResolvedValue({
+				items: [{
+					schema_version: 1,
+					run_id: "run-history",
+					project_id: "project-history",
+					project_url: "https://research.example.com",
+					status: "COMPLETED",
+					created_at: "2026-09-04T12:00:00Z",
+					started_at: "2026-09-04T12:00:01Z",
+					finished_at: "2026-09-04T12:00:05Z",
+					output_dir: "/work/outputs/run-history",
+					last_event_id: 3,
+					summary: null,
+					error: null,
+					instruction: "整理研究网首页",
+					events: []
+				}],
+				next_cursor: null
+			}),
+			subscribeToRun: vi.fn().mockResolvedValue(() => {})
+		};
+		render(<App bridge={readyBridge()} createClient={() => client} />);
+
+		await user.click(screen.getByRole("button", { name: "查看项目 研究网 的历史任务" }));
+
+		const dialog = await screen.findByRole("dialog", { name: "项目历史任务：研究网" });
+		expect(dialog).toBeVisible();
+		expect(within(dialog).getByText("整理研究网首页")).toBeVisible();
+		expect(client.listProjectHistory).toHaveBeenCalledWith("project-history", expect.objectContaining({ limit: 100 }));
+		await user.click(screen.getByRole("button", { name: "关闭" }));
+		expect(screen.queryByRole("dialog", { name: "项目历史任务：研究网" })).not.toBeInTheDocument();
 	});
 });

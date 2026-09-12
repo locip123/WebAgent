@@ -1,7 +1,7 @@
 {
   "api_model": "gpt-5.5",
   "api_mode": "responses",
-  "reasoning_effort": "high",
+  "reasoning_effort": "low",
   "model_services": [
     {
       "model": "gpt-5.5",
@@ -27,13 +27,6 @@
     {
       "model": "gpt-5.5",
       "response_mode": "responses",
-      "name": "zxai",
-      "api_base": "https://zxai.work/v1",
-      "api_key": "sk-xbzb3EL48z7K0tyG63cZmM7TxEy4ThtGHg60lcrvzcFgcOgJ"
-    },
-    {
-      "model": "gpt-5.5",
-      "response_mode": "responses",
       "name": "share-plus",
       "api_base": "https://share-api.com/v1",
       "api_key": "sk-58ef910f7a880db1d46222f9f99b177eb8b7104db3152ded664800303c788472"
@@ -44,13 +37,6 @@
       "name": "share-pro-2",
       "api_base": "https://share-api.com/v1",
       "api_key": "sk-f5d0aef77f5123c4c0513aeb2f51501c75404f1cb25c4bd9a0a1611dbbade3a3"
-    },
-    {
-      "model": "gpt-5.5",
-      "response_mode": "responses",
-      "name": "zxai-2",
-      "api_base": "https://zxai.work/v1",
-      "api_key": "sk-ozW26xoMiaEkipDQojvC7FRSIndYkJgW6iIWQ01c0RM5QpDs"
     },
     {
       "model": "gpt-5.5",

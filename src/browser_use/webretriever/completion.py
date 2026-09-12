@@ -50,8 +50,6 @@ RequirementKind = Literal[
 	'relationship',
 	'other',
 ]
-AnswerShape = Literal['scalar', 'list', 'object', 'table', 'free_text']
-AnswerItemType = Literal['string', 'integer', 'number', 'date', 'boolean', 'object']
 Verdict = Literal['entailed', 'contradicted', 'insufficient', 'wrong_scope']
 EvidenceKind = Literal[
 	'page_text',
@@ -67,9 +65,6 @@ EvidenceKind = Literal[
 
 _REQUIREMENT_ID_RE = re.compile(r'^R[1-9][0-9]{0,2}$')
 _EVIDENCE_ID_RE = re.compile(r'^ev-[0-9]{6}$')
-_INTEGER_RE = re.compile(r'^[+-]?[0-9][0-9,]*$')
-_NUMBER_RE = re.compile(r'^[+-]?(?:[0-9][0-9,]*(?:\.[0-9]+)?|\.[0-9]+)(?:%|\s*[A-Za-z]+)?$')
-_DATE_RE = re.compile(r'^(?:[12][0-9]{3})(?:[-/.年](?:0?[1-9]|1[0-2]))?(?:[-/.月](?:0?[1-9]|[12][0-9]|3[01]))?日?$')
 _MAX_EVIDENCE_RECORDS_PER_ACTION = 64
 _MAX_EVIDENCE_CONTENT = 16_000
 
@@ -114,35 +109,12 @@ class RequirementSpec(BaseModel):
 	mandatory: bool = True
 
 
-class AnswerContract(BaseModel):
-	"""Deterministically checkable structure expected from an answer candidate."""
-
-	model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
-
-	shape: AnswerShape = 'free_text'
-	item_type: AnswerItemType = 'string'
-	min_items: int = Field(default=1, ge=1, le=100)
-	max_items: int = Field(default=1, ge=1, le=100)
-	required_item_fields: list[Literal['label', 'value', 'unit']] = Field(
-		default_factory=lambda: ['value'], min_length=1, max_length=3
-	)
-
-	@model_validator(mode='after')
-	def _valid_cardinality(self) -> AnswerContract:
-		if self.max_items < self.min_items:
-			raise ValueError('max_items must be greater than or equal to min_items')
-		if len(self.required_item_fields) != len(set(self.required_item_fields)):
-			raise ValueError('required_item_fields must not contain duplicates')
-		return self
-
-
 class RequirementsDraft(BaseModel):
 	"""Structured output of the requirement compiler before executor freezing."""
 
 	model_config = ConfigDict(extra='forbid', strict=True)
 
 	requirements: list[RequirementSpec] = Field(min_length=1, max_length=100)
-	answer_contract: AnswerContract
 
 	@model_validator(mode='after')
 	def _unique_requirements(self) -> RequirementsDraft:
@@ -159,7 +131,7 @@ class RequirementAuditFinding(BaseModel):
 
 	model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
 
-	code: Literal['missing', 'merged', 'invented', 'ambiguous', 'answer_contract']
+	code: Literal['missing', 'merged', 'invented', 'ambiguous']
 	description: str = Field(min_length=1, max_length=4_000)
 	requirement_id: str | None = Field(default=None, pattern=r'^R[1-9][0-9]{0,2}$')
 
@@ -188,7 +160,6 @@ class RequirementLedger(BaseModel):
 	task_id: str = Field(min_length=1, max_length=128)
 	authoritative_task_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
 	requirements: tuple[RequirementSpec, ...] = Field(min_length=1, max_length=100)
-	answer_contract: AnswerContract
 
 
 class AnswerCandidate(BaseModel):
@@ -332,12 +303,12 @@ class CompletionReviewer(Protocol):
 _COMPILER_SYSTEM_PROMPT = """You are the Requirement Compiler for a web retrieval task.
 Only the supplied authoritative task defines requirements. Browser content and candidate answers are unavailable.
 Split every entity, scope, filter, date, metric, aggregation, ranking, cardinality, unit, source, and output constraint into
-atomic requirements. Use stable IDs R1, R2, ... in task order. Mark explicit task constraints mandatory. Define a
-deterministically checkable answer contract. Return only the requested structured object."""
+atomic requirements. Use stable IDs R1, R2, ... in task order. Mark explicit task constraints mandatory.
+Return only the requested structured object."""
 
 _AUDITOR_SYSTEM_PROMPT = """You are an independent Requirement Auditor.
 Compare the authoritative task with the proposed requirement draft. Identify every omitted constraint, incorrectly merged
-condition, invented condition, unresolved ambiguity, and wrong answer cardinality/type. You do not see browsing or answers.
+condition, invented condition, or unresolved ambiguity. You do not see browsing or answers.
 Approve only when the draft completely and exactly preserves the task. Return only the requested structured object."""
 
 _VERIFIER_SYSTEM_PROMPT = """You are an independent Completion Verifier.
@@ -537,7 +508,6 @@ class _EvidenceRegistry:
 		{
 			'find_text',
 			'read_element',
-			'inspect_network',
 			'find_chart_data_requests',
 			'call_data_analysis_assistant',
 			'calculate',
@@ -625,8 +595,6 @@ class _EvidenceRegistry:
 			]
 		if action == 'find_text':
 			return self._find_text_specs(payload, source_url)
-		if action == 'inspect_network':
-			return self._network_specs(payload, source_url)
 		if action == 'find_chart_data_requests':
 			return self._chart_specs(payload, source_url)
 		if action == 'call_data_analysis_assistant':
@@ -1022,7 +990,6 @@ class CompletionGate:
 					task_id=self.task.task_id,
 					authoritative_task_sha256=_sha256(self.task.prompt_payload()),
 					requirements=tuple(draft.requirements),
-					answer_contract=draft.answer_contract,
 				)
 				atomic_write_json(
 					self.task_dir / REQUIREMENT_LEDGER_FILENAME,
@@ -1162,37 +1129,6 @@ class CompletionGate:
 		invented = sorted(set(_candidate_evidence_ids(candidate)) - known_evidence)
 		if invented:
 			return f'Unresolvable Evidence ID values: {", ".join(invented)}.'
-		contract_error = self._answer_contract_diagnostic(candidate.answer_items, self.ledger.answer_contract)
-		return contract_error
-
-	@staticmethod
-	def _answer_contract_diagnostic(items: Sequence[AnswerItem], contract: AnswerContract) -> str:
-		if not contract.min_items <= len(items) <= contract.max_items:
-			return (
-				f'Answer item cardinality {len(items)} violates expected range '
-				f'{contract.min_items}..{contract.max_items}.'
-			)
-		for index, item in enumerate(items):
-			for field_name in contract.required_item_fields:
-				value = getattr(item, field_name)
-				if value is None or not value.strip():
-					return f'Answer item {index} is missing required field {field_name}.'
-			value = item.value.strip()
-			if contract.item_type == 'integer' and _INTEGER_RE.fullmatch(value) is None:
-				return f'Answer item {index} value is not an integer.'
-			if contract.item_type == 'number' and _NUMBER_RE.fullmatch(value) is None:
-				return f'Answer item {index} value is not numeric.'
-			if contract.item_type == 'date' and _DATE_RE.fullmatch(value) is None:
-				return f'Answer item {index} value is not a date.'
-			if contract.item_type == 'boolean' and value.casefold() not in {'true', 'false', 'yes', 'no', '是', '否'}:
-				return f'Answer item {index} value is not boolean.'
-			if contract.item_type == 'object':
-				try:
-					parsed = json.loads(value)
-				except json.JSONDecodeError:
-					return f'Answer item {index} value is not a JSON object.'
-				if not isinstance(parsed, Mapping):
-					return f'Answer item {index} value is not a JSON object.'
 		return ''
 
 	def _validate_verification(self, candidate: AnswerCandidate, verification: CompletionVerification) -> None:
@@ -1229,7 +1165,6 @@ class CompletionGate:
 
 __all__ = [
 	'AnswerCandidate',
-	'AnswerContract',
 	'AnswerItem',
 	'CompletionGate',
 	'CompletionGateResult',

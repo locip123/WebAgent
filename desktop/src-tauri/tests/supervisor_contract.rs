@@ -9,11 +9,11 @@ use wr_desktop_shell::supervisor::{
 };
 
 #[test]
-fn release_configuration_uses_only_the_fixed_bundled_sidecar() {
+fn release_configuration_allows_the_production_tauri_origins() {
 	let program = bundled_sidecar_program(std::path::Path::new("/opt/WebRetriever/resources"));
 	let config = SupervisorConfig::bundled(std::path::PathBuf::from("/var/lib/webretriever"), program.clone());
 
-	assert_eq!(config.allowed_origins, vec!["tauri://localhost"]);
+	assert_eq!(config.allowed_origins, vec!["tauri://localhost", "http://tauri.localhost"]);
 	assert!(matches!(config.launch, SidecarLaunch::BundledBinary { program: configured } if configured == program));
 }
 
