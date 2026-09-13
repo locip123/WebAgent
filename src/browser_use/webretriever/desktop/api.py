@@ -10,6 +10,8 @@ import hmac
 import os
 import re
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -69,6 +71,20 @@ class _ProblemError(Exception):
 	def __init__(self, problem: ProblemDetails) -> None:
 		super().__init__(problem.error_code)
 		self.problem = problem
+
+
+_PROJECT_DELETE_DEBUG_LOG = "project-delete-diagnostics.log"
+
+
+def _record_project_delete_diagnostic(state_dir: str | os.PathLike[str], event: str) -> None:
+	"""Append a temporary, non-sensitive deletion diagnostic event."""
+
+	try:
+		path = Path(state_dir).resolve() / _PROJECT_DELETE_DEBUG_LOG
+		with path.open("a", encoding="utf-8") as stream:
+			stream.write(f"[DEBUG-project-delete-20260913] {datetime.now(timezone.utc).isoformat()} {event}\n")
+	except OSError:
+		pass
 
 
 def _problem_response(problem: ProblemDetails) -> JSONResponse:
@@ -284,11 +300,14 @@ def create_app(
 	)
 	async def delete_project(project_id: str, request: Request) -> Response:
 		_validate_project_id(project_id, request)
+		_record_project_delete_diagnostic(app.state.state_dir, "request_received")
 		try:
 			await manager.delete_project(project_id, state_dir=app.state.state_dir)
 		except ProjectNotFoundError as exc:
+			_record_project_delete_diagnostic(app.state.state_dir, "project_not_found")
 			raise _project_not_found_problem(request, project_id) from exc
 		except ActiveProjectRunError as exc:
+			_record_project_delete_diagnostic(app.state.state_dir, "active_run")
 			raise _ProblemError(
 				ProblemDetails.for_error(
 					code="project_has_active_run",
@@ -299,6 +318,7 @@ def create_app(
 				)
 			) from exc
 		except ProjectPathUnsafeError as exc:
+			_record_project_delete_diagnostic(app.state.state_dir, "unsafe_path")
 			raise _ProblemError(
 				ProblemDetails.for_error(
 					code="project_path_unsafe",
@@ -308,6 +328,7 @@ def create_app(
 				)
 			) from exc
 		except ProjectDeletionPermissionError as exc:
+			_record_project_delete_diagnostic(app.state.state_dir, f"permission_{exc.stage}")
 			raise _ProblemError(
 				ProblemDetails.for_error(
 					code="project_files_in_use",
@@ -318,6 +339,7 @@ def create_app(
 				)
 			) from exc
 		except Exception as exc:
+			_record_project_delete_diagnostic(app.state.state_dir, f"unexpected_{type(exc).__name__}")
 			raise _ProblemError(
 				ProblemDetails.for_error(
 					code="project_delete_failed",
@@ -326,6 +348,7 @@ def create_app(
 					trace_id=request.state.trace_id,
 				)
 			) from exc
+		_record_project_delete_diagnostic(app.state.state_dir, "deleted")
 		return Response(status_code=204)
 
 	@app.post(

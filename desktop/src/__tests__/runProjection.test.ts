@@ -84,9 +84,17 @@ describe("run event projection", () => {
 
   it("shows a model thought before its browser action completes and updates that same step", () => {
     const started = applyRunEvent(createRunProjection(snapshot), taskStarted);
-    const decided = applyRunEvent(started, {
+    const waitingForDecision = applyRunEvent(started, {
       ...taskStarted,
       event_id: 3,
+      occurred_at: "2026-09-04T12:00:03Z",
+      type: "task.phase_changed",
+      payload: { phase: "model_wait" }
+    });
+    const decided = applyRunEvent(waitingForDecision, {
+      ...taskStarted,
+      event_id: 4,
+      occurred_at: "2026-09-04T12:00:05Z",
       type: "task.step.decided",
       payload: {
         step: 2,
@@ -98,10 +106,12 @@ describe("run event projection", () => {
 
     expect(decided.steps).toEqual([
       {
-        eventId: 3,
+        eventId: 4,
         taskId: "task-4",
         step: 2,
         maxSteps: 5,
+        startedAt: "2026-09-04T12:00:03Z",
+        completedAt: "2026-09-04T12:00:05Z",
         action: "find_text",
         outcome: null,
         thought: "Inspect the page for the requested text.",
@@ -111,7 +121,8 @@ describe("run event projection", () => {
 
     const completed = applyRunEvent(decided, {
       ...taskStarted,
-      event_id: 4,
+      event_id: 5,
+      occurred_at: "2026-09-04T12:00:09Z",
       type: "task.step.completed",
       payload: {
         step: 2,
@@ -125,10 +136,12 @@ describe("run event projection", () => {
     expect(completed.tasks["task-4"]).toMatchObject({ completedSteps: 2, maxSteps: 5 });
     expect(completed.steps).toEqual([
       {
-        eventId: 3,
+        eventId: 4,
         taskId: "task-4",
         step: 2,
         maxSteps: 5,
+        startedAt: "2026-09-04T12:00:03Z",
+        completedAt: "2026-09-04T12:00:05Z",
         action: "find_text",
         outcome: "ok",
         thought: "Inspect the page for the requested text.",
@@ -162,6 +175,8 @@ describe("run event projection", () => {
         taskId: "task-4",
         step: 2,
         maxSteps: 5,
+        startedAt: "2026-09-04T12:00:02Z",
+        completedAt: "2026-09-04T12:00:02Z",
         action: "find_text",
         outcome: "ok",
         thought: "Inspect the page for the requested text.",

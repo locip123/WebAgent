@@ -168,6 +168,32 @@ function isTerminalRunStatus(status: RunSnapshot["status"] | undefined): boolean
   return status === "COMPLETED" || status === "CANCELLED" || status === "FAILED" || status === "INTERRUPTED";
 }
 
+function thinkingDurationInSeconds(startedAt: string, completedAt: string | null, now: number): number {
+  const startedAtMilliseconds = Date.parse(startedAt);
+  const completedAtMilliseconds = completedAt === null ? now : Date.parse(completedAt);
+  if (!Number.isFinite(startedAtMilliseconds) || !Number.isFinite(completedAtMilliseconds)) return 0;
+  return Math.max(0, Math.floor((completedAtMilliseconds - startedAtMilliseconds) / 1000));
+}
+
+function StepThinkingDuration({ startedAt, completedAt }: Pick<RunProjection["steps"][number], "startedAt" | "completedAt">) {
+  const [now, setNow] = useState(Date.now);
+  const isThinking = completedAt === null;
+
+  useEffect(() => {
+    if (!isThinking) return;
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [isThinking]);
+
+  const seconds = thinkingDurationInSeconds(startedAt, completedAt, now);
+  return (
+    <div className={`step-thinking-duration${isThinking ? " step-thinking-duration--active" : ""}`}>
+      {isThinking && <span>agent 正在思考</span>}
+      <span>{isThinking ? `已经思考 ${seconds} 秒` : `本步思考耗时 ${seconds} 秒`}</span>
+    </div>
+  );
+}
+
 export function App({ bridge, createClient = (readyDescriptor) => new ControlPlaneClient(readyDescriptor) }: AppProps) {
   const [descriptor, setDescriptor] = useState<BackendDescriptor | null>(null);
   const [backend, setBackend] = useState<BackendStatus>({ state: "STARTING" });
@@ -1145,6 +1171,7 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                             ? `正在执行 ${step.action}…`
                             : `已执行 ${step.action}，结果：${step.outcome}`}
                         </span>
+                        <StepThinkingDuration startedAt={step.startedAt} completedAt={step.completedAt} />
                         <div
                           aria-label={`任务进度：第 ${step.step} / ${step.maxSteps} 步`}
                           aria-valuemax={step.maxSteps}
@@ -1172,7 +1199,11 @@ export function App({ bridge, createClient = (readyDescriptor) => new ControlPla
                     </article>
                   )}
                   <div className="conversation-actions">
-                    <span>{workspaceRunStatus(currentWorkspaceRun.projection, null, currentWorkspaceRun.accepted)}</span>
+                    <WorkspaceRunStatus
+                      projection={currentWorkspaceRun.projection}
+                      snapshot={null}
+                      accepted={currentWorkspaceRun.accepted}
+                    />
                     {canCancelWorkspaceRun(currentWorkspaceRun.projection, null, currentWorkspaceRun.accepted) && (
                       <button
                         className="button button--danger"
@@ -1428,6 +1459,34 @@ function workspaceRunStatus(
   accepted: RunAccepted | null
 ): string {
   return `运行状态：${projection?.snapshot.status ?? snapshot?.status ?? accepted?.status ?? "STARTING"}`;
+}
+
+export function WorkspaceRunStatus(
+  { projection, snapshot, accepted }: {
+    projection: RunProjection | null;
+    snapshot: RunSnapshot | null;
+    accepted: RunAccepted | null;
+  }
+) {
+  const [now, setNow] = useState(Date.now);
+  const status = projection?.snapshot.status ?? snapshot?.status ?? accepted?.status ?? "STARTING";
+  const thinkingTask = status === "RUNNING"
+    ? Object.values(projection?.tasks ?? {}).find(
+      (task) => task.phase === "model_wait" && task.thinkingStartedAt
+    )
+    : undefined;
+  const thinkingStartedAt = thinkingTask?.thinkingStartedAt;
+
+  useEffect(() => {
+    if (!thinkingStartedAt) return;
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [thinkingStartedAt]);
+
+  const thinkingSuffix = thinkingStartedAt
+    ? ` · 当前步 Agent 已思考 ${thinkingDurationInSeconds(thinkingStartedAt, null, now)} 秒`
+    : "";
+  return <span>{`${workspaceRunStatus(projection, snapshot, accepted)}${thinkingSuffix}`}</span>;
 }
 
 function canCancelWorkspaceRun(

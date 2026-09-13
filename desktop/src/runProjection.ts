@@ -29,6 +29,7 @@ export interface TaskProjection {
   taskIdx: number;
   website: string;
   phase: string | null;
+  thinkingStartedAt?: string;
   status: "RUNNING" | "FINISHED" | "FAILED";
   completedSteps: number;
   maxSteps: number | null;
@@ -40,6 +41,8 @@ export interface TaskStepProjection {
   taskId: string;
   step: number;
   maxSteps: number;
+  startedAt: string;
+  completedAt: string | null;
   action: string;
   outcome: string | null;
   thought: string;
@@ -95,7 +98,8 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
     if (task) {
       next.tasks[event.task.task_id] = {
         ...task,
-        phase: typeof event.payload.phase === "string" ? event.payload.phase : task.phase
+        phase: typeof event.payload.phase === "string" ? event.payload.phase : task.phase,
+        ...(event.payload.phase === "model_wait" ? { thinkingStartedAt: event.occurred_at } : {})
       };
     }
   }
@@ -127,6 +131,8 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
         taskId: event.task.task_id,
         step,
         maxSteps,
+        startedAt: existingStep?.startedAt ?? task.thinkingStartedAt ?? event.occurred_at,
+        completedAt: existingStep?.completedAt ?? event.occurred_at,
         action,
         outcome,
         thought: thought || existingStep?.thought || "",
@@ -158,6 +164,8 @@ export function applyRunEvent(projection: RunProjection, event: RunEvent): RunPr
         taskId: event.task.task_id,
         step,
         maxSteps,
+        startedAt: task.thinkingStartedAt ?? event.occurred_at,
+        completedAt: event.occurred_at,
         action,
         outcome: null,
         thought,

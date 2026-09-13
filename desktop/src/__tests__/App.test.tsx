@@ -1,13 +1,17 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { UserEvent } from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { App } from "../App";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { App, WorkspaceRunStatus } from "../App";
 import type { RunEvent } from "../runProjection";
 
 describe("desktop run workspace", () => {
 	beforeEach(() => {
 		localStorage.clear();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
 	});
 
 	const readyBridge = () => ({
@@ -20,6 +24,55 @@ describe("desktop run workspace", () => {
 		onBackendStateChanged: vi.fn().mockResolvedValue(() => {}),
 		pickTaskFile: vi.fn().mockResolvedValue(null),
 		pickOutputDirectory: vi.fn().mockResolvedValue(null)
+	});
+
+	it("updates the running status with the current step thinking duration", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-09-04T12:00:03Z"));
+		render(
+			<WorkspaceRunStatus
+				projection={{
+					snapshot: {
+						schema_version: 1,
+						run_id: "run-9",
+						status: "RUNNING",
+						created_at: "2026-09-04T12:00:00Z",
+						started_at: "2026-09-04T12:00:01Z",
+						finished_at: null,
+						output_dir: "/work/outputs/run-9",
+						last_event_id: 3,
+						summary: null,
+						error: null
+					},
+					tasks: {
+						"task-9": {
+							taskId: "task-9",
+							taskIdx: 1,
+							website: "example.com",
+							phase: "model_wait",
+							thinkingStartedAt: "2026-09-04T12:00:03Z",
+							status: "RUNNING",
+							completedSteps: 0,
+							maxSteps: null,
+							answer: null
+						}
+					},
+					steps: [],
+					artifacts: [],
+					errors: []
+				}}
+				snapshot={null}
+				accepted={null}
+			/>
+		);
+
+		expect(screen.getByText("运行状态：RUNNING · 当前步 Agent 已思考 0 秒")).toBeVisible();
+
+		act(() => {
+			vi.advanceTimersByTime(2_000);
+		});
+
+		expect(screen.getByText("运行状态：RUNNING · 当前步 Agent 已思考 2 秒")).toBeVisible();
 	});
 
 	async function openBatchOperations(user: UserEvent) {
@@ -212,7 +265,7 @@ describe("desktop run workspace", () => {
 					task: { task_id: "task-9", task_idx: 1 },
 					payload: { website_display: "example.com" }
 				});
-					onEvent({
+				onEvent({
 					schema: "webretriever.run-event/v1",
 					run_id: "run-9",
 					event_id: 3,
@@ -245,6 +298,7 @@ describe("desktop run workspace", () => {
 		expect(screen.getByText("Inspect the page for the requested text.")).toBeVisible();
 		expect(screen.getByText("第 2 / 5 步")).toBeVisible();
 		expect(screen.getByText("正在执行 find_text…")).toBeVisible();
+		expect(screen.getByText("本步思考耗时 0 秒")).toBeVisible();
 
 		act(() => {
 			if (publishEvent === null) {
@@ -279,6 +333,7 @@ describe("desktop run workspace", () => {
 		});
 
 		expect(await screen.findByText("已执行 find_text，结果：ok")).toBeVisible();
+		expect(screen.getByText("本步思考耗时 0 秒")).toBeVisible();
 		expect(screen.getByText("模型回答")).toBeVisible();
 		expect(screen.getByText("首页信息已经整理完成。")).toBeVisible();
 

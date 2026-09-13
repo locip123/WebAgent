@@ -151,6 +151,8 @@ button:disabled { cursor: not-allowed; }
 .conversation-message--user p { color: #dce5ff; }
 .conversation-message--user strong { color: #fff; }
 .conversation-message--thinking { background: #fff; }
+.step-thinking-duration { display: grid; gap: 1px; margin-top: 1px; }
+.step-thinking-duration--active span:first-child { color: #4a70f7; font-weight: 650; }
 .conversation-message--answer { border-color: #cfe8d9; background: #f7fcf9; }
 .conversation-message--answer p { color: #428266; }
 .conversation-message--error { border-color: #f0c7c7; background: #fff7f7; }
