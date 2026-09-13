@@ -8,6 +8,8 @@
     "tauri": "tauri",
     "build": "tsc --noEmit && vite build",
     "build:windows": "tauri build --bundles msi,nsis",
+    "build:linux": "tauri build --bundles deb,appimage",
+    "build:macos": "tauri build --bundles dmg",
     "test": "vitest run",
     "test:watch": "vitest"
   },

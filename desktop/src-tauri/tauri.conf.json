@@ -31,6 +31,6 @@
     "resources": {
       "resources/sidecar/": "sidecar/"
     },
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico", "icons/icon.icns", "icons/128x128.png"]
   }
 }

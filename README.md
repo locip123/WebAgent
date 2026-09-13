@@ -6,7 +6,7 @@
 
 面向真实网站操作的本地桌面 Agent。创建项目、描述目标，webAgent 会在本地浏览器中完成网页探索，并把执行过程与结果留在你的工作区。
 
-[▶ 观看产品演示](demo/demo.mp4)&nbsp;&nbsp;·&nbsp;&nbsp;[快速开始](#快速开始)&nbsp;&nbsp;·&nbsp;&nbsp;[批量任务](#批量任务)
+[⬇️ 下载最新版](https://github.com/locip123/WebAgent/releases/latest)&nbsp;&nbsp;·&nbsp;&nbsp;[▶ 观看产品演示](demo/demo.mp4)&nbsp;&nbsp;·&nbsp;&nbsp;[快速开始](#快速开始)&nbsp;&nbsp;·&nbsp;&nbsp;[批量任务](#批量任务)
 
 </div>
 
@@ -36,9 +36,26 @@ flowchart LR
 
 每次任务都在本地浏览器中执行。桌面工作台负责项目、模型服务和实时进度；本地 Sidecar 负责运行控制与产物管理；浏览器负责实际网页操作。
 
+## 下载安装
+
+前往 [Releases](https://github.com/locip123/WebAgent/releases/latest) 下载与你的系统匹配的安装包。发行包已内置 Sidecar 和 Chromium，普通用户不需要安装 Python、Conda 或 Node.js。
+
+| 系统 | 选择的文件 | 安装方式 |
+| --- | --- | --- |
+| Windows 10 / 11 x64 | `.exe` 或 `.msi` | 双击安装。若出现 SmartScreen 提示，请确认下载来源为本仓库的 Release。 |
+| Ubuntu / Debian x64 | `.deb` | 在下载目录运行 `sudo apt install ./WebAgent_*_linux-x64.deb`。 |
+| 其他常见 Linux x64 发行版 | `.AppImage` | 运行 `chmod +x WebAgent_*_linux-x64.AppImage`，再双击或执行该文件。 |
+| macOS（Intel） | `macos-x64.dmg` | 打开 DMG 后，将 WebAgent 拖入“应用程序”。 |
+| macOS（Apple Silicon） | `macos-arm64.dmg` | 打开 DMG 后，将 WebAgent 拖入“应用程序”。 |
+
+> [!NOTE]
+> 当前 Windows 与 macOS 安装包未配置代码签名；Windows 可能显示 SmartScreen 提示，macOS 可能要求在“隐私与安全性”中确认打开。请只从本仓库的 Release 下载。
+
+安装后，从系统的应用程序列表启动 **WebRetriever**。首次运行可能需要联网下载 tiktoken 词表；实际执行网页任务还需要有效的模型服务配置。
+
 ## 快速开始
 
-以下步骤以 **Windows PowerShell** 的本地开发环境为例。首次启动前请准备好 Conda、Node.js（含 npm）和 Rust 工具链；项目的 Python 环境固定为 **3.12**。
+以下步骤仅面向需要从源码运行或参与开发的用户；如只需使用应用，请直接按照上方“下载安装”操作。以 **Windows PowerShell** 的本地开发环境为例，首次启动前请准备好 Conda、Node.js（含 npm）和 Rust 工具链；项目的 Python 环境固定为 **3.12**。
 
 在仓库根目录执行：
 

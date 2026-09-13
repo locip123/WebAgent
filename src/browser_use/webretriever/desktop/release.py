@@ -43,6 +43,12 @@ _WINDOWS_TARGETS = {
 	"x86_64": "x86_64-pc-windows-msvc",
 	"amd64": "x86_64-pc-windows-msvc",
 }
+_MACOS_TARGETS = {
+	"x86_64": "x86_64-apple-darwin",
+	"amd64": "x86_64-apple-darwin",
+	"aarch64": "aarch64-apple-darwin",
+	"arm64": "aarch64-apple-darwin",
+}
 
 
 class ReleaseValidationError(ValueError):
@@ -574,6 +580,8 @@ def _target_platform(target: str) -> str:
 		return "linux"
 	if target in set(_WINDOWS_TARGETS.values()):
 		return "windows"
+	if target in set(_MACOS_TARGETS.values()):
+		return "macos"
 	raise ReleaseValidationError(f"release target is unsupported: {target!r}")
 
 
@@ -584,8 +592,11 @@ def _validate_native_target(target: str) -> None:
 	elif sys.platform == "win32":
 		architectures = _WINDOWS_TARGETS
 		platform_name = "Windows"
+	elif sys.platform == "darwin":
+		architectures = _MACOS_TARGETS
+		platform_name = "macOS"
 	else:
-		raise ReleaseValidationError("release staging requires a supported native Linux or Windows host")
+		raise ReleaseValidationError("release staging requires a supported native Linux, macOS, or Windows host")
 	if platform.machine().lower() not in architectures:
 		raise ReleaseValidationError(f"release staging requires a supported native {platform_name} target host")
 	expected = architectures[platform.machine().lower()]
@@ -631,7 +642,7 @@ def _pyinstaller_environment() -> dict[str, str]:
 def _parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Build and verify self-contained WebRetriever desktop releases.")
 	subcommands = parser.add_subparsers(dest="command", required=True)
-	verify = subcommands.add_parser("verify", help="verify a Linux or Windows release directory")
+	verify = subcommands.add_parser("verify", help="verify a Linux, macOS, or Windows release directory")
 	verify.add_argument("--bundle-dir", required=True, type=Path)
 	verify.add_argument("--state-dir", type=Path, help="migrate and verify this sidecar control-state directory")
 	stage = subcommands.add_parser("stage", help="stage a PyInstaller sidecar and its Playwright browser payload")

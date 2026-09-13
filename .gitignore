@@ -7,6 +7,9 @@ __pycache__/
 .env
 .env.local
 
+# Local model credentials
+config.json
+
 # macOS
 .DS_Store
 

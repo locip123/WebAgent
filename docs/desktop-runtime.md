@@ -1,6 +1,6 @@
 # 本地桌面运行时基线
 
-桌面 v1 支持 Linux GNU 和 Windows x64 (`x86_64-pc-windows-msvc`) 发布包。Python Runner 的工件锁使用跨平台 `portalocker`；Windows desktop supervisor 会将 sidecar 放入带 `KILL_ON_JOB_CLOSE` 的 Job Object，确保强制退出或桌面进程意外退出时清理 sidecar 子进程树。
+桌面 v1 支持 Linux GNU x64、Windows x64 (`x86_64-pc-windows-msvc`)、macOS Intel (`x86_64-apple-darwin`) 和 Apple Silicon (`aarch64-apple-darwin`) 发布包。Python Runner 的工件锁使用跨平台 `portalocker`；Windows desktop supervisor 会将 sidecar 放入带 `KILL_ON_JOB_CLOSE` 的 Job Object，确保强制退出或桌面进程意外退出时清理 sidecar 子进程树。
 
 开发和 sidecar 基线为 Python 3.12。创建或更新环境后，使用以下命令安装与仓库声明的 Playwright 版本匹配的 Chromium：
 
@@ -58,7 +58,7 @@ npm run tauri dev
 
 ## 阶段 4：发布包
 
-发布工具入口是 `python -m browser_use.webretriever.desktop.release`。它只接受构建机的原生目标：Linux 支持 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu`，Windows 当前支持 x64 `x86_64-pc-windows-msvc`。macOS 签名/公证尚未实现。
+发布工具入口是 `python -m browser_use.webretriever.desktop.release`。它只接受构建机的原生目标：Linux 支持 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu`，Windows 支持 x64 `x86_64-pc-windows-msvc`，macOS 支持 Intel `x86_64-apple-darwin` 和 Apple Silicon `aarch64-apple-darwin`。macOS 代码签名与公证尚未实现。
 
 在受支持 Linux 构建机上，先用受锁定的 `Browser-Use` 环境准备 PyInstaller 和 Playwright browser，再生成一个独立发行资源目录：
 
@@ -121,6 +121,32 @@ python -m browser_use.webretriever.desktop.release install-tauri-resources `
 Set-Location desktop
 npm ci
 npm run build:windows
+```
+
+macOS 上使用原生构建机执行以下命令。根据构建机架构将目标改为 `x86_64-apple-darwin` 或 `aarch64-apple-darwin`；它会生成对应架构的 DMG。未签名、未公证的测试包会被 Gatekeeper 提示，正式发布前应在 CI 中配置 Apple Developer 签名与公证凭据。
+
+```bash
+conda activate webAgent
+export PYTHONPATH="$PWD/src"
+python -m playwright install chromium
+BUILD="$(git rev-parse --verify HEAD)"
+python -m browser_use.webretriever.desktop.release build \
+  --playwright-browsers-dir "$HOME/Library/Caches/ms-playwright" \
+  --output-dir dist/webretriever-macos-resources \
+  --target aarch64-apple-darwin \
+  --sidecar-build "$BUILD" \
+  --runner-build "$BUILD"
+python -m browser_use.webretriever.desktop.release verify \
+  --bundle-dir dist/webretriever-macos-resources
+python -m browser_use.webretriever.desktop.release smoke \
+  --bundle-dir dist/webretriever-macos-resources
+python -m browser_use.webretriever.desktop.release install-tauri-resources \
+  --bundle-dir dist/webretriever-macos-resources \
+  --resources-dir desktop/src-tauri/resources \
+  --replace
+cd desktop
+npm ci
+npm run build:macos
 ```
 
 生产态 Tauri 从资源目录中的固定 `sidecar/webretriever-sidecar` 启动（Windows 自动使用 `.exe` 后缀），并且只允许 `tauri://localhost`；开发态仍然使用活动 `Browser-Use` 环境中的 `python -m browser_use.webretriever.desktop.sidecar`。UI 不能传解释器路径或任意 shell 参数。

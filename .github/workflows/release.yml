@@ -1,0 +1,185 @@
+name: Release desktop installers
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+            asset_suffix: windows-x64
+          - label: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            asset_suffix: linux-x64
+          - label: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            asset_suffix: macos-x64
+          - label: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg
+            asset_suffix: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          environment-file: environment.yml
+          activate-environment: webAgent
+          auto-activate-base: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install the required Rust toolchain
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Install the required Rust toolchain
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Build release resources and installer
+        shell: bash
+        if: runner.os != 'Windows'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+          PYTHONPATH: ${{ github.workspace }}/src
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: |
+          set -euo pipefail
+          conda run -n webAgent python -m playwright install chromium
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release build \
+            --playwright-browsers-dir "$PLAYWRIGHT_BROWSERS_PATH" \
+            --output-dir "$RUNNER_TEMP/webretriever-resources" \
+            --target "$TARGET" \
+            --sidecar-build "$GITHUB_SHA" \
+            --runner-build "$GITHUB_SHA"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release verify \
+            --bundle-dir "$RUNNER_TEMP/webretriever-resources"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release smoke \
+            --bundle-dir "$RUNNER_TEMP/webretriever-resources"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release install-tauri-resources \
+            --bundle-dir "$RUNNER_TEMP/webretriever-resources" \
+            --resources-dir desktop/src-tauri/resources \
+            --replace
+          cd desktop
+          npm ci
+          npm exec tauri build -- --bundles "$BUNDLES"
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) -print0 |
+            while IFS= read -r -d '' file; do
+              extension="${file##*.}"
+              cp "$file" "$RUNNER_TEMP/release-assets/WebAgent_${version}_${ASSET_SUFFIX}.${extension}"
+            done
+
+      - name: Build Windows release resources and installer
+        shell: pwsh
+        if: runner.os == 'Windows'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\.playwright-browsers
+          PYTHONPATH: ${{ github.workspace }}\src
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          conda run -n webAgent python -m playwright install chromium
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release build `
+            --playwright-browsers-dir "$env:PLAYWRIGHT_BROWSERS_PATH" `
+            --output-dir "$env:RUNNER_TEMP\webretriever-resources" `
+            --target "$env:TARGET" `
+            --sidecar-build "$env:GITHUB_SHA" `
+            --runner-build "$env:GITHUB_SHA"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release verify `
+            --bundle-dir "$env:RUNNER_TEMP\webretriever-resources"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release smoke `
+            --bundle-dir "$env:RUNNER_TEMP\webretriever-resources"
+          conda run -n webAgent python -m browser_use.webretriever.desktop.release install-tauri-resources `
+            --bundle-dir "$env:RUNNER_TEMP\webretriever-resources" `
+            --resources-dir "desktop\src-tauri\resources" `
+            --replace
+          Set-Location desktop
+          npm ci
+          npm exec tauri build -- --bundles "$env:BUNDLES"
+          $version = (Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json).version
+          $assets = Join-Path $env:RUNNER_TEMP "release-assets"
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          $installers = Get-ChildItem src-tauri\target\release\bundle -Recurse -File -Include *.msi,*.exe
+          if ($installers.Count -eq 0) { throw "Tauri did not produce a Windows installer." }
+          foreach ($installer in $installers) {
+            Copy-Item $installer.FullName (Join-Path $assets "WebAgent_$version`_$env:ASSET_SUFFIX$($installer.Extension)")
+          }
+
+      - name: Upload platform installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_suffix }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release and attach installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          test "$TAG" = "v$version"
+          gh release create "$TAG" release-assets/* --title "WebAgent $TAG" --generate-notes
