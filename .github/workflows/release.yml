@@ -110,6 +110,9 @@ jobs:
             --replace
           cd desktop
           npm ci
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            export LD_LIBRARY_PATH="$RUNNER_TEMP/webretriever-resources/sidecar/_internal${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           npm exec tauri build -- --verbose --bundles "$BUNDLES"
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           mkdir -p "$RUNNER_TEMP/release-assets"
