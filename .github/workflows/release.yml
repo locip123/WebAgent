@@ -73,6 +73,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             build-essential \
+            libfuse2t64 \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
@@ -89,6 +90,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           BUNDLES: ${{ matrix.bundles }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           set -euo pipefail
           conda run -n webAgent python -m playwright install chromium
@@ -108,7 +110,7 @@ jobs:
             --replace
           cd desktop
           npm ci
-          npm exec tauri build -- --bundles "$BUNDLES"
+          npm exec tauri build -- --verbose --bundles "$BUNDLES"
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           mkdir -p "$RUNNER_TEMP/release-assets"
           find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) -print0 |
