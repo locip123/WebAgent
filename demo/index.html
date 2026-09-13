@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WebAgent 产品演示</title>
+    <style>
+      :root {
+        color: #eef2ff;
+        background: #101323;
+        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        padding: 24px;
+        box-sizing: border-box;
+        place-items: center;
+      }
+
+      main {
+        width: min(100%, 1100px);
+      }
+
+      p {
+        margin: 0 0 8px;
+        color: #b9c4e4;
+      }
+
+      h1 {
+        margin: 0 0 24px;
+        font-size: clamp(1.75rem, 4vw, 2.5rem);
+      }
+
+      video {
+        display: block;
+        width: 100%;
+        border-radius: 12px;
+        background: #05070d;
+        box-shadow: 0 20px 48px rgb(0 0 0 / 35%);
+      }
+
+      a {
+        display: inline-block;
+        margin-top: 16px;
+        color: #a9c7ff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>WebAgent</p>
+      <h1>产品演示</h1>
+      <video controls preload="metadata" playsinline>
+        <source src="demo.mp4" type="video/mp4">
+        您的浏览器不支持视频播放，请下载视频后观看。
+      </video>
+      <a href="demo.mp4" download>下载演示视频</a>
+    </main>
+  </body>
+</html>
