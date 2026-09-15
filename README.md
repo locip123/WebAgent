@@ -8,6 +8,8 @@
 
 [⬇️ 下载最新版](https://github.com/locip123/WebAgent/releases/latest)&nbsp;&nbsp;·&nbsp;&nbsp;[▶ 观看产品演示](https://locip123.github.io/WebAgent/)&nbsp;&nbsp;·&nbsp;&nbsp;[快速开始](#快速开始)&nbsp;&nbsp;·&nbsp;&nbsp;[批量任务](#批量任务)
 
+🏆 **WebRetriever Challenge 2026 第 9 名** · [赛事主页](https://mininglamp-ai.github.io/WebRetriever_Challenge/)
+
 </div>
 
 ---
